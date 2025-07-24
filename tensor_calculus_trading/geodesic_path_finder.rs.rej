@@ -1,0 +1,27 @@
+--- src/tensor_calculus_trading/geodesic_path_finder.rs
++++ src/tensor_calculus_trading/geodesic_path_finder.rs
+@@ -150,8 +150,8 @@
+         let mut visited = HashSet::new();
+         visited.insert(from_token);
+         
+-        let mut best_paths: HashMap<Pubkey, (u64, f64)> = HashMap::new();
+-        let mut heap = BinaryHeap::new();
++        let best_paths = Arc::new(Mutex::new(HashMap::<Pubkey, (u64, f64)>::new()));
++        let heap = Arc::new(Mutex::new(BinaryHeap::new()));
+         
+         // Start with direct paths
+         pools.par_iter().for_each(|pool| {
+@@ -172,9 +172,11 @@
+                     
+                     let profit = self.calculate_profit(output_amount, amount, slippage);
+                     
+-                    best_paths.insert(output_token, (output_amount, profit));
++                    best_paths.lock().unwrap().insert(output_token, (output_amount, profit));
+                     
+-                    heap.push(PathNode {
++                    let heap_clone = heap.clone();
++                    
++                    heap_clone.lock().unwrap().push(PathNode {
+                         token: output_token,
+                         amount: output_amount,
+                         profit,
