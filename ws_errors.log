@@ -1,0 +1,18 @@
+src/rpc/websocket_optimizer.rs:6:5: error[E0432]: unresolved import `futures_util`: use of unresolved module or unlinked crate `futures_util`
+src/rpc/websocket_optimizer.rs:7:5: error[E0433]: failed to resolve: use of unresolved module or unlinked crate `tokio_tungstenite`: use of unresolved module or unlinked crate `tokio_tungstenite`
+src/rpc/websocket_optimizer.rs:7:5: error[E0432]: unresolved import `tokio_tungstenite`: use of unresolved module or unlinked crate `tokio_tungstenite`
+src/rpc/websocket_optimizer.rs:11:5: error[E0432]: unresolved import `parking_lot`: use of unresolved module or unlinked crate `parking_lot`
+src/rpc/websocket_optimizer.rs:13:5: error[E0433]: failed to resolve: use of unresolved module or unlinked crate `flate2`: use of unresolved module or unlinked crate `flate2`
+src/rpc/websocket_optimizer.rs:14:5: error[E0433]: failed to resolve: use of unresolved module or unlinked crate `flate2`: use of unresolved module or unlinked crate `flate2`
+src/rpc/websocket_optimizer.rs:12:5: error[E0432]: unresolved import `bytes`: use of unresolved module or unlinked crate `bytes`
+src/rpc/websocket_optimizer.rs:15:5: error[E0432]: unresolved import `flate2`: use of unresolved module or unlinked crate `flate2`
+src/rpc/websocket_optimizer.rs:17:5: error[E0432]: unresolved import `blake3`: help: a similar path exists: `solana_sdk::blake3`
+src/rpc/websocket_optimizer.rs:18:5: error[E0432]: unresolved import `crossbeam_channel`: use of unresolved module or unlinked crate `crossbeam_channel`
+src/rpc/websocket_optimizer.rs:19:5: error[E0432]: unresolved import `mio`: use of unresolved module or unlinked crate `mio`
+src/rpc/websocket_optimizer.rs:21:5: error[E0433]: failed to resolve: use of unresolved module or unlinked crate `nix`: use of unresolved module or unlinked crate `nix`
+src/rpc/websocket_optimizer.rs:20:5: error[E0432]: unresolved import `socket2`: use of unresolved module or unlinked crate `socket2`
+src/rpc/websocket_optimizer.rs:187:26: error[E0433]: failed to resolve: use of unresolved module or unlinked crate `url`: use of unresolved module or unlinked crate `url`
+src/rpc/websocket_optimizer.rs:1:43: warning: unused import: `HashSet`
+src/rpc/websocket_optimizer.rs:2:22: warning: unused import: `RwLock`
+src/rpc/websocket_optimizer.rs:4:25: warning: unused import: `oneshot`
+src/rpc/websocket_optimizer.rs:44:17: error[E0119]: conflicting implementations of trait `Clone` for type `ConnectionMetrics`: conflicting implementation for `ConnectionMetrics`

@@ -1,0 +1,144 @@
+import { Connection } from '@solana/web3.js';
+import { Market } from '@openbook-dex/openbook';
+interface VWAPConfig {
+    targetVolume: number;
+    timeHorizon: number;
+    maxSlippage: number;
+    minOrderSize: number;
+    maxOrderSize: number;
+    aggressiveness: number;
+    adaptiveSpread: boolean;
+    riskLimit: number;
+}
+interface MarketData {
+    price: number;
+    volume: number;
+    timestamp: number;
+    bid: number;
+    ask: number;
+    spread: number;
+}
+interface OrderSlice {
+    size: number;
+    price: number;
+    timestamp: number;
+    side: 'buy' | 'sell';
+    urgency: number;
+}
+interface VWAPMetrics {
+    currentVWAP: number;
+    targetVWAP: number;
+    deviation: number;
+    completionRate: number;
+    slippage: number;
+    efficiency: number;
+}
+export declare class VWAPOptimizer {
+    private connection;
+    private market;
+    private config;
+    private historicalData;
+    private executedOrders;
+    private activeOrders;
+    private vwapWindow;
+    private volumeProfile;
+    private marketImpactModel;
+    private adaptiveParameters;
+    private riskMetrics;
+    constructor(connection: Connection, market: Market, config: VWAPConfig);
+    private initializeAdaptiveParameters;
+    private initializeRiskMetrics;
+    optimizeVWAPExecution(side: 'buy' | 'sell', totalQuantity: number, timeHorizon: number): Promise<OrderSlice[]>;
+    private getMarketData;
+    private calculateRecentVolume;
+    private calculateVolumeProfile;
+    private getHistoricalVolumeForSlice;
+    private adjustVolumeForMarketConditions;
+    private calculateOptimalSlices;
+    private calculateOptimalParticipationRate;
+    private calculateUrgency;
+    private calculateOptimalPrice;
+    private estimateMarketImpact;
+    private calculateVolatility;
+    private calculateAdaptiveSpreadAdjustment;
+    private calculateLiquidityScore;
+    private optimizeSliceSequence;
+    private calculateSliceScore;
+    private applyRiskConstraints;
+    executeSlice(slice: OrderSlice): Promise<string | null>;
+    private adjustSliceForMarketConditions;
+    private calculateVolatilityAdjustment;
+    private calculateLiquidityAdjustment;
+    private calculateMomentumAdjustment;
+    private calculateHistoricalVolatility;
+    private calculatePriceMomentum;
+    private adjustSizeForLiquidity;
+    private validateSliceExecution;
+    private calculateSlippage;
+    private validateRiskLimits;
+    private validateLiquidityConstraints;
+    private placeOrder;
+    private createOrderInstruction;
+    private getOpenOrdersAddress;
+    private getOwnerPublicKey;
+    private getPayerAddress;
+    private updateRiskMetrics;
+    private updateUnrealizedPnL;
+    private updatePerformanceMetrics;
+    private calculateReturns;
+    private calculateSharpeRatio;
+    private calculateInformationRatio;
+    monitorAndAdjust(): Promise<void>;
+    private updateAdaptiveParameters;
+    private calculateMeanReversionSignal;
+    private calculateAdverseSelectionCost;
+    private rebalanceActiveOrders;
+    private shouldCancelOrder;
+    private hasLiquidityChanged;
+    private cancelOrder;
+    private createCancelOrderInstruction;
+    private updateVWAPMetrics;
+    private calculateCurrentVWAP;
+    private calculateTargetVWAP;
+    private calculateCompletionRate;
+    private calculateExecutionEfficiency;
+    private shouldTriggerEmergencyStop;
+    private emergencyStop;
+    getVWAPMetrics(): VWAPMetrics;
+    private calculateAverageSlippage;
+    private getMarketPriceAtTime;
+    getRiskMetrics(): Map<string, number>;
+    getAdaptiveParameters(): Map<string, number>;
+    cleanup(): Promise<void>;
+    onOrderFilled(orderId: string, fillPrice: number, fillSize: number): void;
+    optimizeParameters(): Promise<void>;
+    private adjustAggressiveness;
+    private adjustParticipationRate;
+    private adjustSlicingStrategy;
+    executeVWAPStrategy(side: 'buy' | 'sell', totalQuantity: number, timeHorizon: number): Promise<boolean>;
+    private calculateAdaptiveDelay;
+    private sleep;
+    startContinuousOptimization(): Promise<void>;
+    private cleanupOldData;
+    getExecutionSummary(): {
+        totalExecuted: number;
+        averagePrice: number;
+        totalSlippage: number;
+        efficiency: number;
+        riskMetrics: Map<string, number>;
+        adaptiveParams: Map<string, number>;
+    };
+    validateMarketConditions(): Promise<boolean>;
+    updateConfiguration(newConfig: Partial<VWAPConfig>): void;
+    performBacktest(historicalData: MarketData[], testConfig: VWAPConfig): Promise<{
+        totalReturn: number;
+        sharpeRatio: number;
+        maxDrawdown: number;
+        winRate: number;
+        averageSlippage: number;
+    }>;
+    private calculateMaxDrawdown;
+    destroy(): void;
+}
+export { VWAPConfig, MarketData, OrderSlice, VWAPMetrics };
+//# sourceMappingURL=VWAPOptimizer.d.ts.map

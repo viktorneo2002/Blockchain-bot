@@ -1,0 +1,310 @@
+30:#[derive(Debug, Clone, Serialize, Deserialize)]
+40:#[derive(Debug, Clone)]
+52:#[derive(Debug)]
+66:    message_cache: Arc<DashMap<[u8; 32], (WSMessage, Instant)>>,
+75:    pub fn new(endpoints: Vec<String>) -> Self {
+76:        let (rx_sender, rx_channel) = mpsc::channel(MESSAGE_BUFFER_SIZE);
+79:            connections: Arc::new(DashMap::new()),
+80:            message_cache: Arc::new(DashMap::new()),
+81:            tx_channels: Arc::new(DashMap::new()),
+84:            compressor: Arc::new(Mutex::new(GzEncoder::new(Vec::new(), Compression::best()))),
+89:    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+90:        let num_connections = std::cmp::min(self.endpoints.len(), MAX_CONNECTIONS);
+93:            let endpoint = self.endpoints[i % self.endpoints.len()].clone();
+94:            self.spawn_connection(i, endpoint).await?;
+97:        self.start_maintenance_tasks();
+98:        Ok(())
+101:    async fn spawn_connection(&self, id: usize, url: String) -> Result<(), Box<dyn std::error::Error>> {
+102:        let (tx, mut rx) = mpsc::channel(MESSAGE_BUFFER_SIZE);
+103:        self.tx_channels.insert(id, tx);
+107:            url: url.clone(),
+116:                last_activity: Instant::now(),
+117:            })),
+118:            priority_queues: (0..PRIORITY_LEVELS).map(|_| VecDeque::with_capacity(1024)).collect(),
+119:            send_semaphore: Arc::new(Semaphore::new(256)),
+121:            last_ping: Instant::now(),
+122:            latency_samples: VecDeque::with_capacity(LATENCY_WINDOW),
+123:        });
+125:        self.connections.insert(id, state.clone());
+126:        self.connection_pool.write().push(id);
+128:        let connections = self.connections.clone();
+129:        let rx_sender = self.rx_sender.clone();
+130:        let shutdown = self.shutdown.clone();
+134:                if *shutdown.read() {
+138:                match Self::connect_with_optimization(&url).await {
+139:                    Ok(ws_stream) => {
+140:                        let mut state_guard = state.lock().await;
+141:                        state_guard.stream = Some(ws_stream);
+143:                        drop(state_guard);
+145:                        if let Err(e) = Self::handle_connection(
+146:                            state.clone(),
+148:                            rx_sender.clone(),
+149:                            shutdown.clone()
+150:                        ).await {
+151:                            let mut state_guard = state.lock().await;
+152:                            state_guard.metrics.write().errors += 1;
+153:                            eprintln!("Connection {} error: {:?}", id, e);
+156:                    Err(e) => {
+157:                        eprintln!("Failed to connect to {}: {:?}", url, e);
+161:                let mut state_guard = state.lock().await;
+163:                state_guard.metrics.write().reconnects += 1;
+164:                let delay = Self::calculate_backoff(state_guard.reconnect_count);
+165:                drop(state_guard);
+167:                tokio::time::sleep(Duration::from_millis(delay)).await;
+169:        });
+171:        Ok(())
+174:    async fn connect_with_optimization(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error>> {
+175:        let parsed_url = url::Url::parse(url)?;
+176:        let host = parsed_url.host_str().ok_or("Invalid URL")?;
+177:        let port = parsed_url.port_or_known_default().ok_or("Invalid port")?;
+179:        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+180:        socket.set_nodelay(true)?;
+181:        socket.set_nonblocking(true)?;
+183:        #[cfg(target_os = "linux")]
+185:            socket.set_reuse_address(true)?;
+186:            socket.set_reuse_port(true)?;
+187:            let _ = socket.set_tcp_quickack(true);
+190:        let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
+191:        match socket.connect(&addr.into()) {
+192:            Ok(_) => {},
+193:            Err(e) if e.raw_os_error() == Some(115) => {},
+194:            Err(e) => return Err(e.into()),
+197:        let tcp_stream: TcpStream = socket.into();
+198:        tcp_stream.set_nodelay(true)?;
+200:        let (ws_stream, _) = timeout(
+201:            Duration::from_millis(CONNECTION_TIMEOUT),
+202:            connect_async(url)
+203:        ).await??;
+205:        Ok(ws_stream)
+212:    ) -> Result<(), Box<dyn std::error::Error>> {
+213:        let ping_interval = interval(Duration::from_millis(PING_INTERVAL));
+214:        tokio::pin!(ping_interval);
+217:            if *shutdown.read() {
+221:            let mut state_guard = state.lock().await;
+222:            if state_guard.stream.is_none() {
+223:                drop(state_guard);
+224:                return Err("Stream disconnected".into());
+227:            let ws_stream = state_guard.stream.as_mut().unwrap();
+230:                msg = rx.recv() => {
+231:                    if let Some(msg) = msg {
+234:                            state_guard.priority_queues[priority].push_back(msg);
+239:                ws_msg = ws_stream.next() => {
+241:                        Some(Ok(Message::Binary(data))) => {
+242:                            let received_msg = Self::process_incoming_message(data)?;
+243:                            state_guard.metrics.write().messages_received += 1;
+244:                            state_guard.metrics.write().bytes_received += received_msg.payload.len() as u64;
+245:                            drop(state_guard);
+246:                            tx_global.send(received_msg).await?;
+248:                        Some(Ok(Message::Pong(data))) => {
+249:                            let latency = state_guard.last_ping.elapsed().as_micros() as f64 / 1000.0;
+250:                            state_guard.latency_samples.push_back(latency);
+251:                            if state_guard.latency_samples.len() > LATENCY_WINDOW {
+252:                                state_guard.latency_samples.pop_front();
+254:                            let avg_latency = state_guard.latency_samples.iter().sum::<f64>() 
+255:                                / state_guard.latency_samples.len() as f64;
+256:                            state_guard.metrics.write().latency_ms = avg_latency;
+258:                        Some(Ok(Message::Close(_))) => {
+259:                            drop(state_guard);
+260:                            return Err("Connection closed".into());
+262:                        Some(Err(e)) => {
+263:                            drop(state_guard);
+264:                            return Err(e.into());
+267:                            drop(state_guard);
+268:                            return Err("Stream ended".into());
+274:                _ = ping_interval.tick() => {
+275:                    state_guard.last_ping = Instant::now();
+276:                    let ping = Message::Ping(vec![]);
+277:                    ws_stream.send(ping).await?;
+282:                if let Some(msg) = state_guard.priority_queues[priority].pop_front() {
+283:                    if let Ok(_permit) = state_guard.send_semaphore.try_acquire() {
+284:                        let data = Self::prepare_outgoing_message(&msg)?;
+285:                        ws_stream.send(Message::Binary(data)).await?;
+286:                        state_guard.metrics.write().messages_sent += 1;
+287:                        state_guard.metrics.write().bytes_sent += msg.payload.len() as u64;
+289:                        state_guard.priority_queues[priority].push_front(msg);
+295:            state_guard.metrics.write().last_activity = Instant::now();
+296:            drop(state_guard);
+299:        Ok(())
+302:    pub async fn send_message(&self, payload: Vec<u8>, priority: u8) -> Result<u64, Box<dyn std::error::Error>> {
+304:            let mut next_id = self.next_id.write();
+310:        let compressed = payload.len() > COMPRESSION_THRESHOLD;
+312:            Self::compress_data(&payload)?
+317:        let hash = Self::calculate_hash(&processed_payload);
+321:            priority: priority.min((PRIORITY_LEVELS - 1) as u8),
+322:            timestamp: std::time::SystemTime::now()
+323:                .duration_since(std::time::UNIX_EPOCH)?
+324:                .as_millis() as u64,
+325:            payload: Bytes::from(processed_payload),
+330:        self.message_cache.insert(hash, (message.clone(), Instant::now()));
+332:        let pool = self.connection_pool.read();
+333:        if pool.is_empty() {
+334:            return Err("No active connections".into());
+337:        let best_connection = self.select_best_connection(&pool).await?;
+338:        drop(pool);
+340:        if let Some(tx) = self.tx_channels.get(&best_connection) {
+341:            tx.send(message).await?;
+342:            Ok(id)
+344:            Err("Connection channel not found".into())
+348:    async fn select_best_connection(&self, pool: &[usize]) -> Result<usize, Box<dyn std::error::Error>> {
+353:            if let Some(conn) = self.connections.get(&conn_id) {
+354:                let state = conn.lock().await;
+355:                let metrics = state.metrics.read();
+357:                let queue_size: usize = state.priority_queues.iter().map(|q| q.len()).sum();
+359:                let error_rate = metrics.errors as f64 / metrics.messages_sent.max(1) as f64;
+360:                let activity_age = state.last_ping.elapsed().as_millis() as f64;
+363:                    + (queue_size as f64) * 0.3 
+367:                if score < best_score && state.stream.is_some() {
+374:        Ok(best_id)
+377:    pub async fn receive_message(&mut self) -> Result<WSMessage, Box<dyn std::error::Error>> {
+378:        self.rx_channel.recv().await.ok_or("Receive channel closed".into())
+381:    fn start_maintenance_tasks(&self) {
+382:        let cache = self.message_cache.clone();
+383:        let connections = self.connections.clone();
+384:        let pool = self.connection_pool.clone();
+385:        let shutdown = self.shutdown.clone();
+388:            let mut cleanup_interval = interval(Duration::from_secs(30));
+389:            let mut health_check_interval = interval(Duration::from_secs(5));
+392:                if *shutdown.read() {
+397:                    _ = cleanup_interval.tick() => {
+398:                        let now = Instant::now();
+399:                        cache.retain(|_, (_, timestamp)| {
+400:                            now.duration_since(*timestamp).as_secs() < 300
+401:                        });
+404:                    _ = health_check_interval.tick() => {
+405:                        let mut healthy_connections = Vec::new();
+407:                        for entry in connections.iter() {
+408:                            let conn_id = *entry.key();
+409:                            let conn_state = entry.value();
+410:                            let state = conn_state.lock().await;
+412:                            let healthy = state.stream.is_some() && 
+413:                                         state.last_ping.elapsed().as_secs() < 30 &&
+414:                                         state.metrics.read().latency_ms < 1000.0;
+417:                                healthy_connections.push(conn_id);
+421:                        *pool.write() = healthy_connections;
+425:        });
+428:    fn calculate_backoff(attempt: u32) -> u64 {
+429:        let delay = RECONNECT_BASE_DELAY * (2u64.pow(attempt.min(10)));
+430:        delay.min(MAX_RECONNECT_DELAY)
+433:    fn compress_data(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+434:        let mut encoder = GzEncoder::new(Vec::with_capacity(data.len()), Compression::best());
+435:        encoder.write_all(data)?;
+436:        Ok(encoder.finish()?)
+439:    fn decompress_data(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+440:        let mut decoder = GzDecoder::new(data);
+441:        let mut decompressed = Vec::new();
+442:        decoder.read_to_end(&mut decompressed)?;
+443:        Ok(decompressed)
+446:    fn calculate_hash(data: &[u8]) -> [u8; 32] {
+447:        let mut hasher = Hasher::new();
+448:        hasher.update(data);
+449:        *hasher.finalize().as_bytes()
+452:    fn prepare_outgoing_message(msg: &WSMessage) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+456:            (msg.id >> 56) as u8,
+457:            (msg.id >> 48) as u8,
+458:            (msg.id >> 40) as u8,
+459:            (msg.id >> 32) as u8,
+460:            (msg.id >> 24) as u8,
+461:            (msg.id >> 16) as u8,
+462:            (msg.id >> 8) as u8,
+464:            (msg.timestamp >> 56) as u8,
+465:            (msg.timestamp >> 48) as u8,
+466:            (msg.timestamp >> 40) as u8,
+467:            (msg.timestamp >> 32) as u8,
+468:            (msg.timestamp >> 24) as u8,
+469:            (msg.timestamp >> 16) as u8,
+470:            (msg.timestamp >> 8) as u8,
+475:        result.extend_from_slice(&msg.hash);
+476:        result.extend_from_slice(&msg.payload);
+478:        Ok(result)
+481:    fn process_incoming_message(data: Vec<u8>) -> Result<WSMessage, Box<dyn std::error::Error>> {
+482:        if data.len() < 50 {
+483:            return Err("Invalid message format".into());
+492:        ]);
+497:        ]);
+500:        hash.copy_from_slice(&data[18..50]);
+504:            Self::decompress_data(payload_data)?
+506:            payload_data.to_vec()
+513:            payload: Bytes::from(payload),
+516:        })
+519:    pub async fn get_metrics(&self) -> HashMap<usize, ConnectionMetrics> {
+520:        let mut metrics = HashMap::new();
+522:        for entry in self.connections.iter() {
+523:            let id = *entry.key();
+524:            let state = entry.value().lock().await;
+525:            metrics.insert(id, state.metrics.read().clone());
+531:    pub async fn get_best_latency(&self) -> Option<f64> {
+532:        let pool = self.connection_pool.read();
+535:        for &conn_id in pool.iter() {
+536:            if let Some(conn) = self.connections.get(&conn_id) {
+537:                let state = conn.lock().await;
+538:                let latency = state.metrics.read().latency_ms;
+541:                    None => best_latency = Some(latency),
+542:                    Some(current_best) if latency < current_best => best_latency = Some(latency),
+551:    pub async fn force_reconnect(&self, connection_id: usize) -> Result<(), Box<dyn std::error::Error>> {
+552:        if let Some(conn) = self.connections.get(&connection_id) {
+553:            let mut state = conn.lock().await;
+554:            if let Some(stream) = state.stream.take() {
+555:                let _ = stream.close(None).await;
+559:        Ok(())
+562:    pub fn is_duplicate(&self, hash: &[u8; 32]) -> bool {
+563:        self.message_cache.contains_key(hash)
+566:    pub async fn shutdown(&mut self) {
+567:        *self.shutdown.write() = true;
+569:        for entry in self.connections.iter() {
+570:            let mut state = entry.value().lock().await;
+571:            if let Some(mut stream) = state.stream.take() {
+572:                let _ = stream.close(None).await;
+576:        self.connections.clear();
+577:        self.tx_channels.clear();
+578:        self.message_cache.clear();
+579:        self.connection_pool.write().clear();
+582:    pub fn get_active_connections(&self) -> usize {
+583:        self.connection_pool.read().len()
+586:    pub async fn add_endpoint(&mut self, endpoint: String) -> Result<(), Box<dyn std::error::Error>> {
+587:        if !self.endpoints.contains(&endpoint) {
+588:            self.endpoints.push(endpoint.clone());
+590:            let id = self.connections.len();
+592:                self.spawn_connection(id, endpoint).await?;
+595:        Ok(())
+598:    pub async fn remove_endpoint(&mut self, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+599:        self.endpoints.retain(|e| e != endpoint);
+601:        let mut to_remove = Vec::new();
+602:        for entry in self.connections.iter() {
+603:            let state = entry.value().lock().await;
+605:                to_remove.push(*entry.key());
+610:            if let Some((_, conn)) = self.connections.remove(&id) {
+611:                let mut state = conn.lock().await;
+612:                if let Some(mut stream) = state.stream.take() {
+613:                    let _ = stream.close(None).await;
+616:            self.tx_channels.remove(&id);
+617:            self.connection_pool.write().retain(|&x| x != id);
+620:        Ok(())
+623:    pub async fn optimize_connection_pool(&self) {
+624:        let metrics = self.get_metrics().await;
+625:        let mut scored_connections: Vec<(usize, f64)> = Vec::new();
+627:        for (id, metric) in metrics {
+629:                + (metric.errors as f64 / metric.messages_sent.max(1) as f64) * 500.0
+630:                + (metric.reconnects as f64) * 10.0;
+631:            scored_connections.push((id, score));
+634:        scored_connections.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+636:        let optimal_size = (scored_connections.len() / 2).max(4).min(MAX_CONNECTIONS);
+637:        let mut new_pool = Vec::new();
+639:        for (i, (id, _)) in scored_connections.iter().enumerate() {
+641:                new_pool.push(*id);
+645:        *self.connection_pool.write() = new_pool;
+650:#[cfg(test)]
+655:    async fn test_websocket_optimizer_initialization() {
+656:        let endpoints = vec!["wss://api.mainnet-beta.solana.com".to_string()];
+657:        let optimizer = WebSocketOptimizer::new(endpoints);
+658:        assert_eq!(optimizer.get_active_connections(), 0);
+662:    async fn test_message_compression() {
+664:        let compressed = WebSocketOptimizer::compress_data(&data).unwrap();
+665:        assert!(compressed.len() < data.len());
+667:        let decompressed = WebSocketOptimizer::decompress_data(&compressed).unwrap();
+668:        assert_eq!(data, decompressed);
+672:    async fn test_hash_calculation() {
+674:        let hash1 = WebSocketOptimizer::calculate_hash(data);
+675:        let hash2 = WebSocketOptimizer::calculate_hash(data);
+676:        assert_eq!(hash1, hash2);
+679:        let hash3 = WebSocketOptimizer::calculate_hash(different_data);
+680:        assert_ne!(hash1, hash3);

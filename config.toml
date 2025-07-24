@@ -1,0 +1,159 @@
+[network]
+primary_rpc = "https://api.mainnet-beta.solana.com"
+backup_rpcs = ["https://solana-api.projectserum.com", "https://rpc.ankr.com/solana"]
+ws_endpoint = "wss://api.mainnet-beta.solana.com"
+commitment_level = "confirmed"
+max_retries = 3
+retry_delay_ms = 100
+request_timeout_ms = 5000
+preflight_commitment = "processed"
+skip_preflight = true
+encoding = "base64"
+max_concurrent_requests = 100
+rate_limit_per_second = 50
+connection_pool_size = 10
+
+[trading]
+wallet_keypair_path = "./wallet.json"
+min_profit_bps = 30
+max_position_size_sol = 100.0
+max_slippage_bps = 50
+enable_jito_bundles = true
+jito_tip_amount_lamports = 10000
+jito_block_engine_url = "https://mainnet.block-engine.jito.wtf"
+priority_fee_lamports = 50000
+compute_unit_limit = 1400000
+compute_unit_price_micro_lamports = 100
+max_accounts_per_tx = 64
+enable_partial_fills = true
+min_order_size_sol = 0.1
+use_versioned_transactions = true
+enable_cross_program_invocation = true
+
+[risk]
+max_daily_loss_sol = 50.0
+max_position_count = 10
+max_exposure_sol = 500.0
+stop_loss_percentage = 2.0
+take_profit_percentage = 5.0
+max_gas_per_tx_sol = 0.01
+circuit_breaker_threshold = 10.0
+cooldown_period_ms = 5000
+max_consecutive_failures = 5
+enable_portfolio_hedging = true
+correlation_threshold = 0.7
+var_confidence_level = 0.95
+max_drawdown_percentage = 15.0
+
+[fees]
+raydium_fee_bps = 25
+orca_fee_bps = 30
+serum_fee_bps = 40
+jupiter_fee_bps = 20
+base_priority_fee = 50000
+dynamic_fee_enabled = true
+fee_percentile_target = 75
+max_priority_fee_lamports = 1000000
+fee_cache_duration_ms = 1000
+
+[monitoring]
+enable_metrics = true
+metrics_port = 9090
+log_level = "info"
+enable_telegram_alerts = false
+telegram_bot_token = ""
+telegram_chat_id = ""
+alert_min_profit_sol = 1.0
+enable_discord_webhook = false
+discord_webhook_url = ""
+performance_sample_size = 1000
+latency_threshold_ms = 100
+
+[execution]
+parallel_execution = true
+max_parallel_trades = 5
+bundle_size = 4
+pre_execution_simulation = true
+post_execution_verification = true
+enable_flashloans = true
+flashloan_provider = "solend"
+routing_algorithm = "smart_router_v2"
+path_finding_depth = 3
+enable_sandwich_protection = true
+front_run_protection_delay_ms = 50
+enable_atomic_arbitrage = true
+
+[mev]
+enable_mev_protection = true
+private_mempool_enabled = true
+searcher_reputation_threshold = 0.8
+bundle_auction_timeout_ms = 200
+enable_backrunning = true
+frontrun_detection_enabled = true
+sandwich_detection_threshold = 0.85
+
+[pools]
+min_liquidity_usd = 50000.0
+min_volume_24h_usd = 100000.0
+max_price_impact_percentage = 1.0
+blacklisted_pools = []
+whitelisted_pools = []
+auto_discovery_enabled = true
+pool_refresh_interval_ms = 60000
+depth_levels_to_track = 10
+enable_concentrated_liquidity = true
+
+[tokens]
+min_token_liquidity_usd = 10000.0
+token_metadata_cache_duration_ms = 3600000
+enable_token_screening = true
+rugpull_detection_enabled = true
+honeypot_detection_enabled = true
+stablecoin_addresses = [
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+]
+
+[[tokens.supported_tokens]]
+symbol = "SOL"
+address = "So11111111111111111111111111111111111111112"
+decimals = 9
+coingecko_id = "solana"
+max_position_size = 1000.0
+
+[[tokens.supported_tokens]]
+symbol = "USDC"
+address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+decimals = 6
+coingecko_id = "usd-coin"
+max_position_size = 100000.0
+
+[[tokens.supported_tokens]]
+symbol = "USDT"
+address = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+decimals = 6
+coingecko_id = "tether"
+max_position_size = 100000.0
+
+[advanced]
+enable_machine_learning = false
+ml_model_path = "./models/price_prediction.onnx"
+feature_engineering_enabled = true
+market_making_enabled = false
+market_making_spread_bps = 10
+inventory_target_ratio = 0.5
+enable_statistical_arbitrage = true
+correlation_window_size = 100
+zscore_entry_threshold = 2.0
+zscore_exit_threshold = 0.5
+enable_triangular_arbitrage = true
+gas_optimization_enabled = true
+transaction_compression_enabled = true
+enable_dark_pool_routing = false
+quote_stuffing_protection = true
+
+[mev.block_builder_tips]
+jito = 10000
+flashbots = 15000
+
+[fees.custom_fee_markets]

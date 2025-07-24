@@ -1,0 +1,4 @@
+
+> blockchain-bot@1.0.0 start
+> ts-node --transpile-only src/advanced-order-types/VWAPOptimizer.ts
+

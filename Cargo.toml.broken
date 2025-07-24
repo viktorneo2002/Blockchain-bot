@@ -1,0 +1,79 @@
+[package]
+name = "solana-mev-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core Solana dependencies only
+# Essential async runtime
+# Essential serialization
+# Basic error handling
+# Basic logging
+# Essential utilities
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+ark-bn254 = "0.4"
+ark-ec = "0.4"
+ark-ff = "0.4"
+ark-groth16 = "0.4"
+ark-serialize = "0.4"
+ark-std = "0.4"
+blake3 = "1.5"
+subtle = "2.5"
+hex = "0.4"
+solana-program = "1.17"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+ark-std = "0.4"
+proptest = "1.4"
+criterion = "0.5"
+
+[features]
+default = []
+enhanced-security = []
+profiling = []
+
+[profile.test]
+opt-level = 1
+debug = true
+overflow-checks = true
+
+[[bench]]
+name = "verification_benchmark"
+harness = false
+# Solana dependencies
+solana-program = "1.17"
+
+# Async runtime for ghost slot detection
+tokio = { version = "1.0", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# Error handling
+@@ -36,12 +36,16 @@
+tracing = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# Error handling
+thiserror = "1.0"
+
+# Neural network dependencies
+ndarray = "0.15"
+
+[[bin]]
+name = "whale_wallet_behavioral_fingerprinter"
+path = "whale_wallet_behavioral_fingerprinter.rs"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+base64 = "0.21"
