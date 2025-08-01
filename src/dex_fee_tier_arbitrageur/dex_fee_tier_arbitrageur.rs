@@ -414,61 +414,133 @@ impl DexFeeTierArbitrageur {
     }
 
     fn calculate_orca_output(pool: &PoolState, amount_in: u64, is_a_to_b: bool) -> (u64, bool) {
+        // Apply fee to input amount first
+        let amount_in_after_fee = Self::apply_fee(amount_in, pool.fee_rate);
         let sqrt_price_limit = Self::calculate_sqrt_price_limit(pool.sqrt_price_x64, is_a_to_b);
-        
-        let amount_specified = amount_in as i128;
-        let liquidity = pool.liquidity;
         let sqrt_price_current = pool.sqrt_price_x64;
+        let liquidity = pool.liquidity;
         
         if is_a_to_b {
             if sqrt_price_current <= sqrt_price_limit {
                 return (0, false);
             }
             
-            let delta_liquidity = liquidity.checked_mul(sqrt_price_current - sqrt_price_limit)
-                .and_then(|v| v.checked_div(Q64));
+            // Calculate output for token B using proper Orca AMM formula
+            // Based on Orca's get_amount_delta_b function
+            let sqrt_price_diff = sqrt_price_current - sqrt_price_limit;
             
-            match delta_liquidity {
-                Some(amount) if amount <= amount_specified as u128 => {
-                    let amount_out = liquidity
-                        .saturating_mul(sqrt_price_current - sqrt_price_limit)
-                        .saturating_div(sqrt_price_current.saturating_mul(sqrt_price_limit).saturating_div(Q64));
-                    (amount_out.min(u64::MAX as u128) as u64, true)
+            // Calculate numerator: liquidity * sqrt_price_diff
+            let numerator = liquidity.saturating_mul(sqrt_price_diff);
+            
+            // Calculate amount_out = (numerator >> 64) with proper rounding
+            let amount_out = if numerator > 0 && sqrt_price_diff > 0 {
+                let result = numerator >> 64;
+                // Check if we need to round up (if there's a remainder)
+                let remainder = numerator & 0xFFFFFFFFFFFFFFFF;
+                if remainder > 0 && result < u64::MAX as u128 {
+                    result as u64 + 1
+                } else {
+                    result.min(u64::MAX as u128) as u64
                 }
-                _ => (0, false)
-            }
+            } else {
+                0
+            };
+            
+            (amount_out, true)
         } else {
             if sqrt_price_current >= sqrt_price_limit {
                 return (0, false);
             }
             
-            let price_diff = sqrt_price_limit.saturating_sub(sqrt_price_current);
-            let denominator = sqrt_price_current.saturating_mul(sqrt_price_limit).saturating_div(Q64);
+            // Calculate output for token A using proper Orca AMM formula
+            // Based on Orca's get_amount_delta_a function
+            let sqrt_price_diff = sqrt_price_limit - sqrt_price_current;
+            
+            // Calculate numerator: liquidity * sqrt_price_diff * Q64
+            let numerator = liquidity.saturating_mul(sqrt_price_diff).saturating_mul(Q64);
+            
+            // Calculate denominator: sqrt_price_limit * sqrt_price_current
+            let denominator = sqrt_price_limit.saturating_mul(sqrt_price_current);
             
             if denominator == 0 {
                 return (0, false);
             }
             
-            let amount_out = liquidity.saturating_mul(price_diff).saturating_div(denominator);
-            (amount_out.min(u64::MAX as u128) as u64, true)
+            // Calculate amount_out = numerator / denominator with proper rounding
+            let (amount_out, remainder) = (numerator / denominator, numerator % denominator);
+            
+            // Round up if there's a remainder and we won't overflow
+            let amount_out = if remainder > 0 && amount_out < u64::MAX as u128 {
+                amount_out as u64 + 1
+            } else {
+                amount_out.min(u64::MAX as u128) as u64
+            };
+            
+            (amount_out, true)
         }
     }
 
     fn calculate_raydium_output(pool: &PoolState, amount_in: u64, is_a_to_b: bool) -> (u64, bool) {
-        if pool.sqrt_price_x64 == 0 {
+        
+        // Calculate token reserves from liquidity and price
+        // liquidity = sqrt(x * y) => x * y = liquidity^2
+        // price = y / x => y = price * x
+        // => x * price * x = liquidity^2 => x^2 = liquidity^2 / price => x = liquidity / sqrt(price)
+        // => y = liquidity * sqrt(price)
+        
+        let sqrt_price = pool.sqrt_price_x64;
+        let price = sqrt_price.saturating_mul(sqrt_price).saturating_div(Q64);
+        
+        if price == 0 {
             return (0, false);
         }
         
-        let price = pool.sqrt_price_x64.saturating_mul(pool.sqrt_price_x64).saturating_div(Q64);
+        // Calculate reserve_x (token A) and reserve_y (token B)
+        // Using: reserve_x = liquidity / sqrt(price) and reserve_y = liquidity * sqrt(price)
+        // We need to be careful with precision here
+        let liquidity_u128 = pool.liquidity;
         
         if is_a_to_b {
-            let output = (amount_in as u128).saturating_mul(price).saturating_div(Q64);
-            (output.min(u64::MAX as u128) as u64, true)
-        } else {
-            if price == 0 {
+            // Swapping token A for token B
+            // output = (reserve_y * amount_in_after_fee) / (reserve_x + amount_in_after_fee)
+            
+            // Calculate reserve_x = liquidity / sqrt(price)
+            // This is equivalent to: liquidity * Q64 / (sqrt_price * sqrt_price) * sqrt_price = liquidity * Q64 / sqrt_price
+            let reserve_x = liquidity_u128.saturating_mul(Q64).saturating_div(sqrt_price);
+            let reserve_y = liquidity_u128.saturating_mul(sqrt_price).saturating_div(Q64);
+            
+            if reserve_x == 0 {
                 return (0, false);
             }
-            let output = (amount_in as u128).saturating_mul(Q64).saturating_div(price);
+            
+            let numerator = reserve_y.saturating_mul(amount_in_after_fee as u128);
+            let denominator = reserve_x.saturating_add(amount_in_after_fee as u128);
+            
+            if denominator == 0 {
+                return (0, false);
+            }
+            
+            let output = numerator.saturating_div(denominator);
+            (output.min(u64::MAX as u128) as u64, true)
+        } else {
+            // Swapping token B for token A
+            // output = (reserve_x * amount_in_after_fee) / (reserve_y + amount_in_after_fee)
+            
+            let reserve_x = liquidity_u128.saturating_mul(Q64).saturating_div(sqrt_price);
+            let reserve_y = liquidity_u128.saturating_mul(sqrt_price).saturating_div(Q64);
+            
+            if reserve_y == 0 {
+                return (0, false);
+            }
+            
+            let numerator = reserve_x.saturating_mul(amount_in_after_fee as u128);
+            let denominator = reserve_y.saturating_add(amount_in_after_fee as u128);
+            
+            if denominator == 0 {
+                return (0, false);
+            }
+            
+            let output = numerator.saturating_div(denominator);
             (output.min(u64::MAX as u128) as u64, true)
         }
     }
@@ -812,23 +884,15 @@ fn sqrt_u128(value: u128) -> u128 {
         return 0;
     }
     
-    let mut bit = 1u128 << 64;
-    while bit > value {
-        bit >>= 2;
+    let mut x = value;
+    let mut y = (x + 1) / 2;
+    
+    while y < x {
+        x = y;
+        y = (x + value / x) / 2;
     }
     
-    let mut result = 0u128;
-    while bit != 0 {
-        if value >= result + bit {
-            value -= result + bit;
-            result = (result >> 1) + bit;
-        } else {
-            result >>= 1;
-        }
-        bit >>= 2;
-    }
-    
-    result
+    x
 }
 
 #[cfg(test)]
@@ -881,4 +945,3 @@ mod tests {
         assert_eq!(ata1, ata2);
     }
 }
-
