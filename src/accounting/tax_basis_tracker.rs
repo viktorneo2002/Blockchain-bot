@@ -9,6 +9,7 @@ use thiserror::Error;
 use bincode;
 use rocksdb::{DB, Options, WriteBatch};
 use std::path::Path;
+use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum TaxBasisError {
@@ -24,6 +25,8 @@ pub enum TaxBasisError {
     LockPoisoned,
     #[error("Token not found")]
     TokenNotFound,
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,8 +80,10 @@ pub struct TaxBasisTracker {
     positions: Arc<RwLock<HashMap<Pubkey, TokenPosition>>>,
     accounting_method: AccountingMethod,
     db: Option<DB>,
-    wash_sale_window: i64,
-    long_term_threshold: i64,
+    long_term_threshold: i64, // seconds
+    wash_sale_window: i64,    // seconds
+}
+    tax_filing_status: String,
 }
 
 impl TaxBasisTracker {
@@ -109,8 +114,8 @@ impl TaxBasisTracker {
             positions: Arc::new(RwLock::new(HashMap::new())),
             accounting_method,
             db,
-            wash_sale_window: 30 * 24 * 3600,
-            long_term_threshold: 365 * 24 * 3600,
+            long_term_threshold: 365 * 24 * 3600, // 1 year in seconds
+            wash_sale_window: 30 * 24 * 3600,     // 30 days in seconds
         })
     }
 
@@ -121,8 +126,22 @@ impl TaxBasisTracker {
         cost_per_unit: Decimal,
         tx_signature: String,
     ) -> Result<String, TaxBasisError> {
-        let lot_id = format!("{}-{}", token_mint, Utc::now().timestamp_nanos());
-        let total_cost = quantity * cost_per_unit;
+        // Input validation
+        if quantity <= Decimal::ZERO {
+            return Err(TaxBasisError::InvalidInput("Quantity must be positive".to_string()));
+        }
+        
+        if cost_per_unit < Decimal::ZERO {
+            return Err(TaxBasisError::InvalidInput("Cost per unit must be non-negative".to_string()));
+        }
+        
+        if tx_signature.is_empty() {
+            return Err(TaxBasisError::InvalidInput("Transaction signature cannot be empty".to_string()));
+        }
+        
+        let lot_id = format!("{}-{}", token_mint, Uuid::new_v4().to_string());
+        let total_cost = quantity.checked_mul(cost_per_unit)
+            .ok_or_else(|| TaxBasisError::InvalidInput("Cost calculation overflow".to_string()))?;
         
         let tax_lot = TaxLot {
             lot_id: lot_id.clone(),
@@ -171,8 +190,17 @@ impl TaxBasisTracker {
         price_per_unit: Decimal,
         tx_signature: String,
     ) -> Result<Vec<(String, Decimal)>, TaxBasisError> {
+        // Input validation
         if quantity <= Decimal::ZERO {
             return Err(TaxBasisError::InvalidAmount);
+        }
+        
+        if price_per_unit < Decimal::ZERO {
+            return Err(TaxBasisError::InvalidInput("Price per unit must be non-negative".to_string()));
+        }
+        
+        if tx_signature.is_empty() {
+            return Err(TaxBasisError::InvalidInput("Transaction signature cannot be empty".to_string()));
         }
 
         let mut positions = self.positions.write()
@@ -197,12 +225,19 @@ impl TaxBasisTracker {
 
         for (lot_idx, disposal_quantity) in lots_to_dispose {
             let lot = &mut position.lots[lot_idx];
-            let disposal_value = disposal_quantity * price_per_unit;
-            let cost_basis = disposal_quantity * lot.cost_basis_per_unit;
-            let realized_pnl = disposal_value - cost_basis;
+            
+            // Calculate values with overflow protection
+            let disposal_value = disposal_quantity.checked_mul(price_per_unit)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Disposal value calculation overflow".to_string()))?;
+            let cost_basis = disposal_quantity.checked_mul(lot.cost_basis_per_unit)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Cost basis calculation overflow".to_string()))?;
+            let realized_pnl = disposal_value.checked_sub(cost_basis)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Realized PNL calculation overflow".to_string()))?;
 
-            lot.quantity -= disposal_quantity;
-            lot.total_cost_basis = lot.quantity * lot.cost_basis_per_unit;
+            lot.quantity = lot.quantity.checked_sub(disposal_quantity)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Lot quantity subtraction underflow".to_string()))?;
+            lot.total_cost_basis = lot.quantity.checked_mul(lot.cost_basis_per_unit)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Lot cost basis calculation overflow".to_string()))?;
 
             if lot.quantity == Decimal::ZERO {
                 lot.is_disposed = true;
@@ -221,8 +256,10 @@ impl TaxBasisTracker {
         }
 
         position.lots.retain(|lot| !lot.is_disposed);
-        position.total_quantity -= quantity;
-        position.realized_pnl += total_realized_pnl;
+        position.total_quantity = position.total_quantity.checked_sub(quantity)
+            .ok_or_else(|| TaxBasisError::InvalidInput("Position quantity subtraction underflow".to_string()))?;
+        position.realized_pnl = position.realized_pnl.checked_add(total_realized_pnl)
+            .ok_or_else(|| TaxBasisError::InvalidInput("Position realized PNL addition overflow".to_string()))?;
         position.average_cost_basis = self.calculate_weighted_average(&position.lots);
         position.last_update = Utc::now();
 
@@ -311,13 +348,16 @@ impl TaxBasisTracker {
 
         for lot in lots.iter() {
             if !lot.is_disposed {
-                total_cost += lot.total_cost_basis;
-                total_quantity += lot.quantity;
+                total_cost = total_cost.checked_add(lot.total_cost_basis)
+                    .unwrap_or_else(|_| Decimal::ZERO); // In case of overflow, we return ZERO
+                total_quantity = total_quantity.checked_add(lot.quantity)
+                    .unwrap_or_else(|_| Decimal::ZERO); // In case of overflow, we return ZERO
             }
         }
 
         if total_quantity > Decimal::ZERO {
-            total_cost / total_quantity
+            total_cost.checked_div(total_quantity)
+                .unwrap_or_else(|_| Decimal::ZERO) // In case of division error, we return ZERO
         } else {
             Decimal::ZERO
         }
@@ -338,13 +378,16 @@ impl TaxBasisTracker {
             .map_err(|_| TaxBasisError::LockPoisoned)?;
 
         if let Some(position) = positions.get_mut(token_mint) {
-            let market_value = position.total_quantity * current_price;
+            let market_value = position.total_quantity.checked_mul(current_price)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Market value calculation overflow".to_string()))?;
             let cost_basis = position.lots.iter()
                 .filter(|lot| !lot.is_disposed)
                 .map(|lot| lot.total_cost_basis)
-                .sum::<Decimal>();
+                .try_fold(Decimal::ZERO, |acc, cost| acc.checked_add(cost))
+                .ok_or_else(|| TaxBasisError::InvalidInput("Cost basis calculation overflow".to_string()))?;
             
-            position.unrealized_pnl = market_value - cost_basis;
+            position.unrealized_pnl = market_value.checked_sub(cost_basis)
+                .ok_or_else(|| TaxBasisError::InvalidInput("Unrealized PNL calculation overflow".to_string()))?;
             position.last_update = Utc::now();
             
             if let Some(ref db) = self.db {
@@ -379,7 +422,8 @@ impl TaxBasisTracker {
         };
 
         if let Some(position) = positions.get(token_mint) {
-            let long_term_cutoff = Utc::now() - chrono::Duration::seconds(self.long_term_threshold);
+            let long_term_cutoff = Utc::now().checked_sub_signed(chrono::Duration::seconds(self.long_term_threshold))
+                .ok_or_else(|| TaxBasisError::InvalidInput("Invalid long term threshold".to_string()))?;
             
             for lot in &position.lots {
                 if let Some(disposal_time) = lot.disposal_time {
@@ -421,8 +465,10 @@ impl TaxBasisTracker {
                 if disposal_time >= start_date && disposal_time <= end_date {
                     if let Some(loss) = lot.realized_pnl {
                         if loss < Decimal::ZERO {
-                            let wash_start = disposal_time - wash_window;
-                            let wash_end = disposal_time + wash_window;
+                            let wash_start = disposal_time.checked_sub_signed(wash_window)
+                                .ok_or_else(|| TaxBasisError::InvalidInput("Invalid wash sale window start".to_string()))?;
+                            let wash_end = disposal_time.checked_add_signed(wash_window)
+                                .ok_or_else(|| TaxBasisError::InvalidInput("Invalid wash sale window end".to_string()))?;
                             
                             for (j, other_lot) in position.lots.iter().enumerate() {
                                 if i != j && other_lot.acquisition_time >= wash_start 
@@ -678,4 +724,3 @@ mod tests {
         assert_eq!(disposals[1].1, dec!(250));
     }
 }
-
