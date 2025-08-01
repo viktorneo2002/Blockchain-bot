@@ -212,10 +212,10 @@ impl DexFeeTierArbitrageur {
         let liquidity = u128::from_le_bytes(data[49..65].try_into().unwrap());
         let sqrt_price_x64 = u128::from_le_bytes(data[65..81].try_into().unwrap());
         let tick_current = i32::from_le_bytes(data[81..85].try_into().unwrap());
-        let token_mint_a = Pubkey::new(&data[101..133]);
-        let token_vault_a = Pubkey::new(&data[133..165]);
-        let token_mint_b = Pubkey::new(&data[181..213]);
-        let token_vault_b = Pubkey::new(&data[213..245]);
+        let token_mint_a = Pubkey::try_from(&data[101..133]).unwrap();
+        let token_vault_a = Pubkey::try_from(&data[133..165]).unwrap();
+        let token_mint_b = Pubkey::try_from(&data[181..213]).unwrap();
+        let token_vault_b = Pubkey::try_from(&data[213..245]).unwrap();
         
         if liquidity < MIN_LIQUIDITY || sqrt_price_x64 == 0 {
             return Err(ArbitrageError::InsufficientLiquidity);
@@ -250,17 +250,17 @@ impl DexFeeTierArbitrageur {
         let swap_fee_denominator = u64::from_le_bytes(data[184..192].try_into().unwrap());
         let base_total_deposited = u128::from_le_bytes(data[240..256].try_into().unwrap());
         let quote_total_deposited = u128::from_le_bytes(data[224..240].try_into().unwrap());
-        let base_vault = Pubkey::new(&data[336..368]);
-        let quote_vault = Pubkey::new(&data[368..400]);
-        let base_mint = Pubkey::new(&data[400..432]);
-        let quote_mint = Pubkey::new(&data[432..464]);
+        let base_vault = Pubkey::try_from(&data[336..368]).unwrap();
+        let quote_vault = Pubkey::try_from(&data[368..400]).unwrap();
+        let base_mint = Pubkey::try_from(&data[400..432]).unwrap();
+        let quote_mint = Pubkey::try_from(&data[432..464]).unwrap();
         
         if base_total_deposited < MIN_LIQUIDITY || quote_total_deposited < MIN_LIQUIDITY {
             return Err(ArbitrageError::InsufficientLiquidity);
         }
         
         let fee_rate = if swap_fee_denominator > 0 {
-            (swap_fee_numerator * FEE_RATE_MUL / swap_fee_denominator) as u32
+            (swap_fee_numerator as u128 * FEE_RATE_MUL / swap_fee_denominator as u128) as u32
         } else {
             2500
         };
@@ -944,4 +944,87 @@ mod tests {
         let ata2 = DexFeeTierArbitrageur::get_associated_token_address(&wallet, &mint);
         assert_eq!(ata1, ata2);
     }
+
+    #[test]
+    fn test_calculate_orca_output() {
+        // Test case 1: Normal A to B swap
+        let pool = PoolState {
+            address: Pubkey::new_unique(),
+            token_a: Pubkey::new_unique(),
+            token_b: Pubkey::new_unique(),
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            fee_rate: 3000, // 0.3%
+            sqrt_price_x64: 1_000_000_000_000u128,
+            liquidity: 1_000_000_000_000u128,
+            tick_current: 0,
+            protocol: Protocol::Orca,
+            last_update: 0,
+        };
+        
+        let (output, is_valid) = DexFeeTierArbitrageur::calculate_orca_output(&pool, 1_000_000, true);
+        assert!(is_valid);
+        assert!(output > 0);
+        
+        // Test case 2: Normal B to A swap
+        let (output, is_valid) = DexFeeTierArbitrageur::calculate_orca_output(&pool, 1_000_000, false);
+        assert!(is_valid);
+        assert!(output > 0);
+        
+        // Test case 3: Zero liquidity
+        let pool_zero_liquidity = PoolState {
+            liquidity: 0,
+            ..pool
+        };
+        let (output, is_valid) = DexFeeTierArbitrageur::calculate_orca_output(&pool_zero_liquidity, 1_000_000, true);
+        assert!(!is_valid);
+        assert_eq!(output, 0);
+    }
+
+    #[test]
+    fn test_calculate_raydium_output() {
+        // Test case 1: Normal A to B swap
+        let pool = PoolState {
+            address: Pubkey::new_unique(),
+            token_a: Pubkey::new_unique(),
+            token_b: Pubkey::new_unique(),
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            fee_rate: 2500, // 0.25%
+            sqrt_price_x64: 1_000_000_000_000u128,
+            liquidity: 1_000_000_000_000u128,
+            tick_current: 0,
+            protocol: Protocol::Raydium,
+            last_update: 0,
+        };
+        
+        let (output, is_valid) = DexFeeTierArbitrageur::calculate_raydium_output(&pool, 1_000_000, true);
+        assert!(is_valid);
+        assert!(output > 0);
+        
+        // Test case 2: Normal B to A swap
+        let (output, is_valid) = DexFeeTierArbitrageur::calculate_raydium_output(&pool, 1_000_000, false);
+        assert!(is_valid);
+        assert!(output > 0);
+        
+        // Test case 3: Zero liquidity
+        let pool_zero_liquidity = PoolState {
+            liquidity: 0,
+            ..pool
+        };
+        let (output, is_valid) = DexFeeTierArbitrageur::calculate_raydium_output(&pool_zero_liquidity, 1_000_000, true);
+        assert!(!is_valid);
+        assert_eq!(output, 0);
+    }
 }
+
+pub async fn create_arbitrageur(
+    rpc_url: &str,
+    keypair_path: &str,
+) -> Result<DexFeeTierArbitrageur, Box<dyn std::error::Error>> {
+    let keypair_bytes = std::fs::read(keypair_path)?;
+    let keypair = Keypair::from_bytes(&keypair_bytes)?;
+    Ok(DexFeeTierArbitrageur::new(rpc_url, keypair))
+}
+
+
