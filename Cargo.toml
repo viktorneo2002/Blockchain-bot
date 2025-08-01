@@ -14,6 +14,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solana-transaction-status = "2.3.5"
+uuid = { version = "1.0", features = ["v4"] }
 # jito-tip-distribution-sdk = { path = "jito-sdk/programs/sdk" }
 # raydium-sdk = { git = "https://github.com/raydium-io/raydium-sdk-V2", branch = "master" }
 # orca-whirlpool-sdk = { git = "https://github.com/orca-so/whirlpools", package = "whirlpool-sdk", branch = "main" }
@@ -64,3 +65,4 @@ path = "whale_wallet_behavioral_fingerprinter.rs"
 [[bench]]
 name = "verification_benchmark"
 harness = false
+
