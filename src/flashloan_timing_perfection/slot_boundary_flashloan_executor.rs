@@ -22,6 +22,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionEncoding;
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -56,7 +57,7 @@ struct SlotTracker {
     current_slot: Arc<AtomicU64>,
     slot_start_time: Arc<RwLock<Instant>>,
     leader_schedule: Arc<RwLock<Vec<Pubkey>>>,
-    slot_hashes: Arc<RwLock<Vec<(u64, Hash)>>>,
+    slot_hashes: Arc<RwLock<VecDeque<(u64, Hash)>>>,
 }
 
 #[derive(Clone)]
@@ -98,7 +99,7 @@ impl SlotBoundaryFlashLoanExecutor {
             current_slot: Arc::new(AtomicU64::new(0)),
             slot_start_time: Arc::new(RwLock::new(Instant::now())),
             leader_schedule: Arc::new(RwLock::new(Vec::with_capacity(SLOT_LEADER_SCHEDULE_CACHE_SIZE))),
-            slot_hashes: Arc::new(RwLock::new(Vec::with_capacity(150))),
+            slot_hashes: Arc::new(RwLock::new(VecDeque::with_capacity(150))),
         });
 
         let priority_fee_calculator = Arc::new(PriorityFeeCalculator {
@@ -117,6 +118,7 @@ impl SlotBoundaryFlashLoanExecutor {
 
         executor.start_slot_monitoring().await;
         executor.start_priority_fee_monitoring().await;
+        executor.start_leader_schedule_refresh().await;
 
         Ok(executor)
     }
@@ -140,11 +142,11 @@ impl SlotBoundaryFlashLoanExecutor {
                         *slot_tracker.slot_start_time.write().await = Instant::now();
                         last_slot = current_slot;
 
-                        if let Ok(recent_blockhashes) = rpc_client.get_recent_blockhash().await {
+                        if let Ok(recent_blockhash) = rpc_client.get_latest_blockhash().await {
                             let mut slot_hashes = slot_tracker.slot_hashes.write().await;
-                            slot_hashes.push((current_slot, recent_blockhashes.0));
+                            slot_hashes.push_back((current_slot, recent_blockhash));
                             if slot_hashes.len() > 150 {
-                                slot_hashes.remove(0);
+                                slot_hashes.pop_front();
                             }
                         }
                     }
@@ -181,6 +183,22 @@ impl SlotBoundaryFlashLoanExecutor {
                         let optimal_fee = sorted_fees[percentile_index];
                         priority_fee_calculator.base_priority_fee.store(optimal_fee, Ordering::Release);
                     }
+                }
+            }
+        });
+    }
+
+    async fn start_leader_schedule_refresh(&self) {
+        let executor = self.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(60)); // Refresh every minute
+            
+            loop {
+                interval.tick().await;
+                
+                if let Err(e) = executor.refresh_leader_schedule().await {
+                    eprintln!("Failed to refresh leader schedule: {}", e);
                 }
             }
         });
@@ -300,7 +318,7 @@ impl SlotBoundaryFlashLoanExecutor {
     async fn get_optimal_blockhash(&self) -> Result<Hash, Box<dyn std::error::Error>> {
         let slot_hashes = self.slot_tracker.slot_hashes.read().await;
         
-        if let Some((_, hash)) = slot_hashes.last() {
+        if let Some((_, hash)) = slot_hashes.back() {
             Ok(*hash)
         } else {
             Ok(self.rpc_client.get_latest_blockhash().await?)
@@ -363,10 +381,10 @@ impl SlotBoundaryFlashLoanExecutor {
         max_retries: u8,
     ) -> Result<Signature, Box<dyn std::error::Error>> {
         let config = RpcSendTransactionConfig {
-            skip_preflight: true,
-            preflight_commitment: None,
+            skip_preflight: false, // Fixed: Changed to false for proper validation
+            preflight_commitment: Some(CommitmentConfig::processed()), // Added proper commitment
             encoding: None,
-            max_retries: Some(0),
+            max_retries: Some(max_retries as u64), // Fixed: Align with function parameter
             min_context_slot: None,
         };
 
@@ -393,7 +411,7 @@ impl SlotBoundaryFlashLoanExecutor {
                             }
                         }
                         
-                        sleep(Duration::from_millis(100)).await;
+                        sleep(Duration::from_millis(100 * (retry_count as u64 + 1))).await; // Exponential backoff
                         confirmation_attempts += 1;
                     }
 
@@ -404,7 +422,7 @@ impl SlotBoundaryFlashLoanExecutor {
                     retry_count += 1;
                     
                     if retry_count < max_retries {
-                        sleep(Duration::from_millis(50 * retry_count as u64)).await;
+                        sleep(Duration::from_millis(100 * (retry_count as u64).pow(2))).await; // Exponential backoff
                     }
                 }
             }
@@ -450,6 +468,12 @@ impl SlotBoundaryFlashLoanExecutor {
 
     pub async fn get_slot_leader(&self, slot: u64) -> Option<Pubkey> {
         let leader_schedule = self.slot_tracker.leader_schedule.read().await;
+        
+        // Fixed: Check for empty leader schedule
+        if leader_schedule.is_empty() {
+            return None;
+        }
+        
         let slot_index = slot as usize % leader_schedule.len();
         
         if slot_index < leader_schedule.len() {
