@@ -1,5 +1,11 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::{token::{Token, TokenAccount}, transfer::Transfer};
+use solana_sdk::transaction::Transaction;
+use solana_program::program_error::ProgramError;
+use anchor_lang::prelude::CpiContext;
+
+// Module declarations
+pub mod dex_fee_tier_arbitrageur;
 
 // Error codes
 #[error_code]
@@ -277,7 +283,7 @@ pub mod flash_loan_aggregator {
     }
 
     // Helper function to execute swap route with proper account handling
-    fn execute_swap_route(ctx: &Context<ExecuteFlashLoan>, route: &SwapRouteData) -> Result<()> {
+    fn execute_swap_route(ctx: &Context<ExecuteFlashLoan>, route: &SwapRouteData) -> Result<(), ProgramError> {
         // Convert AccountMetadata to AccountMeta for CPI
         let account_metas: Vec<AccountMeta> = route.swap_accounts
             .iter()
@@ -346,7 +352,7 @@ pub mod flash_loan_aggregator {
     }
 
     // Helper function to verify profit
-    fn verify_profit(ctx: &Context<ExecuteFlashLoan>, flash_loan_amount: u64) -> Result<()> {
+    fn verify_profit(ctx: &Context<ExecuteFlashLoan>, flash_loan_amount: u64) -> Result<(), ProgramError> {
         // In a real implementation, this would check the profit vault balance
         // and ensure the flash loan is profitable
         
