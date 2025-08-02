@@ -21,7 +21,10 @@ impl RiskManager {
     }
     
     pub async fn check_position_limits(&self, amount: u64) -> bool {
-        let current = self.current_positions.read().unwrap();
+        let current = self.current_positions.read().map_err(|e| {
+            eprintln!("Failed to acquire read lock on current_positions: {}", e);
+            false
+        }).unwrap_or(false);
         *current + amount <= self.max_position_size
     }
 }
