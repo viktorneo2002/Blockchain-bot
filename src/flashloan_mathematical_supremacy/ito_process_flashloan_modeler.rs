@@ -31,6 +31,7 @@ use std::{
 use crate::flashloan_mathematical_supremacy::strategy_integrator::StrategyIntegrator;
 use crate::analytics::kalman_filter_spread_predictor::KalmanFilterSpreadPredictor;
 use crate::ornstein_uhlenbeck_mean_reverter::ornstein_uhlenbeck_mean_reverter::OrnsteinUhlenbeckStrategy;
+use crate::amm_exploitation::orca_whirlpool_optimizer::OrcaWhirlpoolOptimizer;
     rc::Rc,
     cell::RefCell,
 };
@@ -42,6 +43,10 @@ use serde::{Serialize, Deserialize};
 use bincode;
 use blake3;
 use arrayref::{array_ref, array_refs};
+
+// Solana Program IDs
+const ORCA_WHIRLPOOL: Pubkey = solana_program::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+const TOKEN_PROGRAM_ID: Pubkey = solana_program::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 // Production constants for Solana mainnet
 const MIN_LIQUIDITY_DEPTH: u64 = 1_000_000_000; // $1000 minimum
@@ -95,6 +100,9 @@ pub struct LiquidityPool {
     pub current_sqrt_price: u128,
     pub tick_spacing: u16,
     pub oracle_address: Option<Pubkey>,
+    // Orca-specific fields
+    pub token_vault_a: Pubkey,
+    pub token_vault_b: Pubkey,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -172,6 +180,10 @@ pub struct SwapRoute {
     pub minimum_output: u64,
     pub price_impact_bps: u64,
     pub route_type: RouteType,
+    // Orca-specific fields
+    pub input_vault: Pubkey,
+    pub output_vault: Pubkey,
+    pub is_base_to_quote: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +202,7 @@ pub struct ITOFlashLoanModeler {
     rpc_client: Arc<RpcClient>,
     event_sender: Sender<ModelEvent>,
     metrics: Arc<ParkingRwLock<ProductionMetrics>>,
+    orca_optimizer: Arc<OrcaWhirlpoolOptimizer>,
 }
 
 pub struct PriceOracle {
@@ -277,7 +290,7 @@ impl ITOFlashLoanModeler {
         
         let (event_sender, _) = bounded(1000);
         
-        Ok(Self {
+        let modeler = Self {
             models: Arc::new(ParkingRwLock::new(HashMap::with_capacity(1000))),
             price_oracle: Arc::new(PriceOracle {
                 pyth_feeds,
@@ -298,7 +311,10 @@ impl ITOFlashLoanModeler {
             rpc_client,
             event_sender,
             metrics: Arc::new(ParkingRwLock::new(ProductionMetrics::default())),
-        })
+            orca_optimizer: Arc::new(OrcaWhirlpoolOptimizer::new()),
+        };
+        
+        Ok(modeler)
     }
 
     pub async fn analyze_ito_opportunity(
@@ -422,6 +438,28 @@ impl ITOFlashLoanModeler {
             all_paths.extend(multi_hop_paths);
         }
         
+        // Orca optimized paths
+        // Find all unique token pairs in the liquidity pools
+        let mut token_pairs: Vec<(Pubkey, Pubkey)> = Vec::new();
+        for pool in &model.liquidity_pools {
+            // Skip non-Orca pools for this optimization
+            if pool.pool_type != PoolType::Orca {
+                continue;
+            }
+            
+            // Add token pair (token_a, token_b) and (token_b, token_a)
+            token_pairs.push((pool.token_a_mint, pool.token_b_mint));
+            token_pairs.push((pool.token_b_mint, pool.token_a_mint));
+        }
+        
+        // Find optimal Orca routes for each token pair
+        for (input_mint, output_mint) in token_pairs {
+            if let Some(orca_route) = self.find_optimal_orca_route(input_mint, output_mint, loan_amount).await? {
+                // Convert single route to path format
+                all_paths.push(vec![orca_route]);
+            }
+        }
+        
         // Sort by expected profit and filter top candidates
         all_paths.sort_by(|a, b| {
             let profit_a = self.estimate_path_profit(a, loan_amount).unwrap_or(0);
@@ -467,6 +505,10 @@ impl ITOFlashLoanModeler {
                 minimum_output: first_output * 995 / 1000, // 0.5% slippage
                 price_impact_bps: self.calculate_price_impact(first_pool, amount)?,
                 route_type: RouteType::Direct,
+                // Orca-specific fields
+                input_vault: if first_pool.pool_type == PoolType::Orca { first_pool.token_vault_a } else { Pubkey::default() },
+                output_vault: if first_pool.pool_type == PoolType::Orca { first_pool.token_vault_b } else { Pubkey::default() },
+                is_base_to_quote: first_pool.pool_type == PoolType::Orca && price_a <= price_b,
             },
             SwapRoute {
                 pool_address: second_pool.pool_address,
@@ -475,6 +517,10 @@ impl ITOFlashLoanModeler {
                 minimum_output: amount + (amount * MIN_PROFIT_BPS / 10000),
                 price_impact_bps: self.calculate_price_impact(second_pool, first_output)?,
                 route_type: RouteType::Direct,
+                // Orca-specific fields
+                input_vault: if second_pool.pool_type == PoolType::Orca { second_pool.token_vault_a } else { Pubkey::default() },
+                output_vault: if second_pool.pool_type == PoolType::Orca { second_pool.token_vault_b } else { Pubkey::default() },
+                is_base_to_quote: second_pool.pool_type == PoolType::Orca && price_a > price_b,
             },
         ]))
     }
@@ -500,6 +546,10 @@ impl ITOFlashLoanModeler {
                 minimum_output: 0,
                 price_impact_bps: 0,
                 route_type: RouteType::Direct,
+                // Orca-specific fields (default values for multi-hop paths)
+                input_vault: if pool.pool_type == PoolType::Orca { pool.token_vault_a } else { Pubkey::default() },
+                output_vault: if pool.pool_type == PoolType::Orca { pool.token_vault_b } else { Pubkey::default() },
+                is_base_to_quote: pool.pool_type == PoolType::Orca,
             }]]);
         }
         
@@ -518,6 +568,10 @@ impl ITOFlashLoanModeler {
                             minimum_output: output_amount * 995 / 1000,
                             price_impact_bps: self.calculate_price_impact(pool, amount)?,
                             route_type: RouteType::Direct,
+                            // Orca-specific fields
+                            input_vault: if pool.pool_type == PoolType::Orca { pool.token_vault_a } else { Pubkey::default() },
+                            output_vault: if pool.pool_type == PoolType::Orca { pool.token_vault_b } else { Pubkey::default() },
+                            is_base_to_quote: pool.pool_type == PoolType::Orca,
                         });
                         
                         let key = (hop, pool.quote_mint, output_amount);
@@ -565,7 +619,7 @@ impl ITOFlashLoanModeler {
         let amount_after_fee = input_amount - fee_amount;
         
         match pool.pool_type {
-            PoolType::RaydiumV3 | PoolType::Orca => {
+            PoolType::RaydiumV3 => {
                 // Concentrated liquidity calculation
                 let (input_reserve, output_reserve) = if is_base_to_quote {
                     (pool.base_reserve, pool.quote_reserve)
@@ -580,6 +634,10 @@ impl ITOFlashLoanModeler {
                 
                 Ok(output_amount)
             },
+            PoolType::Orca => {
+                // Use Orca optimizer for more accurate calculations
+                self.calculate_orca_swap_output(pool.pool_address, input_amount, is_base_to_quote)
+            },
             PoolType::Phoenix => {
                 // Order book style calculation
                 let effective_price = self.calculate_pool_price(pool)?;
@@ -591,22 +649,17 @@ impl ITOFlashLoanModeler {
                 Ok(output)
             },
             PoolType::Meteora => {
-                // Dynamic AMM calculation
-                let (input_reserve, output_reserve) = if is_base_to_quote {
-                    (pool.base_reserve, pool.quote_reserve)
-                } else {
-                    (pool.quote_reserve, pool.base_reserve)
-                };
-                
-                let amplifier = 100_u128; // Meteora's amplification factor
-                let d = self.calculate_stable_swap_d(input_reserve, output_reserve, amplifier)?;
+                // Stable swap calculation
+                let amp = pool.stable_amp.unwrap_or(100) as u128;
+                let d = self.calculate_stable_swap_d(pool.base_reserve, pool.quote_reserve, amp)?;
                 let output = self.calculate_stable_swap_output(
-                    input_reserve,
-                    output_reserve,
+                    pool.base_reserve,
+                    pool.quote_reserve,
                     amount_after_fee,
-                    amplifier,
+                    amp,
                     d,
                 )?;
+                
                 Ok(output)
             },
         }
@@ -663,7 +716,14 @@ impl ITOFlashLoanModeler {
 
     fn calculate_price_impact(&self, pool: &LiquidityPool, amount: u64) -> Result<u64> {
         let output_no_impact = match pool.pool_type {
-            PoolType::RaydiumV3 | PoolType::Orca => {
+            PoolType::RaydiumV3 => {
+                let price = self.calculate_pool_price(pool)?;
+                (amount as f64 * price) as u64
+            },
+            PoolType::Orca => {
+                // For Orca pools, we use the pool price for theoretical calculation
+                // The actual swap output is computed via the OrcaWhirlpoolOptimizer in calculate_swap_output
+                // This approach ensures we're using Orca's precise concentrated liquidity model
                 let price = self.calculate_pool_price(pool)?;
                 (amount as f64 * price) as u64
             },
@@ -1434,40 +1494,6 @@ impl VolatilityTracker {
             self.garch_params.insert(token_mint, GARCHParameters {
                 omega: GARCH_OMEGA,
                 alpha: GARCH_ALPHA,
-                beta: GARCH_BETA,
-                current_variance: 0.0004,
-            });
-        }
-    }
-}
-
-impl ExecutionSimulator {
-    fn new() -> Self {
-        Self {
-            slippage_model: SlippageModel {
-                base_slippage_bps: 10,
-                size_impact_factor: 0.0001,
-                volatility_factor: 2.0,
-                time_decay_factor: 0.95,
-            },
-            latency_estimator: LatencyEstimator {
-                network_latency_ms: 50,
-                computation_time_ms: 10,
-                confirmation_time_slots: 2,
-            },
-            failure_predictor: FailurePredictor {
-                historical_success_rate: 0.95,
-                congestion_factor: 1.0,
-                competition_level: 1.0,
-            },
-            simulation_cache: DashMap::with_capacity(10000),
-        }
-    }
-
-    fn simulate_execution(
-        &self,
-        path: &[SwapRoute],
-        amount: u64,
         conditions: &MarketConditions,
     ) -> Result<SimulationResult> {
         let cache_key = self.generate_simulation_key(path, amount)?;
@@ -1743,37 +1769,97 @@ fn build_swap_instruction(
     route: &SwapRoute,
     trader: &Pubkey,
 ) -> Result<Instruction> {
-    let data = match &route.route_type {
-        RouteType::Direct => {
-            bincode::serialize(&SwapInstruction::Swap {
-                amount_in: route.input_amount,
-                minimum_amount_out: route.minimum_output,
-            })?
-        },
-        RouteType::MultiHop(hops) => {
-            bincode::serialize(&SwapInstruction::MultiHopSwap {
-                amount_in: route.input_amount,
-                minimum_amount_out: route.minimum_output,
-                path: hops.clone(),
-            })?
-        },
-        RouteType::Split(splits) => {
-            bincode::serialize(&SwapInstruction::SplitSwap {
-                amount_in: route.input_amount,
-                minimum_amount_out: route.minimum_output,
-                splits: splits.clone(),
-            })?
-        },
-    };
-    
-    Ok(Instruction {
-        program_id: route.pool_address,
-        accounts: vec![
-            AccountMeta::new(*trader, true),
+    // Check if this is an Orca pool and build specific Orca instruction
+    if route.pool_type == PoolType::Orca {
+        // For Orca pools, we need to build the specific Whirlpool swap instruction
+        // This requires deriving the tick arrays and oracle accounts
+        
+        // Derive tick array PDAs (using standard tick spacing of 64 for most pools)
+        let tick_array_lower = Pubkey::find_program_address(
+            &[b"tick_array", route.pool_address.as_ref(), &(-44352i32).to_le_bytes()],
+            &ORCA_WHIRLPOOL
+        ).0;
+        
+        let tick_array_middle = Pubkey::find_program_address(
+            &[b"tick_array", route.pool_address.as_ref(), &0i32.to_le_bytes()],
+            &ORCA_WHIRLPOOL
+        ).0;
+        
+        let tick_array_upper = Pubkey::find_program_address(
+            &[b"tick_array", route.pool_address.as_ref(), &44352i32.to_le_bytes()],
+            &ORCA_WHIRLPOOL
+        ).0;
+        
+        // Derive oracle PDA
+        let oracle = Pubkey::find_program_address(
+            &[b"oracle", route.pool_address.as_ref()],
+            &ORCA_WHIRLPOOL
+        ).0;
+        
+        // Create account metas for Orca swap instruction
+        let accounts = vec![
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*trader, true),
             AccountMeta::new(route.pool_address, false),
-        ],
-        data,
-    })
+            AccountMeta::new_readonly(route.input_vault, false), // Source token account
+            AccountMeta::new(route.input_vault, false), // Input vault
+            AccountMeta::new(route.output_vault, false), // Output vault
+            AccountMeta::new_readonly(route.output_vault, false), // Destination token account
+            AccountMeta::new(tick_array_lower, false),
+            AccountMeta::new(tick_array_middle, false),
+            AccountMeta::new(tick_array_upper, false),
+            AccountMeta::new_readonly(oracle, false),
+        ];
+        
+        // Build Orca swap instruction data using the correct format
+        // Instruction discriminator for swap is 0xf8
+        let mut data = vec![0xf8];
+        
+        // Add amount, other amount threshold, sqrt price limit, and direction
+        data.extend_from_slice(&route.input_amount.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // other_amount_threshold (0 for no limit)
+        data.extend_from_slice(&(u128::MAX / 2).to_le_bytes()); // sqrt_price_limit (no limit)
+        data.push(if route.is_base_to_quote { 1 } else { 0 }); // amount_specified_is_input
+        
+        Ok(Instruction {
+            program_id: ORCA_WHIRLPOOL,
+            accounts,
+            data,
+        })
+    } else {
+        // For non-Orca pools, use the existing generic instruction building
+        let data = match &route.route_type {
+            RouteType::Direct => {
+                bincode::serialize(&SwapInstruction::Swap {
+                    amount_in: route.input_amount,
+                    minimum_amount_out: route.minimum_output,
+                })?
+            },
+            RouteType::MultiHop(hops) => {
+                bincode::serialize(&SwapInstruction::MultiHopSwap {
+                    amount_in: route.input_amount,
+                    minimum_amount_out: route.minimum_output,
+                    path: hops.clone(),
+                })?
+            },
+            RouteType::Split(splits) => {
+                bincode::serialize(&SwapInstruction::SplitSwap {
+                    amount_in: route.input_amount,
+                    minimum_amount_out: route.minimum_output,
+                    splits: splits.clone(),
+                })?
+            },
+        };
+        
+        Ok(Instruction {
+            program_id: route.pool_address,
+            accounts: vec![
+                AccountMeta::new(*trader, true),
+                AccountMeta::new(route.pool_address, false),
+            ],
+            data,
+        })
+    }
 }
 
 fn build_repay_instruction(
@@ -1832,12 +1918,6 @@ enum SwapInstruction {
         amount_in: u64,
         minimum_amount_out: u64,
         path: Vec<Pubkey>,
-    },
-    SplitSwap {
-        amount_in: u64,
-        minimum_amount_out: u64,
-        splits: Vec<(Pubkey, u64)>,
-    },
 }
 
 #[cfg(test)]
@@ -1868,5 +1948,71 @@ mod tests {
         
         let impact = modeler.calculate_price_impact(&pool, 100_000_000).unwrap();
         assert!(impact > 0 && impact < 1000);
+    }
+}
+
+impl ITOFlashLoanModeler {
+    /// Find the optimal Orca route for a given token pair and amount
+    /// This function leverages the OrcaWhirlpoolOptimizer to find the best multi-hop route
+    pub async fn find_optimal_orca_route(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+    ) -> Result<Option<SwapRoute>> {
+        // Use the Orca optimizer to find the optimal route
+        let route = self.orca_optimizer.find_optimal_route(
+            input_mint,
+            output_mint,
+            amount,
+        ).await?;
+        
+        if let Some(optimized_route) = route {
+            // Convert the Orca optimizer result to our SwapRoute format
+            let swap_route = SwapRoute {
+                pool_address: optimized_route.pool_address,
+                pool_type: PoolType::Orca,
+                input_amount: amount,
+                minimum_output: (optimized_route.expected_output as f64 * 0.99) as u64, // 1% slippage tolerance
+                price_impact_bps: 0, // Will be calculated separately if needed
+                route_type: RouteType::MultiHop(optimized_route.intermediate_tokens),
+                // Orca-specific fields (will need to be populated with actual values)
+                input_vault: Pubkey::default(),
+                output_vault: Pubkey::default(),
+                is_base_to_quote: true, // Will need to be determined based on token direction
+            };
+            Ok(Some(swap_route))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Calculate the output amount for an Orca swap using the optimizer
+    /// This is a synchronous wrapper that calls the async optimizer function
+    pub fn calculate_orca_swap_output(
+        &self,
+        pool_address: Pubkey,
+        input_amount: u64,
+        is_base_to_quote: bool,
+    ) -> Result<u64> {
+        // Create a temporary runtime to call the async function
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        
+        // Call the async function using the runtime
+        let result = rt.block_on(async {
+            self.orca_optimizer.get_optimized_swap_quote(
+                pool_address,
+                input_amount,
+                is_base_to_quote,
+            ).await
+        });
+        
+        match result {
+            Ok(quote) => Ok(quote.expected_output),
+            Err(e) => Err(format!("Failed to get Orca swap quote: {}", e).into()),
+        }
     }
 }
