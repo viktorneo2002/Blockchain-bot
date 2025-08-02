@@ -28,6 +28,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH, Instant},
     cmp::{min, max},
     f64::consts::{E, PI},
+use crate::flashloan_mathematical_supremacy::strategy_integrator::StrategyIntegrator;
+use crate::analytics::kalman_filter_spread_predictor::KalmanFilterSpreadPredictor;
+use crate::ornstein_uhlenbeck_mean_reverter::ornstein_uhlenbeck_mean_reverter::OrnsteinUhlenbeckStrategy;
     rc::Rc,
     cell::RefCell,
 };
@@ -76,6 +79,7 @@ pub struct ITOFlashLoanModel {
     pub risk_parameters: RiskParameters,
     pub last_update_slot: u64,
     pub last_update_timestamp: i64,
+    pub strategy_integrator: Arc<StrategyIntegrator>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
