@@ -14,4 +14,8 @@ pub mod kalman_ou_strategy;
 
 pub use kalman_ou_strategy::KalmanOUStrategy;
 pub mod dex_config;
+pub mod kalman_filter_spread_predictor;
+
+pub use kalman_filter_spread_predictor::{KalmanFilterSpreadPredictor, OrnsteinUhlenbeckStrategy, Signal, SpreadObservation, PricePoint, OUParameters, SpreadPrediction};
+
 
