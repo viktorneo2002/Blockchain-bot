@@ -190,7 +190,7 @@ impl TransactionRevertPredictor {
     }
 
     async fn check_blockhash_validity(&self, blockhash: &Hash) -> Option<RevertReason> {
-        let recent_hashes = self.recent_blockhashes.read().unwrap();
+        let recent_hashes = self.recent_blockhashes.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on recent_blockhashes: {}", e)).ok()?;
         let now = Instant::now();
         
         for (hash, timestamp) in recent_hashes.iter() {
@@ -211,7 +211,7 @@ impl TransactionRevertPredictor {
                 if !valid {
                     Some(RevertReason::StaleBlockhash)
                 } else {
-                    let mut hashes = self.recent_blockhashes.write().unwrap();
+                    let mut hashes = self.recent_blockhashes.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on recent_blockhashes: {}", e))?;
                     hashes.push_back((*blockhash, now));
                     if hashes.len() > 150 {
                         hashes.pop_front();
@@ -304,7 +304,7 @@ impl TransactionRevertPredictor {
     }
 
     async fn check_program_failure_rate(&self, program_id: &Pubkey) -> Option<f64> {
-        let rates = self.program_success_rates.read().unwrap();
+        let rates = self.program_success_rates.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on program_success_rates: {}", e)).ok()?;
         if let Some((successes, total)) = rates.get(program_id) {
             if *total > 10 {
                 let failure_rate = 1.0 - (*successes as f64 / *total as f64);
@@ -363,7 +363,7 @@ impl TransactionRevertPredictor {
             ).await {
                 Ok(Ok(result)) => {
                     if let Some(err) = result.err {
-                        let logs = result.logs.unwrap_or_default();
+                        let logs = result.logs.clone().unwrap_or_else(|| vec![]);
                         let reason = self.parse_simulation_error(&err, &logs);
                         return Ok(Some((reason, logs)));
                     }
@@ -461,7 +461,7 @@ impl TransactionRevertPredictor {
             compute_units_used: compute_units,
         };
 
-        let mut patterns = self.failure_patterns.write().unwrap();
+        let mut patterns = self.failure_patterns.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on failure_patterns: {}", e))?;
         patterns.push_back(pattern);
         
         if patterns.len() > FAILURE_PATTERN_WINDOW {
@@ -469,16 +469,17 @@ impl TransactionRevertPredictor {
         }
 
         // Update program success rates
-        let mut rates = self.program_success_rates.write().unwrap();
+        let mut rates = self.program_success_rates.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on program_success_rates: {}", e))?;
         let (successes, total) = rates.entry(program_id).or_insert((0, 0));
         *total += 1;
     }
 
-    pub async fn record_success(&self, program_id: Pubkey) {
-        let mut rates = self.program_success_rates.write().unwrap();
+    pub async fn record_success(&self, program_id: Pubkey) -> Result<()> {
+        let mut rates = self.program_success_rates.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on program_success_rates: {}", e))?;
         let (successes, total) = rates.entry(program_id).or_insert((0, 0));
         *successes += 1;
         *total += 1;
+        Ok(())
     }
 
     async fn calculate_priority_fee(
@@ -545,7 +546,7 @@ impl TransactionRevertPredictor {
     }
 
     pub async fn analyze_failure_patterns(&self) -> HashMap<String, f64> {
-        let patterns = self.failure_patterns.read().unwrap();
+        let patterns = self.failure_patterns.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on failure_patterns: {}", e))?;
         let mut error_counts: HashMap<String, u32> = HashMap::new();
         let now = Instant::now();
         
@@ -558,22 +559,22 @@ impl TransactionRevertPredictor {
 
         let total = error_counts.values().sum::<u32>() as f64;
         
-        error_counts
+        Ok(error_counts
             .into_iter()
             .map(|(error, count)| (error, count as f64 / total))
-            .collect()
+            .collect())
     }
 
     pub async fn get_program_health_metrics(&self) -> HashMap<Pubkey, f64> {
-        let rates = self.program_success_rates.read().unwrap();
+        let rates = self.program_success_rates.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on program_success_rates: {}", e))?;
         
-        rates
+        Ok(rates
             .iter()
             .filter(|(_, (_, total))| *total > 10)
             .map(|(program, (successes, total))| {
                 (*program, *successes as f64 / *total as f64)
             })
-            .collect()
+            .collect())
     }
 
     pub async fn should_execute_transaction(
@@ -617,7 +618,7 @@ impl TransactionRevertPredictor {
 
     pub async fn cleanup_old_data(&self) {
         // Clean old failure patterns
-        let mut patterns = self.failure_patterns.write().unwrap();
+        let mut patterns = self.failure_patterns.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on failure_patterns: {}", e))?;
         let now = Instant::now();
         
         patterns.retain(|pattern| {
@@ -633,7 +634,7 @@ impl TransactionRevertPredictor {
         });
 
         // Clean old blockhashes
-        let mut blockhashes = self.recent_blockhashes.write().unwrap();
+        let mut blockhashes = self.recent_blockhashes.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on recent_blockhashes: {}", e))?;
         
         blockhashes.retain(|(_, timestamp)| {
             now.duration_since(*timestamp) < Duration::from_secs(150)
@@ -664,7 +665,7 @@ mod tests {
             &[instruction],
             &payer,
             recent_blockhash,
-        ).await.unwrap();
+        ).await.map_err(|e| anyhow::anyhow!("Failed to clean old data: {}", e))?;
 
         assert!(prediction.will_revert);
         assert_eq!(prediction.reason, RevertReason::InsufficientBalance);
