@@ -28,6 +28,7 @@ use crate::flashloan_mathematical_supremacy::strategy_integrator::StrategyIntegr
 // Constants for transaction building
 const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const RAYDIUM_V4_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const SERUM_PROGRAM_ID: &str = "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX";
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
@@ -406,23 +407,29 @@ impl Strategy for KalmanOUStrategy {
     }
     
     /// Get associated token address for a wallet and mint
-    fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)
+            .map_err(|e| anyhow::anyhow!("Failed to parse token program ID: {}", e))?;
+        let associated_token_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)
+            .map_err(|e| anyhow::anyhow!("Failed to parse associated token program ID: {}", e))?;
+        
         let (ata, _) = Pubkey::find_program_address(
             &[
                 wallet.as_ref(),
-                Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap().as_ref(),
+                token_program.as_ref(),
                 mint.as_ref(),
             ],
-            &Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).unwrap(),
+            &associated_token_program,
         );
-        ata
+        Ok(ata)
     }
     
     /// Build Orca Whirlpool swap accounts
-    fn build_orca_swap_accounts(&self, pool: &Pubkey, user: &Pubkey, is_a_to_b: bool, token_a: &Pubkey, token_b: &Pubkey, pool_state: &crate::dex_connectors::orca_connector::WhirlpoolState) -> Vec<AccountMeta> {
-        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap();
-        let user_ata_a = Self::get_associated_token_address(user, token_a);
-        let user_ata_b = Self::get_associated_token_address(user, token_b);
+    fn build_orca_swap_accounts(&self, pool: &Pubkey, user: &Pubkey, is_a_to_b: bool, token_a: &Pubkey, token_b: &Pubkey, pool_state: &crate::dex_connectors::orca_connector::WhirlpoolState) -> Result<Vec<AccountMeta>> {
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)
+            .map_err(|e| anyhow::anyhow!("Failed to parse token program ID: {}", e))?;
+        let user_ata_a = Self::get_associated_token_address(user, token_a)?;
+        let user_ata_b = Self::get_associated_token_address(user, token_b)?;
         
         let (source_ata, dest_ata) = if is_a_to_b {
             (user_ata_a, user_ata_b)
@@ -440,14 +447,14 @@ impl Strategy for KalmanOUStrategy {
         let tick_arrays: Vec<Pubkey> = tick_array_indices
             .iter()
             .map(|&index| Self::derive_tick_array(pool, index))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()??;
         
         // Ensure we have at least 3 tick arrays (pad with null if needed)
-        let tick_array_0 = tick_arrays.get(0).cloned().unwrap_or(Pubkey::default());
-        let tick_array_1 = tick_arrays.get(1).cloned().unwrap_or(Pubkey::default());
-        let tick_array_2 = tick_arrays.get(2).cloned().unwrap_or(Pubkey::default());
+        let tick_array_0 = tick_arrays.get(0).cloned().unwrap_or_default();
+        let tick_array_1 = tick_arrays.get(1).cloned().unwrap_or_default();
+        let tick_array_2 = tick_arrays.get(2).cloned().unwrap_or_default();
 
-        let oracle = Self::derive_oracle(pool);
+        let oracle = Self::derive_oracle(pool)?;
 
         vec![
             AccountMeta::new_readonly(token_program, false),
@@ -465,16 +472,16 @@ impl Strategy for KalmanOUStrategy {
     }
     
     /// Build Raydium AMM swap accounts
-    fn build_raydium_swap_accounts(&self, pool: &Pubkey, user: &Pubkey, is_a_to_b: bool, coin_mint: &Pubkey, pc_mint: &Pubkey, market: &Pubkey) -> Vec<AccountMeta> {
-        let (open_orders, market_authority) = self.derive_raydium_pdas(pool, market);
+    fn build_raydium_swap_accounts(&self, pool: &Pubkey, user: &Pubkey, is_a_to_b: bool, coin_mint: &Pubkey, pc_mint: &Pubkey, market: &Pubkey) -> Result<Vec<AccountMeta>> {
+        let (open_orders, market_authority) = self.derive_raydium_pdas(pool, market)?;?;
         
         let source_mint = if is_a_to_b { coin_mint } else { pc_mint };
         let dest_mint = if is_a_to_b { pc_mint } else { coin_mint };
         
-        let source_ata = self.get_associated_token_address(user, source_mint);
-        let dest_ata = self.get_associated_token_address(user, dest_mint);
+        let source_ata = self.get_associated_token_address(user, source_mint)?;
+        let dest_ata = self.get_associated_token_address(user, dest_mint)?;
         
-        vec![
+        Ok(vec![
             AccountMeta::new_readonly(*pool, false),
             AccountMeta::new_readonly(market_authority, false),
             AccountMeta::new(open_orders, false),
@@ -532,31 +539,35 @@ impl Strategy for KalmanOUStrategy {
     
     /// Build Orca swap instruction
     fn build_orca_swap(&self, pool_state: &crate::dex_connectors::orca_connector::WhirlpoolState, amount_in: u64, min_amount_out: u64, is_a_to_b: bool) -> Result<(Vec<AccountMeta>, Vec<u8>)> {
-        let pool_pubkey = self.pool_config.get_orca_pool("SOL/USDC").unwrap().get_pubkey()?;
-        let accounts = self.build_orca_swap_accounts(&pool_pubkey, &self.wallet.pubkey(), is_a_to_b, &pool_state.token_mint_a, &pool_state.token_mint_b, pool_state);
+        let sol_usdc_orca = self.pool_config.get_orca_pool("SOL/USDC").ok_or_else(|| anyhow::anyhow!("SOL/USDC Orca pool not found in config"))?;
+        let pool_pubkey = sol_usdc_orca.get_pubkey()?;
+        let accounts = self.build_orca_swap_accounts(&pool_pubkey, &self.wallet.pubkey(), is_a_to_b, &pool_state.token_mint_a, &pool_state.token_mint_b, pool_state)?;
         let data = self.build_orca_swap_data(amount_in, min_amount_out, is_a_to_b, pool_state.sqrt_price, MAX_SLIPPAGE_BPS);
         Ok((accounts, data))
     }
     
     /// Build Raydium swap instruction
     fn build_raydium_swap(&self, pool_state: &crate::dex_connectors::raydium_connector::AmmInfo, amount_in: u64, min_amount_out: u64, is_a_to_b: bool) -> Result<(Vec<AccountMeta>, Vec<u8>)> {
-        let pool_pubkey = self.pool_config.get_raydium_pool("SOL/USDC").unwrap().get_pubkey()?;
-        let accounts = self.build_raydium_swap_accounts(&pool_pubkey, &self.wallet.pubkey(), is_a_to_b, &pool_state.coin_vault_mint, &pool_state.pc_vault_mint, &pool_state.market);
+        let sol_usdc_raydium = self.pool_config.get_raydium_pool("SOL/USDC").ok_or_else(|| anyhow::anyhow!("SOL/USDC Raydium pool not found in config"))?;
+        let pool_pubkey = sol_usdc_raydium.get_pubkey()?;
+        let accounts = self.build_raydium_swap_accounts(&pool_pubkey, &self.wallet.pubkey(), is_a_to_b, &pool_state.coin_vault_mint, &pool_state.pc_vault_mint, &pool_state.market)?;
         let data = self.build_raydium_swap_data(amount_in, min_amount_out);
         Ok((accounts, data))
     }
     
     /// Derive tick array address for Orca Whirlpool
-    fn derive_tick_array(pool: &Pubkey, start_tick_index: i32) -> Pubkey {
+    fn derive_tick_array(pool: &Pubkey, start_tick_index: i32) -> Result<Pubkey> {
+        let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Orca Whirlpool program ID: {}", e))?;
         let (tick_array, _) = Pubkey::find_program_address(
             &[
                 b"tick_array",
                 pool.as_ref(),
                 &start_tick_index.to_le_bytes(),
             ],
-            &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+            &program_id,
         );
-        tick_array
+        Ok(tick_array)
     }
     
     /// Calculate appropriate tick array indices based on current tick and direction
@@ -583,26 +594,33 @@ impl Strategy for KalmanOUStrategy {
     }
     
     /// Derive oracle address for Orca Whirlpool
-    fn derive_oracle(pool: &Pubkey) -> Pubkey {
+    fn derive_oracle(pool: &Pubkey) -> Result<Pubkey> {
+        let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Orca Whirlpool program ID: {}", e))?;
         let (oracle, _) = Pubkey::find_program_address(
             &[
                 b"oracle",
                 pool.as_ref(),
             ],
-            &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+            &program_id,
         );
-        oracle
+        Ok(oracle)
     }
     
     /// Derive PDA addresses for Raydium AMM
-    fn derive_raydium_pdas(pool: &Pubkey, market: &Pubkey) -> (Pubkey, Pubkey) {
+    fn derive_raydium_pdas(pool: &Pubkey, market: &Pubkey) -> Result<(Pubkey, Pubkey)> {
+        let raydium_program = Pubkey::from_str(RAYDIUM_V4_PROGRAM)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Raydium V4 program ID: {}", e))?;
+        let serum_program = Pubkey::from_str(SERUM_PROGRAM_ID)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Serum program ID: {}", e))?;
+        
         let (open_orders, _) = Pubkey::find_program_address(
             &[
                 b"open_order",
                 pool.as_ref(),
                 market.as_ref(),
             ],
-            &Pubkey::from_str(RAYDIUM_V4_PROGRAM).unwrap(),
+            &raydium_program,
         );
         
         let (market_authority, _) = Pubkey::find_program_address(
@@ -610,9 +628,9 @@ impl Strategy for KalmanOUStrategy {
                 b"market",
                 market.as_ref(),
             ],
-            &Pubkey::from_str(SERUM_PROGRAM_ID).unwrap(),
+            &serum_program,
         );
         
-        (open_orders, market_authority)
+        Ok((open_orders, market_authority))
     }
 }
