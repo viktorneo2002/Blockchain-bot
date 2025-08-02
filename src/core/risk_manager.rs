@@ -20,11 +20,10 @@ impl RiskManager {
         }
     }
     
-    pub async fn check_position_limits(&self, amount: u64) -> bool {
+    pub async fn check_position_limits(&self, amount: u64) -> Result<bool, Box<dyn std::error::Error>> {
         let current = self.current_positions.read().map_err(|e| {
-            eprintln!("Failed to acquire read lock on current_positions: {}", e);
-            false
-        }).unwrap_or(false);
-        *current + amount <= self.max_position_size
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to acquire read lock on current_positions: {}", e)))
+        })?;
+        Ok(*current + amount <= self.max_position_size)
     }
 }
