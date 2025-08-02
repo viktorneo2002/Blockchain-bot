@@ -138,15 +138,23 @@ impl StrategyEngine {
         }
     }
 
-    pub async fn analyze_opportunity(&self) -> Result<()> {
-        let market_state = self.market_state.read().unwrap();
-        let config = self.config.read().unwrap();
+    pub async fn analyze_opportunity(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let market_state = self.market_state.read().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to acquire read lock on market_state: {}", e)))
+        })?;
+        let config = self.config.read().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to acquire read lock on config: {}", e)))
+        })?;
         
-        if self.risk_manager.read().unwrap().circuit_breaker_triggered {
+        let risk_manager = self.risk_manager.read().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to acquire read lock on risk_manager: {}", e)))
+        })?;
+        
+        if risk_manager.circuit_breaker_triggered {
             return Ok(());
         }
 
-        let strategies = self.rank_strategies(&market_state, &config);
+        let strategies = self.rank_strategies(&market_state, &config)?;
         
         for strategy_type in strategies {
             let result = match strategy_type {
@@ -164,7 +172,7 @@ impl StrategyEngine {
                     strategy_result.priority_fee = self.calculate_optimal_priority_fee(
                         &market_state,
                         &strategy_result,
-                    );
+                    )?;
                     
                     self.tx_sender.send(strategy_result).await.ok();
                     break;
@@ -179,7 +187,7 @@ impl StrategyEngine {
         &self,
         market_state: &MarketState,
         config: &StrategyConfig,
-    ) -> Vec<StrategyType> {
+    ) -> Result<Vec<StrategyType>, Box<dyn std::error::Error>> {
         let mut strategy_scores: Vec<(StrategyType, f64)> = vec![
             (StrategyType::Arbitrage, self.score_arbitrage_opportunity(market_state)),
             (StrategyType::JitLiquidity, self.score_jit_opportunity(market_state)),
@@ -190,16 +198,19 @@ impl StrategyEngine {
             (StrategyType::StatArb, self.score_stat_arb_opportunity(market_state)),
         ];
 
-        let perf_tracker = self.performance_tracker.read().unwrap();
+        let perf_tracker = self.performance_tracker.read().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to acquire read lock on performance_tracker: {}", e)))
+        })?;
+        
         for (strategy_type, score) in &mut strategy_scores {
             if let Some((success, total)) = perf_tracker.strategy_success.get(strategy_type) {
                 let success_rate = if *total > 0 { *success as f64 / *total as f64 } else { 0.5 };
-                *score *= success_rate * config.strategy_weights.get(strategy_type).unwrap_or(&1.0);
+                *score *= success_rate * config.strategy_weights.get(strategy_type).copied().unwrap_or(1.0);
             }
         }
 
         strategy_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        strategy_scores.into_iter().map(|(s, _)| s).collect()
+        Ok(strategy_scores.into_iter().map(|(s, _)| s).collect())
     }
 
     fn find_arbitrage(
@@ -225,7 +236,7 @@ impl StrategyEngine {
                         
                         if profit > config.min_profit_threshold {
                             let current_score = profit as f64 / optimal_amount as f64;
-                            if best_arb.is_none() || best_arb.as_ref().unwrap().3 < current_score {
+                            if best_arb.is_none() || best_arb.as_ref().map(|b| b.3 < current_score).unwrap_or(false) {
                                 best_arb = Some((*pool1_key, *pool2_key, optimal_amount, current_score));
                             }
                         }
@@ -441,7 +452,7 @@ impl StrategyEngine {
                             let profit = self.calculate_route_profit(&route, amount, market_state);
                             
                             if profit > config.min_profit_threshold {
-                                if best_opportunity.is_none() || best_opportunity.as_ref().unwrap().2 < profit {
+                                if best_opportunity.is_none() || best_opportunity.as_ref().map(|b| b.2 < profit).unwrap_or(false) {
                                     best_opportunity = Some((route, amount, profit));
                                 }
                             }
@@ -517,7 +528,10 @@ impl StrategyEngine {
     }
 
     fn validate_strategy(&self, strategy: &StrategyResult, config: &StrategyConfig) -> bool {
-        let risk_manager = self.risk_manager.read().unwrap();
+        let risk_manager = match self.risk_manager.read() {
+            Ok(rm) => rm,
+            Err(_) => return false, // If we can't read the risk manager, don't validate
+        };
         
         if risk_manager.circuit_breaker_triggered {
             return false;
@@ -541,30 +555,6 @@ impl StrategyEngine {
         
         true
     }
-
-    fn calculate_optimal_priority_fee(
-        &self,
-        market_state: &MarketState,
-        strategy: &StrategyResult,
-    ) -> u64 {
-        let base_fee = match strategy.strategy_type {
-            StrategyType::Sandwich => 100000,
-            StrategyType::Arbitrage => 50000,
-            StrategyType::JitLiquidity => 75000,
-            StrategyType::Liquidation => 80000,
-            _ => 25000,
-        };
-        
-        let congestion_multiplier = 1.0 + market_state.network_congestion * 2.0;
-        let profit_ratio = (strategy.expected_profit as f64 / 1e9).min(10.0);
-        let competition_factor = self.estimate_competition_level(market_state, &strategy.strategy_type);
-        
-        let priority_fee = (base_fee as f64 * congestion_multiplier * (1.0 + profit_ratio * 0.1) * competition_factor) as u64;
-        
-        priority_fee.min(strategy.expected_profit / 10)
-    }
-
-    fn calculate_amm_price(&self, pool: &AmmInfo) -> f64 {
         if pool.coin_vault_balance > 0 && pool.pc_vault_balance > 0 {
             pool.pc_vault_balance as f64 / pool.coin_vault_balance as f64
         } else {
@@ -654,7 +644,11 @@ impl StrategyEngine {
     }
 
     fn get_recent_success_rate(&self) -> f64 {
-        let tracker = self.performance_tracker.read().unwrap();
+        let tracker = match self.performance_tracker.read() {
+            Ok(tracker) => tracker,
+            Err(_) => return 0.7, // If we can't read the tracker, return default success rate
+        };
+        
         let total: u64 = tracker.strategy_success.values().map(|(_, t)| t).sum();
         let success: u64 = tracker.strategy_success.values().map(|(s, _)| s).sum();
         
@@ -896,7 +890,11 @@ impl StrategyEngine {
                 &owner,
                 &market_key,
                 None,
-            ).unwrap(),
+            ).unwrap_or_else(|_| Instruction {
+                program_id: Pubkey::default(),
+                accounts: vec![],
+                data: vec![],
+            }),
         ]
     }
 
@@ -953,7 +951,7 @@ impl StrategyEngine {
                 u16::MAX,
                 u64::MAX,
                 32,
-            ).unwrap(),
+            ).map_err(|e| anyhow::anyhow!("Failed to create Serum instruction: {}", e))??,
         ]
     }
 
@@ -1049,7 +1047,7 @@ impl StrategyEngine {
                 &pool_key,
                 amount,
                 0,
-            ).unwrap()
+            ).map_err(|e| anyhow::anyhow!("Failed to create swap instruction: {}", e))??
         };
         
         instructions.push(swap_instruction(front_amount, direction));
@@ -1164,7 +1162,10 @@ impl StrategyEngine {
     }
 
     fn get_historical_ratio(&self, asset1: &Pubkey, asset2: &Pubkey) -> f64 {
-        let state = self.market_state.read().unwrap();
+        let state = match self.market_state.read() {
+            Ok(state) => state,
+            Err(_) => return 1.0, // If we can't read the market state, return default ratio
+        };
         
         if let (Some(feed1), Some(feed2)) = (
             state.price_feeds.get(asset1),
@@ -1219,7 +1220,10 @@ impl StrategyEngine {
     }
 
     pub fn update_performance(&self, strategy_type: StrategyType, success: bool, profit: i64) {
-        let mut tracker = self.performance_tracker.write().unwrap();
+        let mut tracker = match self.performance_tracker.write() {
+            Ok(tracker) => tracker,
+            Err(_) => return, // If we can't write to the tracker, return early
+        };
         
         let entry = tracker.strategy_success.entry(strategy_type).or_insert((0, 0));
         entry.1 += 1;
@@ -1237,7 +1241,10 @@ impl StrategyEngine {
         tracker.gas_spent += if success { 150000 } else { 50000 };
         
         if profit < 0 {
-            let mut risk_manager = self.risk_manager.write().unwrap();
+            let mut risk_manager = match self.risk_manager.write() {
+                Ok(rm) => rm,
+                Err(_) => return, // If we can't write to risk manager, return early
+            };
             risk_manager.daily_loss += profit;
             risk_manager.current_exposure = risk_manager.current_exposure.saturating_sub(profit.abs() as u64);
             
@@ -1245,13 +1252,19 @@ impl StrategyEngine {
                 risk_manager.circuit_breaker_triggered = true;
             }
         } else {
-            let mut risk_manager = self.risk_manager.write().unwrap();
+            let mut risk_manager = match self.risk_manager.write() {
+                Ok(rm) => rm,
+                Err(_) => return, // If we can't write to risk manager, return early
+            };
             risk_manager.current_exposure = risk_manager.current_exposure.saturating_add(profit as u64 / 2);
         }
     }
 
     pub fn update_market_state(&self, update: MarketStateUpdate) {
-        let mut state = self.market_state.write().unwrap();
+        let mut state = match self.market_state.write() {
+            Ok(state) => state,
+            Err(_) => return, // If we can't write to the market state, return early
+        };
         
         match update {
             MarketStateUpdate::AmmPool(key, info) => {
@@ -1286,7 +1299,11 @@ impl StrategyEngine {
     }
 
     pub fn reset_daily_limits(&self) {
-        let mut risk_manager = self.risk_manager.write().unwrap();
+        let mut risk_manager = match self.risk_manager.write() {
+            Ok(rm) => rm,
+            Err(_) => return, // If we can't write to risk manager, return early
+        };
+        
         if risk_manager.last_reset.elapsed() > Duration::from_secs(86400) {
             risk_manager.daily_loss = 0;
             risk_manager.circuit_breaker_triggered = false;
@@ -1296,7 +1313,11 @@ impl StrategyEngine {
     }
 
     pub fn get_strategy_metrics(&self) -> HashMap<StrategyType, (f64, f64, u64)> {
-        let tracker = self.performance_tracker.read().unwrap();
+        let tracker = match self.performance_tracker.read() {
+            Ok(tracker) => tracker,
+            Err(_) => return HashMap::new(), // If we can't read the tracker, return empty metrics
+        };
+        
         let mut metrics = HashMap::new();
         
         for (strategy, (success, total)) in &tracker.strategy_success {
@@ -1365,6 +1386,6 @@ mod tests {
     fn test_strategy_engine_creation() {
         let (tx, _rx) = mpsc::channel(100);
         let engine = StrategyEngine::new(StrategyConfig::default(), tx);
-        assert!(!engine.risk_manager.read().unwrap().circuit_breaker_triggered);
+        assert!(!engine.risk_manager.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on risk manager: {}", e))?.circuit_breaker_triggered);
     }
 }
