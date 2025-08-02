@@ -10,6 +10,7 @@ use solana_mev_bot::{
         metrics_collector::MetricsCollector,
     },
     solana_flashloan_domination::solend_kamino_port_optimizer::PortOptimizer,
+    strategies::KalmanOUStrategy,
 };
 
 use anyhow::{Context, Result};
@@ -353,8 +354,83 @@ async fn main_async() -> Result<()> {
         )
         .init();
 
-    // ... rest of the main function content from above ...
-    // (I'm not repeating it all to save space, but it would all go here)
+    // Load configuration
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+    let (config_manager, _) = ConfigManager::with_hot_reload(config_path)?;
+    let config = config_manager.get_config();
+
+    // Initialize RPC client
+    let rpc_client = Arc::new(AsyncRpcClient::new_with_commitment(
+        config.network.primary_rpc.clone(),
+        CommitmentConfig::confirmed(),
+    ));
+
+    // Load wallet
+    let wallet_path = config.wallet.keypair_path.clone();
+    let wallet = Arc::new(read_keypair_file(&wallet_path).context("Failed to read keypair file")?);
+
+    // Initialize strategies
+    let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
+    
+    // Add our Kalman-O-U strategy
+    let kalman_ou_strategy = Box::new(KalmanOUStrategy::new(
+        rpc_client.clone(),
+        wallet.clone(),
+    )?);
+    strategies.push(kalman_ou_strategy);
+
+    // TODO: Add other strategies as needed
+    // For example:
+    // let black_swan_strategy = Box::new(BlackSwanProfiteer::new(rpc_client.clone(), wallet.clone()));
+    // strategies.push(black_swan_strategy);
+
+    // Initialize health monitor
+    let health_monitor = Arc::new(HealthMonitor::new(HealthMonitorConfig {
+        check_interval_ms: 5000,
+        max_memory_mb: 4096,
+        max_cpu_percent: 80.0,
+        rpc_timeout_ms: 5000,
+    }));
+
+    // Start health monitoring
+    let health_monitor_clone = health_monitor.clone();
+    tokio::spawn(async move {
+        health_monitor_clone.start_monitoring().await;
+    });
+
+    // Start all strategies
+    let mut strategy_handles = Vec::new();
+    for strategy in strategies {
+        info!("Starting strategy: {}", strategy.name());
+        let handle = tokio::spawn(async move {
+            if let Err(e) = strategy.run().await {
+                error!("Strategy {} failed: {:?}", strategy.name(), e);
+            }
+        });
+        strategy_handles.push(handle);
+    }
+
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C, shutting down...");
+        }
+        _ = async {
+            // Wait for any strategy to fail
+            for handle in strategy_handles {
+                if let Err(e) = handle.await {
+                    error!("Strategy task failed: {:?}", e);
+                }
+            }
+        } => {
+            error!("A strategy has failed, shutting down...");
+        }
+    }
+
+    // Shutdown all strategies
+    // In a real implementation, we would have a way to access all strategy instances
+    // for graceful shutdown. For now, we'll just log the shutdown.
+    info!("Shutting down strategies...");
 
     Ok(())
 }
