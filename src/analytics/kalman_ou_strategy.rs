@@ -23,6 +23,7 @@ use crate::analytics::{KalmanFilterSpreadPredictor, OrnsteinUhlenbeckStrategy, S
 use crate::dex_connectors::{orca_connector::OrcaConnector, raydium_connector::RaydiumConnector};
 use crate::config::dex_config::DexPoolsConfig;
 use crate::main::Strategy;
+use crate::flashloan_mathematical_supremacy::strategy_integrator::StrategyIntegrator;
 
 // Constants for transaction building
 const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
@@ -57,6 +58,8 @@ pub struct KalmanOUStrategy {
     wallet: Arc<Keypair>,
     /// Shutdown signal
     shutdown: Arc<Mutex<bool>>,
+    /// Strategy integrator
+    strategy_integrator: Arc<StrategyIntegrator>,
 }
 
 impl KalmanOUStrategy {
@@ -67,6 +70,7 @@ impl KalmanOUStrategy {
     ) -> Result<Self> {
         let predictor = Arc::new(KalmanFilterSpreadPredictor::new());
         let strategy = Arc::new(OrnsteinUhlenbeckStrategy::new());
+        let strategy_integrator = Arc::new(StrategyIntegrator::new(predictor.clone(), strategy.clone()));
         
         // Initialize DEX connectors
         let rpc_url = rpc_client.url();
@@ -86,6 +90,7 @@ impl KalmanOUStrategy {
             rpc_client,
             wallet,
             shutdown: Arc::new(Mutex::new(false)),
+            strategy_integrator,
         })
     }
 
