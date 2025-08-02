@@ -19,7 +19,7 @@ use tokio::{
     time::interval,
 };
 use anyhow::Result;
-use crate::analytics::{KalmanFilterSpreadPredictor, OrnsteinUhlenbeckStrategy, Signal};
+use crate::analytics::{KalmanFilterSpreadPredictor, OrnsteinUhlenbeckStrategy, Signal, volatility_regime_classifier::VolatilityRegimeClassifier};
 use crate::dex_connectors::{orca_connector::OrcaConnector, raydium_connector::RaydiumConnector};
 use crate::config::dex_config::DexPoolsConfig;
 use crate::main::Strategy;
@@ -61,6 +61,8 @@ pub struct KalmanOUStrategy {
     shutdown: Arc<Mutex<bool>>,
     /// Strategy integrator
     strategy_integrator: Arc<StrategyIntegrator>,
+    /// Volatility regime classifier
+    volatility_classifier: Arc<VolatilityRegimeClassifier>,
 }
 
 impl KalmanOUStrategy {
@@ -68,6 +70,7 @@ impl KalmanOUStrategy {
     pub fn new(
         rpc_client: Arc<RpcClient>,
         wallet: Arc<Keypair>,
+        volatility_classifier: Arc<VolatilityRegimeClassifier>,
     ) -> Result<Self> {
         let predictor = Arc::new(KalmanFilterSpreadPredictor::new());
         let strategy = Arc::new(OrnsteinUhlenbeckStrategy::new());
@@ -92,6 +95,7 @@ impl KalmanOUStrategy {
             wallet,
             shutdown: Arc::new(Mutex::new(false)),
             strategy_integrator,
+            volatility_classifier,
         })
     }
 
@@ -99,10 +103,20 @@ impl KalmanOUStrategy {
     async fn update_prices(&self, observation: crate::analytics::SpreadObservation) -> Result<()> {
         // Use actual pool addresses as the pair identifier
         // For this example, we'll use the first SOL/USDC pool from each DEX
-        let sol_usdc_orca = self.pool_config.get_orca_pool("SOL/USDC").ok_or_else(|| anyhow::anyhow!("SOL/USDC Orca pool not found in config"))?;
-        let sol_usdc_raydium = self.pool_config.get_raydium_pool("SOL/USDC").ok_or_else(|| anyhow::anyhow!("SOL/USDC Raydium pool not found in config"))?;
+        let sol_usdc_orca = match self.pool_config.get_orca_pool("SOL/USDC") {
+            Some(pool) => pool,
+            None => return Err(anyhow::anyhow!("SOL/USDC Orca pool not found in config")),
+        };
         
-        let pair = (sol_usdc_orca.get_pubkey()?, sol_usdc_raydium.get_pubkey()?);
+        let sol_usdc_raydium = match self.pool_config.get_raydium_pool("SOL/USDC") {
+            Some(pool) => pool,
+            None => return Err(anyhow::anyhow!("SOL/USDC Raydium pool not found in config")),
+        };
+        
+        let orca_pubkey = sol_usdc_orca.get_pubkey()?;
+        let raydium_pubkey = sol_usdc_raydium.get_pubkey()?;
+        
+        let pair = (orca_pubkey, raydium_pubkey);
         self.predictor.update(pair, observation)?;
         Ok(())
     }
@@ -110,10 +124,39 @@ impl KalmanOUStrategy {
     /// Generate trading signal based on current spread prediction
     async fn generate_signal(&self) -> Result<Signal> {
         // Use actual pool addresses as the pair identifier
-        let sol_usdc_orca = self.pool_config.get_orca_pool("SOL/USDC").ok_or_else(|| anyhow::anyhow!("SOL/USDC Orca pool not found in config"))?;
-        let sol_usdc_raydium = self.pool_config.get_raydium_pool("SOL/USDC").ok_or_else(|| anyhow::anyhow!("SOL/USDC Raydium pool not found in config"))?;
+        let sol_usdc_orca = match self.pool_config.get_orca_pool("SOL/USDC") {
+            Some(pool) => pool,
+            None => {
+                tracing::error!("SOL/USDC Orca pool not found in config");
+                return Ok(Signal::Hold);
+            }
+        };
         
-        let pair = (sol_usdc_orca.get_pubkey()?, sol_usdc_raydium.get_pubkey()?);
+        let sol_usdc_raydium = match self.pool_config.get_raydium_pool("SOL/USDC") {
+            Some(pool) => pool,
+            None => {
+                tracing::error!("SOL/USDC Raydium pool not found in config");
+                return Ok(Signal::Hold);
+            }
+        };
+        
+        let orca_pubkey = match sol_usdc_orca.get_pubkey() {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!("Failed to get Orca pool pubkey: {:?}", e);
+                return Ok(Signal::Hold);
+            }
+        };
+        
+        let raydium_pubkey = match sol_usdc_raydium.get_pubkey() {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!("Failed to get Raydium pool pubkey: {:?}", e);
+                return Ok(Signal::Hold);
+            }
+        };
+        
+        let pair = (orca_pubkey, raydium_pubkey);
         
         // Try to get a prediction
         match self.predictor.predict_spread(pair, 1000) { // 1 second horizon
@@ -129,11 +172,33 @@ impl KalmanOUStrategy {
                 // Calculate spread in basis points
                 let spread_bps = ((price_a - price_b).abs() / mid_price * 10000.0) as u16;
                 
+                // Get current volatility regime for USDC (as an example)
+                let usdc_pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse::<Pubkey>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse USDC pubkey: {}", e))?;
+                
+                let volatility_metrics = self.volatility_classifier.get_current_metrics(&usdc_pubkey).await;
+                
                 // Update the OU strategy with the actual data
-                self.strategy.update_price(mid_price, volume, spread_bps)?;
+                if let Err(e) = self.strategy.update_price(mid_price, volume, spread_bps) {
+                    tracing::warn!("Failed to update OU strategy: {}", e);
+                    return Ok(Signal::Hold);
+                }
                 
                 // Get the signal
-                self.strategy.get_signal().map_err(|e| anyhow::anyhow!(e))
+                let mut signal = match self.strategy.get_signal() {
+                    Ok(signal) => signal,
+                    Err(e) => {
+                        tracing::warn!("Failed to get signal from OU strategy: {}", e);
+                        return Ok(Signal::Hold);
+                    }
+                };
+                
+                // Adjust signal based on volatility regime
+                if let Some(metrics) = volatility_metrics {
+                    signal = self.adjust_signal_for_volatility(signal, &metrics.regime);
+                }
+                
+                Ok(signal)
             },
             Err(e) => {
                 tracing::warn!("Failed to predict spread: {:?}", e);
@@ -351,29 +416,49 @@ impl KalmanOUStrategy {
             let raydium_pool_address = sol_usdc_raydium.get_pubkey()?;
             
             // Fetch price observations from both DEXes with proper error handling and retries
-            let orca_observation = self.fetch_with_retry(|| self.orca_connector.get_whirlpool_price(&orca_pool_address)).await?;
-            let raydium_observation = self.fetch_with_retry(|| self.raydium_connector.get_amm_price(&raydium_pool_address)).await?;
+            let orca_observation = match self.fetch_with_retry(|| self.orca_connector.get_whirlpool_price(&orca_pool_address)).await {
+                Ok(obs) => obs,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch Orca observation: {:?}", e);
+                    continue;
+                }
+            };
+            
+            let raydium_observation = match self.fetch_with_retry(|| self.raydium_connector.get_amm_price(&raydium_pool_address)).await {
+                Ok(obs) => obs,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch Raydium observation: {:?}", e);
+                    continue;
+                }
+            };
             
             // Combine observations to create a unified market view
-            let combined_observation = self.combine_observations(orca_observation, raydium_observation)?;
+            let combined_observation = match self.combine_observations(orca_observation, raydium_observation) {
+                Ok(obs) => obs,
+                Err(e) => {
+                    tracing::warn!("Failed to combine observations: {:?}", e);
+                    continue;
+                }
+            };
             
             // Update our models with the new combined data
-            self.update_prices(combined_observation).await?;
+            if let Err(e) = self.update_prices(combined_observation).await {
+                tracing::warn!("Failed to update prices: {:?}", e);
+                continue;
+            }
             
             // Generate trading signals based on updated models
-            let signal = self.generate_signal().await?;
+            let signal = match self.generate_signal().await {
+                Ok(signal) => signal,
+                Err(e) => {
+                    tracing::warn!("Failed to generate signal: {:?}", e);
+                    continue;
+                }
+            };
             
             // Execute trades based on generated signals
-            self.execute_trade(signal).await?;
-            
-            // Skip the old implementation that only used Orca observation
-            continue;
-            
-            self.update_prices(observation).await?;
-            
-            let signal = self.generate_signal().await?;
-            if !matches!(signal, Signal::Hold) {
-                self.execute_trade(signal).await?;
+            if let Err(e) = self.execute_trade(signal).await {
+                tracing::error!("Failed to execute trade: {:?}", e);
             }
         }
         
@@ -535,6 +620,66 @@ impl Strategy for KalmanOUStrategy {
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_amount_out.to_le_bytes());
         data
+    }
+    
+    /// Adjust trading signal based on current volatility regime
+    fn adjust_signal_for_volatility(&self, signal: Signal, regime: &crate::analytics::volatility_regime_classifier::VolatilityRegime) -> Signal {
+        match signal {
+            Signal::Buy { confidence, size_ratio } => {
+                let (adjusted_confidence, adjusted_size) = match regime {
+                    // In low volatility, increase position size and confidence
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::Low => {
+                        (confidence * 1.2, size_ratio * 1.5)
+                    },
+                    // In medium volatility, keep normal parameters
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::Medium => {
+                        (confidence, size_ratio)
+                    },
+                    // In high volatility, reduce position size and confidence
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::High => {
+                        (confidence * 0.8, size_ratio * 0.7)
+                    },
+                    // In extreme volatility, significantly reduce position size and confidence
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::Extreme => {
+                        (confidence * 0.5, size_ratio * 0.3)
+                    },
+                };
+                
+                // Ensure values don't exceed bounds
+                let final_confidence = adjusted_confidence.min(1.0).max(0.0);
+                let final_size = adjusted_size.min(1.0).max(0.0);
+                
+                Signal::Buy { confidence: final_confidence, size_ratio: final_size }
+            },
+            Signal::Sell { confidence, size_ratio } => {
+                let (adjusted_confidence, adjusted_size) = match regime {
+                    // In low volatility, increase position size and confidence
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::Low => {
+                        (confidence * 1.2, size_ratio * 1.5)
+                    },
+                    // In medium volatility, keep normal parameters
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::Medium => {
+                        (confidence, size_ratio)
+                    },
+                    // In high volatility, reduce position size and confidence
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::High => {
+                        (confidence * 0.8, size_ratio * 0.7)
+                    },
+                    // In extreme volatility, significantly reduce position size and confidence
+                    crate::analytics::volatility_regime_classifier::VolatilityRegime::Extreme => {
+                        (confidence * 0.5, size_ratio * 0.3)
+                    },
+                };
+                
+                // Ensure values don't exceed bounds
+                let final_confidence = adjusted_confidence.min(1.0).max(0.0);
+                let final_size = adjusted_size.min(1.0).max(0.0);
+                
+                Signal::Sell { confidence: final_confidence, size_ratio: final_size }
+            },
+            // Hold signals remain unchanged
+            Signal::Hold => Signal::Hold,
+        }
     }
     
     /// Build Orca swap instruction
