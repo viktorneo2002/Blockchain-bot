@@ -332,14 +332,14 @@ impl ConfigManager {
     }
 
     pub fn get_config(&self) -> Config {
-        self.config.read().unwrap().clone()
+        self.config.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on config: {}", e))?.clone()
     }
 
     pub fn update_config<F>(&self, updater: F) -> Result<()>
     where
         F: FnOnce(&mut Config),
     {
-        let mut config = self.config.write().unwrap();
+        let mut config = self.config.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on config: {}", e))?;
         updater(&mut config);
         Self::validate_config(&config)?;
         
@@ -358,11 +358,11 @@ impl ConfigManager {
     }
 
     pub fn should_use_jito(&self) -> bool {
-        self.config.read().unwrap().trading.enable_jito_bundles
+        self.config.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on config: {}", e))?.trading.enable_jito_bundles
     }
 
     pub fn get_priority_fee(&self) -> u64 {
-        self.config.read().unwrap().trading.priority_fee_lamports
+        self.config.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on config: {}", e))?.trading.priority_fee_lamports
     }
 
     pub fn get_compute_budget(&self) -> (u32, u64) {
@@ -371,11 +371,11 @@ impl ConfigManager {
     }
 
     pub fn get_max_position_size(&self) -> f64 {
-        self.config.read().unwrap().trading.max_position_size_sol
+        self.config.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on config: {}", e))?.trading.max_position_size_sol
     }
 
     pub fn get_min_profit_bps(&self) -> u64 {
-        self.config.read().unwrap().trading.min_profit_bps
+        self.config.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on config: {}", e))?.trading.min_profit_bps
     }
 
     pub fn get_risk_parameters(&self) -> RiskParameters {
@@ -432,7 +432,7 @@ impl ConfigManager {
     }
 
     pub fn should_enable_mev_protection(&self) -> bool {
-        self.config.read().unwrap().mev.enable_mev_protection
+        self.config.read().map_err(|e| anyhow::anyhow!("Failed to acquire read lock on config: {}", e))?.mev.enable_mev_protection
     }
 
     pub fn get_jito_config(&self) -> JitoConfig {
