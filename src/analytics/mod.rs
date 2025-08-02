@@ -13,3 +13,5 @@ pub mod vol_surface_arbitrageur;
 pub mod kalman_ou_strategy;
 
 pub use kalman_ou_strategy::KalmanOUStrategy;
+pub mod dex_config;
+
