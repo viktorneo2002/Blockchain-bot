@@ -146,7 +146,7 @@ impl DexFeeTierArbitrageur {
         let orca_pools = self.fetch_orca_pools().await?;
         let raydium_pools = self.fetch_raydium_pools().await?;
         
-        let mut pools = self.pools.write().unwrap();
+        let mut pools = self.pools.write().map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire write lock on pools: {}", e)))?;
         for pool in orca_pools.into_iter().chain(raydium_pools) {
             pools.insert(pool.address, pool);
         }
@@ -164,7 +164,7 @@ impl DexFeeTierArbitrageur {
         let mut pools = Vec::with_capacity(accounts.len());
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire read lock: {}", e)))?
             .as_secs();
         
         for (pubkey, account) in accounts {
@@ -186,7 +186,7 @@ impl DexFeeTierArbitrageur {
         let mut pools = Vec::with_capacity(accounts.len());
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire read lock: {}", e)))?
             .as_secs();
         
         for (pubkey, account) in accounts {
@@ -208,14 +208,14 @@ impl DexFeeTierArbitrageur {
             return Err(ArbitrageError::ParseError("Invalid whirlpool discriminator".to_string()));
         }
         
-        let fee_rate = u16::from_le_bytes(data[45..47].try_into().unwrap()) as u32;
-        let liquidity = u128::from_le_bytes(data[49..65].try_into().unwrap());
-        let sqrt_price_x64 = u128::from_le_bytes(data[65..81].try_into().unwrap());
-        let tick_current = i32::from_le_bytes(data[81..85].try_into().unwrap());
-        let token_mint_a = Pubkey::try_from(&data[101..133]).unwrap();
-        let token_vault_a = Pubkey::try_from(&data[133..165]).unwrap();
-        let token_mint_b = Pubkey::try_from(&data[181..213]).unwrap();
-        let token_vault_b = Pubkey::try_from(&data[213..245]).unwrap();
+        let fee_rate = u16::from_le_bytes(data[45..47].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse fee rate".to_string()))?) as u32;
+        let liquidity = u128::from_le_bytes(data[49..65].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse liquidity".to_string()))?);
+        let sqrt_price_x64 = u128::from_le_bytes(data[65..81].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse sqrt price".to_string()))?);
+        let tick_current = i32::from_le_bytes(data[81..85].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse tick".to_string()))?);
+        let token_mint_a = Pubkey::new(&data[101..133]);
+        let token_vault_a = Pubkey::new(&data[133..165]);
+        let token_mint_b = Pubkey::new(&data[181..213]);
+        let token_vault_b = Pubkey::new(&data[213..245]);
         
         if liquidity < MIN_LIQUIDITY || sqrt_price_x64 == 0 {
             return Err(ArbitrageError::InsufficientLiquidity);
@@ -241,26 +241,26 @@ impl DexFeeTierArbitrageur {
             return Err(ArbitrageError::ParseError("Invalid raydium data length".to_string()));
         }
         
-        let status = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let status = u64::from_le_bytes(data[0..8].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse status".to_string()))?);
         if status != 6 {
             return Err(ArbitrageError::ParseError("Pool not initialized".to_string()));
         }
         
-        let swap_fee_numerator = u64::from_le_bytes(data[176..184].try_into().unwrap());
-        let swap_fee_denominator = u64::from_le_bytes(data[184..192].try_into().unwrap());
-        let base_total_deposited = u128::from_le_bytes(data[240..256].try_into().unwrap());
-        let quote_total_deposited = u128::from_le_bytes(data[224..240].try_into().unwrap());
-        let base_vault = Pubkey::try_from(&data[336..368]).unwrap();
-        let quote_vault = Pubkey::try_from(&data[368..400]).unwrap();
-        let base_mint = Pubkey::try_from(&data[400..432]).unwrap();
-        let quote_mint = Pubkey::try_from(&data[432..464]).unwrap();
+        let swap_fee_numerator = u64::from_le_bytes(data[176..184].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse swap fee numerator".to_string()))?);
+        let swap_fee_denominator = u64::from_le_bytes(data[184..192].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse swap fee denominator".to_string()))?);
+        let base_total_deposited = u128::from_le_bytes(data[240..256].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse base total deposited".to_string()))?);
+        let quote_total_deposited = u128::from_le_bytes(data[224..240].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse quote total deposited".to_string()))?);
+        let base_vault = Pubkey::new(&data[336..368]);
+        let quote_vault = Pubkey::new(&data[368..400]);
+        let base_mint = Pubkey::new(&data[400..432]);
+        let quote_mint = Pubkey::new(&data[432..464]);
         
         if base_total_deposited < MIN_LIQUIDITY || quote_total_deposited < MIN_LIQUIDITY {
             return Err(ArbitrageError::InsufficientLiquidity);
         }
         
         let fee_rate = if swap_fee_denominator > 0 {
-            (swap_fee_numerator as u128 * FEE_RATE_MUL / swap_fee_denominator as u128) as u32
+            (swap_fee_numerator * FEE_RATE_MUL / swap_fee_denominator) as u32
         } else {
             2500
         };
@@ -295,10 +295,10 @@ impl DexFeeTierArbitrageur {
                 
                 let current_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire read lock: {}", e)))?
                     .as_secs();
                 
-                let pool_snapshot = pools.read().unwrap().clone();
+                let pool_snapshot = pools.read().map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire read lock on pools: {}", e)))?.clone();
                 let mut pool_groups: HashMap<(Pubkey, Pubkey), Vec<PoolState>> = HashMap::new();
                 
                 for pool in pool_snapshot.values() {
@@ -597,8 +597,8 @@ impl DexFeeTierArbitrageur {
         
         instructions.push(Instruction {
             program_id: match opp.pool_a.protocol {
-                Protocol::Orca => Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
-                Protocol::Raydium => Pubkey::from_str(RAYDIUM_V4_PROGRAM).unwrap(),
+                Protocol::Orca => Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Orca program ID".to_string()))?,
+                Protocol::Raydium => Pubkey::from_str(RAYDIUM_V4_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Raydium program ID".to_string()))?,
             },
             accounts: swap1_accounts,
             data: swap1_data,
@@ -610,8 +610,8 @@ impl DexFeeTierArbitrageur {
         
         instructions.push(Instruction {
             program_id: match opp.pool_b.protocol {
-                Protocol::Orca => Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
-                Protocol::Raydium => Pubkey::from_str(RAYDIUM_V4_PROGRAM).unwrap(),
+                Protocol::Orca => Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Orca program ID".to_string()))?,
+                Protocol::Raydium => Pubkey::from_str(RAYDIUM_V4_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Raydium program ID".to_string()))?,
             },
             accounts: swap2_accounts,
             data: swap2_data,
@@ -628,8 +628,8 @@ impl DexFeeTierArbitrageur {
             "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
         ];
         
-        let tip_index = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() % jito_tips.len() as u128) as usize;
-        let tip_account = Pubkey::from_str(jito_tips[tip_index]).unwrap();
+        let tip_index = (SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| ArbitrageError::ParseError("Failed to get system time".to_string()))?.as_nanos() % jito_tips.len() as u128) as usize;
+        let tip_account = Pubkey::from_str(jito_tips[tip_index]).map_err(|_| ArbitrageError::ParseError("Invalid tip account".to_string()))?;
         
         instructions.push(system_instruction::transfer(
             &keypair.pubkey(),
@@ -669,7 +669,7 @@ impl DexFeeTierArbitrageur {
     }
 
     fn build_orca_swap_accounts(pool: &PoolState, user: &Pubkey, is_a_to_b: bool) -> Vec<AccountMeta> {
-        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).map_err(|_| ArbitrageError::ParseError("Invalid token program ID".to_string()))?;
                 let user_ata_a = Self::get_associated_token_address(user, &pool.token_a);
         let user_ata_b = Self::get_associated_token_address(user, &pool.token_b);
         
@@ -701,7 +701,7 @@ impl DexFeeTierArbitrageur {
     }
 
     fn build_raydium_swap_accounts(pool: &PoolState, user: &Pubkey, is_a_to_b: bool) -> Vec<AccountMeta> {
-        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).map_err(|_| ArbitrageError::ParseError("Invalid token program ID".to_string()))?;
         let user_ata_a = Self::get_associated_token_address(user, &pool.token_a);
         let user_ata_b = Self::get_associated_token_address(user, &pool.token_b);
         
@@ -712,7 +712,7 @@ impl DexFeeTierArbitrageur {
         };
 
         let (open_orders, market_authority) = Self::derive_raydium_pdas(&pool.address);
-        let serum_program = Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").unwrap();
+        let serum_program = Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").map_err(|_| ArbitrageError::ParseError("Invalid serum program ID".to_string()))?;
 
         vec![
             AccountMeta::new_readonly(token_program, false),
@@ -749,19 +749,19 @@ impl DexFeeTierArbitrageur {
         }
     }
 
-    fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {
         let (ata, _) = Pubkey::find_program_address(
             &[
                 wallet.as_ref(),
-                Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap().as_ref(),
+                Pubkey::from_str(TOKEN_PROGRAM_ID).map_err(|_| ArbitrageError::ParseError("Invalid token program ID".to_string()))?.as_ref(),
                 mint.as_ref(),
             ],
-            &Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).unwrap(),
+            &Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).map_err(|_| ArbitrageError::ParseError("Invalid associated token program ID".to_string()))?,
         );
-        ata
+        Ok(ata)
     }
 
-    fn derive_tick_array(whirlpool: &Pubkey, tick_index: i32) -> Pubkey {
+    fn derive_tick_array(whirlpool: &Pubkey, tick_index: i32) -> Result<Pubkey> {
         const TICK_ARRAY_SIZE: i32 = 88;
         let start_tick_index = tick_index / TICK_ARRAY_SIZE * TICK_ARRAY_SIZE;
         let start_tick_index_bytes = start_tick_index.to_le_bytes();
@@ -772,31 +772,31 @@ impl DexFeeTierArbitrageur {
                 whirlpool.as_ref(),
                 &start_tick_index_bytes,
             ],
-            &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+            &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Orca program ID".to_string()))?,
         );
-        tick_array
+        Ok(tick_array)
     }
 
-    fn derive_oracle(whirlpool: &Pubkey) -> Pubkey {
+    fn derive_oracle(whirlpool: &Pubkey) -> Result<Pubkey> {
         let (oracle, _) = Pubkey::find_program_address(
             &[b"oracle", whirlpool.as_ref()],
-            &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+            &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Orca program ID".to_string()))?,
         );
-        oracle
+        Ok(oracle)
     }
 
-    fn derive_raydium_pdas(pool: &Pubkey) -> (Pubkey, Pubkey) {
+    fn derive_raydium_pdas(pool: &Pubkey) -> Result<(Pubkey, Pubkey)> {
         let (open_orders, _) = Pubkey::find_program_address(
             &[b"open_orders", pool.as_ref()],
-            &Pubkey::from_str(RAYDIUM_V4_PROGRAM).unwrap(),
+            &Pubkey::from_str(RAYDIUM_V4_PROGRAM).map_err(|_| ArbitrageError::ParseError("Invalid Raydium program ID".to_string()))?,
         );
         
         let (market_authority, _) = Pubkey::find_program_address(
             &[&pool.to_bytes()[0..8]],
-            &Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").unwrap(),
+            &Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").map_err(|_| ArbitrageError::ParseError("Invalid Serum program ID".to_string()))?,
         );
         
-        (open_orders, market_authority)
+        Ok((open_orders, market_authority))
     }
 
     fn start_pool_updater(&self) -> tokio::task::JoinHandle<Result<()>> {
@@ -811,11 +811,11 @@ impl DexFeeTierArbitrageur {
                 
                 let current_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire read lock: {}", e)))?
                     .as_secs();
                 
                 let pool_addresses: Vec<Pubkey> = {
-                    let pools_guard = pools.read().unwrap();
+                    let pools_guard = pools.read().map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire read lock: {}", e)))?;
                     pools_guard.keys().copied().collect()
                 };
                 
@@ -830,19 +830,19 @@ impl DexFeeTierArbitrageur {
                             Ok(accounts) => {
                                 for (i, account_opt) in accounts.iter().enumerate() {
                                     if let Some(account) = account_opt {
-                                        let mut pools_guard = pools_clone.write().unwrap();
+                                        let mut pools_guard = pools_clone.write().map_err(|e| ArbitrageError::ParseError(format!("Failed to acquire write lock: {}", e)))?;
                                         if let Some(pool) = pools_guard.get_mut(&chunk[i]) {
                                             match pool.protocol {
                                                 Protocol::Orca => {
                                                     if account.data.len() >= 85 {
                                                         pool.sqrt_price_x64 = u128::from_le_bytes(
-                                                            account.data[65..81].try_into().unwrap_or([0; 16])
+                                                            account.data[65..81].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse sqrt price".to_string()))?)
                                                         );
                                                         pool.liquidity = u128::from_le_bytes(
-                                                            account.data[49..65].try_into().unwrap_or([0; 16])
+                                                            account.data[49..65].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse liquidity".to_string()))?
                                                         );
                                                         pool.tick_current = i32::from_le_bytes(
-                                                            account.data[81..85].try_into().unwrap_or([0; 4])
+                                                            account.data[81..85].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse tick".to_string()))?
                                                         );
                                                         pool.last_update = current_time;
                                                     }
@@ -850,10 +850,10 @@ impl DexFeeTierArbitrageur {
                                                 Protocol::Raydium => {
                                                     if account.data.len() >= 256 {
                                                         let base_total = u128::from_le_bytes(
-                                                            account.data[240..256].try_into().unwrap_or([0; 16])
+                                                            account.data[240..256].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse base total".to_string()))?
                                                         );
                                                         let quote_total = u128::from_le_bytes(
-                                                            account.data[224..240].try_into().unwrap_or([0; 16])
+                                                            account.data[224..240].try_into().map_err(|_| ArbitrageError::ParseError("Failed to parse quote total".to_string()))?
                                                         );
                                                         
                                                         if base_total > 0 && quote_total > 0 {
@@ -1026,5 +1026,4 @@ pub async fn create_arbitrageur(
     let keypair = Keypair::from_bytes(&keypair_bytes)?;
     Ok(DexFeeTierArbitrageur::new(rpc_url, keypair))
 }
-
 
