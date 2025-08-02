@@ -10,7 +10,7 @@ use solana_mev_bot::{
         metrics_collector::MetricsCollector,
     },
     solana_flashloan_domination::solend_kamino_port_optimizer::PortOptimizer,
-    strategies::KalmanOUStrategy,
+    strategies::{KalmanOUStrategy, FlashloanITOStrategy},
 };
 
 use anyhow::{Context, Result};
@@ -23,8 +23,11 @@ use solana_client::{
 };
 use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
+    pubkey::Pubkey,
     signature::{read_keypair_file, Keypair},
 };
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::{
     path::PathBuf,
     sync::{
@@ -379,10 +382,74 @@ async fn main_async() -> Result<()> {
     )?);
     strategies.push(kalman_ou_strategy);
 
-    // TODO: Add other strategies as needed
-    // For example:
-    // let black_swan_strategy = Box::new(BlackSwanProfiteer::new(rpc_client.clone(), wallet.clone()));
-    // strategies.push(black_swan_strategy);
+    // Add Flashloan ITO strategy
+    let flashloan_config = config_manager.get_dex_pools_config()?;
+    let flashloan_orchestrator = Arc::new(FlashLoanOrchestrator::new(
+        FlashLoanConfig {
+            max_loan_amount: 1_000_000_000, // 1000 SOL in lamports
+            min_profit_threshold: 1_000_000, // 0.001 SOL in lamports
+            max_slippage_bps: 50, // 0.5%
+            emergency_shutdown_loss: 10_000_000, // 0.01 SOL in lamports
+            rpc_client: rpc_client.clone(),
+            authority: wallet.clone(),
+        },
+        Arc::new(RiskManager::new(RiskManagerConfig::default())),
+        health_monitor.clone(),
+    ));
+    
+    // Parse ITO addresses from config
+    let ito_addresses: Vec<Pubkey> = flashloan_config.ito_addresses
+        .iter()
+        .filter_map(|addr_str| {
+            Pubkey::from_str(addr_str).map_err(|e| {
+                error!("Invalid ITO address in config: {} - {}", addr_str, e);
+                e
+            }).ok()
+        })
+        .collect();
+    
+    // Parse Pyth feeds from config
+    let pyth_feeds: HashMap<Pubkey, Pubkey> = flashloan_config.pyth_feeds
+        .iter()
+        .filter_map(|(token_str, feed_str)| {
+            let token_key = Pubkey::from_str(token_str).map_err(|e| {
+                error!("Invalid token address in Pyth feeds config: {} - {}", token_str, e);
+                e
+            }).ok()?;
+            let feed_key = Pubkey::from_str(feed_str).map_err(|e| {
+                error!("Invalid feed address in Pyth feeds config: {} - {}", feed_str, e);
+                e
+            }).ok()?;
+            Some((token_key, feed_key))
+        })
+        .collect();
+    
+    // Parse Chainlink feeds from config
+    let chainlink_feeds: HashMap<Pubkey, Pubkey> = flashloan_config.chainlink_feeds
+        .iter()
+        .filter_map(|(token_str, feed_str)| {
+            let token_key = Pubkey::from_str(token_str).map_err(|e| {
+                error!("Invalid token address in Chainlink feeds config: {} - {}", token_str, e);
+                e
+            }).ok()?;
+            let feed_key = Pubkey::from_str(feed_str).map_err(|e| {
+                error!("Invalid feed address in Chainlink feeds config: {} - {}", feed_str, e);
+                e
+            }).ok()?;
+            Some((token_key, feed_key))
+        })
+        .collect();
+    
+    let flashloan_ito_strategy = Box::new(FlashloanITOStrategy::new(
+        rpc_client.clone(),
+        wallet.clone(),
+        flashloan_config,
+        flashloan_orchestrator,
+        ito_addresses,
+        pyth_feeds,
+        chainlink_feeds,
+    )?);
+    strategies.push(flashloan_ito_strategy);
 
     // Initialize health monitor
     let health_monitor = Arc::new(HealthMonitor::new(HealthMonitorConfig {
