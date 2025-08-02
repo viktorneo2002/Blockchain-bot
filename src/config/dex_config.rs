@@ -1,0 +1,52 @@
+use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolConfig {
+    pub name: String,
+    pub address: String,
+    pub token_a: String,
+    pub token_b: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DexPoolsConfig {
+    pub orca_pools: Vec<PoolConfig>,
+    pub raydium_pools: Vec<PoolConfig>,
+    #[serde(default)]
+    pub ito_addresses: Vec<String>,
+    #[serde(default)]
+    pub pyth_feeds: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub chainlink_feeds: std::collections::HashMap<String, String>,
+}
+
+impl PoolConfig {
+    pub fn get_pubkey(&self) -> Result<Pubkey, anyhow::Error> {
+        Pubkey::from_str(&self.address).map_err(|e| anyhow::anyhow!("Invalid pool address: {}", e))
+    }
+    
+    pub fn get_token_a_pubkey(&self) -> Result<Pubkey, anyhow::Error> {
+        Pubkey::from_str(&self.token_a).map_err(|e| anyhow::anyhow!("Invalid token A address: {}", e))
+    }
+    
+    pub fn get_token_b_pubkey(&self) -> Result<Pubkey, anyhow::Error> {
+        Pubkey::from_str(&self.token_b).map_err(|e| anyhow::anyhow!("Invalid token B address: {}", e))
+    }
+}
+
+impl DexPoolsConfig {
+    pub fn load_from_file(config_path: &str) -> Result<Self, anyhow::Error> {
+        let config_str = std::fs::read_to_string(config_path)?;
+        let config: DexPoolsConfig = serde_json::from_str(&config_str)?;
+        Ok(config)
+    }
+    
+    pub fn get_orca_pool(&self, name: &str) -> Option<&PoolConfig> {
+        self.orca_pools.iter().find(|pool| pool.name == name)
+    }
+    
+    pub fn get_raydium_pool(&self, name: &str) -> Option<&PoolConfig> {
+        self.raydium_pools.iter().find(|pool| pool.name == name)
+    }
