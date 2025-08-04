@@ -1,1 +1,2 @@
-pub mod multi_protocol_aggregator;
+pub mod MultiProtocolFlashLoanAggregator;
+pub mod MultiProtocolFlashLoanSanitizer;
