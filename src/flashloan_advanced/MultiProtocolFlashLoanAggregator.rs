@@ -132,16 +132,16 @@ pub mod multi_protocol_flash_loan_aggregator {
         // Execute flash loan
         match protocol.protocol_type {
             ProtocolType::Solend => {
-                execute_solend_flash_loan(&ctx, amount, total_repay, &route_data)?;
+                flashloan::execute_solend_flash_loan(&ctx, amount, total_repay, &route_data)?;
             },
             ProtocolType::PortFinance => {
-                execute_port_finance_flash_loan(&ctx, amount, total_repay, &route_data)?;
+                flashloan::execute_port_finance_flash_loan(&ctx, amount, total_repay, &route_data)?;
             },
             ProtocolType::Larix => {
-                execute_larix_flash_loan(&ctx, amount, total_repay, &route_data)?;
+                flashloan::execute_larix_flash_loan(&ctx, amount, total_repay, &route_data)?;
             },
             ProtocolType::Kamino => {
-                execute_kamino_flash_loan(&ctx, amount, total_repay, &route_data)?;
+                flashloan::execute_kamino_flash_loan(&ctx, amount, total_repay, &route_data)?;
             },
         }
         
@@ -275,394 +275,226 @@ pub struct ExecuteAggregatedFlashLoan<'info> {
         bump = protocol_info.bump
     )]
     pub protocol_info: Account<'info, ProtocolInfo>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(mut)]
-    pub user_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub aggregator_token_account: Account<'info, TokenAccount>,
-    /// CHECK: Protocol reserve
-    #[account(mut)]
-    pub reserve: AccountInfo<'info>,
-    /// CHECK: Reserve liquidity supply
-    #[account(mut)]
-    pub reserve_liquidity_supply: AccountInfo<'info>,
-    /// CHECK: Reserve collateral mint
-    #[account(mut)]
-    pub reserve_collateral_mint: AccountInfo<'info>,
-    /// CHECK: Protocol program
-    pub protocol_program: AccountInfo<'info>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    /// CHECK: Clock sysvar
-    pub clock: AccountInfo<'info>,
+
+// Flashloan module
+mod flashloan {
+    use super::*;
+    
+    pub fn execute_solend_flash_loan<'info>(
+        ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
+        amount: u64,
+        total_repay: u64,
+        route_data: &RouteData,
+    ) -> Result<()> {
+        // Solend flash loan instruction data
+        let mut data = vec![0xca, 0x32, 0x5c, 0xe7]; // Flash borrow discriminator
+        data.extend_from_slice(&amount.to_le_bytes());
+        
+        let flash_borrow_accounts = vec![
+            AccountMeta::new(ctx.accounts.reserve.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
+            AccountMeta::new(ctx.accounts.user_token_account.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.reserve_collateral_mint.key(), false),
+            AccountMeta::new(ctx.accounts.user.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.clock.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        
+        let flash_borrow_ix = Instruction {
+            program_id: ctx.accounts.protocol_program.key(),
+            accounts: flash_borrow_accounts,
+            data,
+        };
+        
+        invoke(&flash_borrow_ix, &[
+            ctx.accounts.reserve.to_account_info(),
+            ctx.accounts.reserve_liquidity_supply.to_account_info(),
+            ctx.accounts.user_token_account.to_account_info(),
+            ctx.accounts.reserve_collateral_mint.to_account_info(),
+            ctx.accounts.user.to_account_info(),
+            ctx.accounts.clock.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ])?;
+        
+        // Execute arbitrage
+        super::execute_swap_route(ctx, route_data)?;
+        
+        // Repay flash loan
+        let mut repay_data = vec![0xd7, 0x15, 0x4b, 0x3a]; // Flash repay discriminator
+        repay_data.extend_from_slice(&total_repay.to_le_bytes());
+        
+        let flash_repay_accounts = vec![
+            AccountMeta::new(ctx.accounts.reserve.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
+            AccountMeta::new(ctx.accounts.user_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_collateral_mint.key(), false),
+            AccountMeta::new(ctx.accounts.user.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.clock.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        
+        let flash_repay_ix = Instruction {
+            program_id: ctx.accounts.protocol_program.key(),
+            accounts: flash_repay_accounts,
+            data: repay_data,
+        };
+        
+        invoke(&flash_repay_ix, &[
+            ctx.accounts.reserve.to_account_info(),
+            ctx.accounts.reserve_liquidity_supply.to_account_info(),
+            ctx.accounts.user_token_account.to_account_info(),
+            ctx.accounts.reserve_collateral_mint.to_account_info(),
+            ctx.accounts.user.to_account_info(),
+            ctx.accounts.clock.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ])?;
+        
+        Ok(())
+    }
+    
+    pub fn execute_port_finance_flash_loan<'info>(
+        ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
+        amount: u64,
+        total_repay: u64,
+        route_data: &RouteData,
+    ) -> Result<()> {
+        // Port Finance uses a single instruction for flash loan
+        let mut data = vec![0x5a, 0x61, 0x75, 0x72]; // Port flash loan discriminator
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // Number of instructions to execute
+        
+        let accounts = vec![
+            AccountMeta::new(ctx.accounts.reserve.key(), false),
+            AccountMeta::new(ctx.accounts.user_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.user.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+            AccountMeta::new_readonly(sysvar::instructions::id(), false),
+        ];
+        
+        let flash_loan_ix = Instruction {
+            program_id: ctx.accounts.protocol_program.key(),
+            accounts,
+            data,
+        };
+        
+        invoke(&flash_loan_ix, &[
+            ctx.accounts.reserve.to_account_info(),
+            ctx.accounts.user_token_account.to_account_info(),
+            ctx.accounts.user.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ])?;
+        
+        super::execute_swap_route(ctx, route_data)?;
+        
+        Ok(())
+    }
+    
+    pub fn execute_larix_flash_loan<'info>(
+        ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
+        amount: u64,
+        total_repay: u64,
+        route_data: &RouteData,
+    ) -> Result<()> {
+        // Larix flash loan begin
+        let mut begin_data = vec![0xe8, 0x9f, 0x4a, 0x21]; // Begin flash loan
+        begin_data.extend_from_slice(&amount.to_le_bytes());
+        
+        let begin_accounts = vec![
+            AccountMeta::new(ctx.accounts.reserve.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
+            AccountMeta::new(ctx.accounts.user_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.user.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        
+        let begin_ix = Instruction {
+            program_id: ctx.accounts.protocol_program.key(),
+            accounts: begin_accounts,
+            data: begin_data,
+        };
+        
+        invoke(&begin_ix, &[
+            ctx.accounts.reserve.to_account_info(),
+            ctx.accounts.reserve_liquidity_supply.to_account_info(),
+            ctx.accounts.user_token_account.to_account_info(),
+            ctx.accounts.user.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ])?;
+        
+        super::execute_swap_route(ctx, route_data)?;
+        
+        // Larix flash loan end
+        let mut end_data = vec![0x12, 0x34, 0x56, 0x78]; // End flash loan
+        end_data.extend_from_slice(&total_repay.to_le_bytes());
+        
+        let end_accounts = vec![
+            AccountMeta::new(ctx.accounts.reserve.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
+            AccountMeta::new(ctx.accounts.user_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.user.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        
+        let end_ix = Instruction {
+            program_id: ctx.accounts.protocol_program.key(),
+            accounts: end_accounts,
+            data: end_data,
+        };
+        
+        invoke(&end_ix, &[
+            ctx.accounts.reserve.to_account_info(),
+            ctx.accounts.reserve_liquidity_supply.to_account_info(),
+            ctx.accounts.user_token_account.to_account_info(),
+            ctx.accounts.user.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ])?;
+        
+        Ok(())
+    }
+    
+    pub fn execute_kamino_flash_loan<'info>(
+        ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
+        amount: u64,
+        total_repay: u64,
+        route_data: &RouteData,
+    ) -> Result<()> {
+        // Kamino flash loan instruction
+        let mut data = vec![0xf0, 0x1d, 0xca, 0xfe]; // Kamino flash loan discriminator
+        data.extend_from_slice(&amount.to_le_bytes());
+        
+        let accounts = vec![
+            AccountMeta::new(ctx.accounts.reserve.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
+            AccountMeta::new(ctx.accounts.reserve_collateral_mint.key(), false),
+            AccountMeta::new(ctx.accounts.user_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.user.key(), true),
+            AccountMeta::new_readonly(sysvar::instructions::id(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        
+        let flash_loan_ix = Instruction {
+            program_id: ctx.accounts.protocol_program.key(),
+            accounts,
+            data,
+        };
+        
+        invoke(&flash_loan_ix, &[
+            ctx.accounts.reserve.to_account_info(),
+            ctx.accounts.reserve_liquidity_supply.to_account_info(),
+            ctx.accounts.reserve_collateral_mint.to_account_info(),
+            ctx.accounts.user_token_account.to_account_info(),
+            ctx.accounts.user.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ])?;
+        
+        super::execute_swap_route(ctx, route_data)?;
+        
+        Ok(())
+    }
 }
 
-#[derive(Accounts)]
-pub struct EmergencyControl<'info> {
-    #[account(mut, seeds = [b"aggregator"], bump = aggregator.bump)]
-    pub aggregator: Account<'info, Aggregator>,
-    #[account(constraint = authority.key() == aggregator.authority)]
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct UpdateConfig<'info> {
-    #[account(mut, seeds = [b"aggregator"], bump = aggregator.bump)]
-    pub aggregator: Account<'info, Aggregator>,
-    #[account(constraint = authority.key() == aggregator.authority)]
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct WithdrawProfits<'info> {
-    #[account(mut, seeds = [b"aggregator"], bump = aggregator.bump)]
-    pub aggregator: Account<'info, Aggregator>,
-    #[account(mut)]
-    pub aggregator_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub treasury_token_account: Account<'info, TokenAccount>,
-    #[account(constraint = authority.key() == aggregator.authority)]
-    pub authority: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[account]
-pub struct Aggregator {
-    pub authority: Pubkey,
-    pub treasury: Pubkey,
-    pub bump: u8,
-    pub total_volume: u64,
-    pub total_profit: u64,
-    pub total_flash_loans: u64,
-    pub is_paused: bool,
-    pub min_profit_bps: u16,
-    pub protocol_count: u8,
-}
-
-#[account]
-pub struct ProtocolInfo {
-    pub protocol_type: ProtocolType,
-    pub program_id: Pubkey,
-    pub reserve_address: Pubkey,
-    pub collateral_mint: Pubkey,
-    pub liquidity_address: Pubkey,
-    pub fee_bps: u16,
-    pub is_active: bool,
-    pub last_update: i64,
-    pub total_borrowed: u64,
-    pub bump: u8,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum ProtocolType {
-    Solend,
-    PortFinance,
-    Larix,
-    Kamino,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct RouteData {
-    pub dex_program: Pubkey,
-    pub swap_accounts: Vec<Pubkey>,
-    pub swap_data: Vec<u8>,
-    pub expected_profit: u64,
-    pub max_slippage_bps: u16,
-}
-
-#[event]
-pub struct AggregatorInitialized {
-    pub authority: Pubkey,
-    pub treasury: Pubkey,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct ProtocolRegistered {
-    pub protocol_type: ProtocolType,
-    pub reserve: Pubkey,
-    pub fee_bps: u16,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct FlashLoanExecuted {
-    pub protocol: ProtocolType,
-    pub amount: u64,
-    pub fee: u64,
-    pub profit: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct EmergencyPause {
-    pub authority: Pubkey,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct OperationsResumed {
-    pub authority: Pubkey,
-    pub timestamp: i64,
-}
-
-#[error_code]
-pub enum ErrorCode {
-    #[msg("System is currently paused")]
-    SystemPaused,
-    #[msg("Maximum number of protocols reached")]
-    MaxProtocolsReached,
-    #[msg("Amount too low")]
-    AmountTooLow,
-    #[msg("Protocol is inactive")]
-    ProtocolInactive,
-    #[msg("Math overflow")]
-    MathOverflow,
-    #[msg("Insufficient expected profit")]
-    InsufficientExpectedProfit,
-    #[msg("Flash loan resulted in loss")]
-    FlashLoanUnprofitable,
-    #[msg("Actual profit below expectation")]
-    ProfitBelowExpectation,
-    #[msg("Invalid parameter")]
-    InvalidParameter,
-    #[msg("Invalid instruction data")]
-    InvalidInstructionData,
-    #[msg("Slippage exceeded")]
-    SlippageExceeded,
-}
-
-// Helper functions
-fn solend_program_id() -> Pubkey {
-    SOLEND_PROGRAM_ID.parse::<Pubkey>().unwrap()
-}
-
-fn port_finance_program_id() -> Pubkey {
-    PORT_FINANCE_PROGRAM_ID.parse::<Pubkey>().unwrap()
-}
-
-fn larix_program_id() -> Pubkey {
-    LARIX_PROGRAM_ID.parse::<Pubkey>().unwrap()
-}
-
-fn kamino_program_id() -> Pubkey {
-    KAMINO_PROGRAM_ID.parse::<Pubkey>().unwrap()
-}
-
-fn execute_solend_flash_loan<'info>(
-    ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
-    amount: u64,
-    total_repay: u64,
-    route_data: &RouteData,
-) -> Result<()> {
-    // Solend flash loan instruction data
-    let mut data = vec![0xca, 0x32, 0x5c, 0xe7]; // Flash borrow discriminator
-    data.extend_from_slice(&amount.to_le_bytes());
-    
-    let flash_borrow_accounts = vec![
-        AccountMeta::new(ctx.accounts.reserve.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
-        AccountMeta::new(ctx.accounts.user_token_account.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.reserve_collateral_mint.key(), false),
-        AccountMeta::new(ctx.accounts.user.key(), true),
-        AccountMeta::new_readonly(ctx.accounts.clock.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-    ];
-    
-    let flash_borrow_ix = Instruction {
-        program_id: ctx.accounts.protocol_program.key(),
-        accounts: flash_borrow_accounts,
-        data,
-    };
-    
-    invoke(&flash_borrow_ix, &[
-        ctx.accounts.reserve.to_account_info(),
-        ctx.accounts.reserve_liquidity_supply.to_account_info(),
-        ctx.accounts.user_token_account.to_account_info(),
-        ctx.accounts.reserve_collateral_mint.to_account_info(),
-        ctx.accounts.user.to_account_info(),
-        ctx.accounts.clock.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-    ])?;
-    
-    // Execute arbitrage
-    execute_swap_route(ctx, route_data)?;
-    
-    // Repay flash loan
-    let mut repay_data = vec![0xd7, 0x15, 0x4b, 0x3a]; // Flash repay discriminator
-    repay_data.extend_from_slice(&total_repay.to_le_bytes());
-    
-    let flash_repay_accounts = vec![
-        AccountMeta::new(ctx.accounts.reserve.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
-        AccountMeta::new(ctx.accounts.user_token_account.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_collateral_mint.key(), false),
-        AccountMeta::new(ctx.accounts.user.key(), true),
-        AccountMeta::new_readonly(ctx.accounts.clock.key(), false),
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-    ];
-    
-    let flash_repay_ix = Instruction {
-        program_id: ctx.accounts.protocol_program.key(),
-        accounts: flash_repay_accounts,
-        data: repay_data,
-    };
-    
-    invoke(&flash_repay_ix, &[
-        ctx.accounts.reserve.to_account_info(),
-        ctx.accounts.reserve_liquidity_supply.to_account_info(),
-        ctx.accounts.user_token_account.to_account_info(),
-        ctx.accounts.reserve_collateral_mint.to_account_info(),
-        ctx.accounts.user.to_account_info(),
-        ctx.accounts.clock.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-    ])?;
-    
-    Ok(())
-}
-
-fn execute_port_finance_flash_loan<'info>(
-    ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
-    amount: u64,
-    total_repay: u64,
-    route_data: &RouteData,
-) -> Result<()> {
-    // Port Finance uses a single instruction for flash loan
-    let mut data = vec![0x5a, 0x61, 0x75, 0x72]; // Port flash loan discriminator
-    data.extend_from_slice(&amount.to_le_bytes());
-    data.extend_from_slice(&1u64.to_le_bytes()); // Number of instructions to execute
-    
-    let accounts = vec![
-        AccountMeta::new(ctx.accounts.reserve.key(), false),
-        AccountMeta::new(ctx.accounts.user_token_account.key(), false),
-        AccountMeta::new(ctx.accounts.user.key(), true),
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-        AccountMeta::new_readonly(sysvar::instructions::id(), false),
-    ];
-    
-    let flash_loan_ix = Instruction {
-        program_id: ctx.accounts.protocol_program.key(),
-        accounts,
-        data,
-    };
-    
-    invoke(&flash_loan_ix, &[
-        ctx.accounts.reserve.to_account_info(),
-        ctx.accounts.user_token_account.to_account_info(),
-        ctx.accounts.user.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-    ])?;
-    
-    execute_swap_route(ctx, route_data)?;
-    
-    Ok(())
-}
-
-fn execute_larix_flash_loan<'info>(
-    ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
-    amount: u64,
-    total_repay: u64,
-    route_data: &RouteData,
-) -> Result<()> {
-    // Larix flash loan begin
-    let mut begin_data = vec![0xe8, 0x9f, 0x4a, 0x21]; // Begin flash loan
-    begin_data.extend_from_slice(&amount.to_le_bytes());
-    
-    let begin_accounts = vec![
-        AccountMeta::new(ctx.accounts.reserve.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
-        AccountMeta::new(ctx.accounts.user_token_account.key(), false),
-        AccountMeta::new(ctx.accounts.user.key(), true),
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-    ];
-    
-    let begin_ix = Instruction {
-        program_id: ctx.accounts.protocol_program.key(),
-        accounts: begin_accounts,
-        data: begin_data,
-    };
-    
-    invoke(&begin_ix, &[
-        ctx.accounts.reserve.to_account_info(),
-        ctx.accounts.reserve_liquidity_supply.to_account_info(),
-        ctx.accounts.user_token_account.to_account_info(),
-        ctx.accounts.user.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-    ])?;
-    
-    execute_swap_route(ctx, route_data)?;
-    
-    // Larix flash loan end
-    let mut end_data = vec![0x12, 0x34, 0x56, 0x78]; // End flash loan
-    end_data.extend_from_slice(&total_repay.to_le_bytes());
-    
-    let end_accounts = vec![
-        AccountMeta::new(ctx.accounts.reserve.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
-        AccountMeta::new(ctx.accounts.user_token_account.key(), false),
-        AccountMeta::new(ctx.accounts.user.key(), true),
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-    ];
-    
-    let end_ix = Instruction {
-        program_id: ctx.accounts.protocol_program.key(),
-        accounts: end_accounts,
-        data: end_data,
-    };
-    
-    invoke(&end_ix, &[
-        ctx.accounts.reserve.to_account_info(),
-        ctx.accounts.reserve_liquidity_supply.to_account_info(),
-        ctx.accounts.user_token_account.to_account_info(),
-        ctx.accounts.user.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-    ])?;
-    
-    Ok(())
-}
-
-fn execute_kamino_flash_loan<'info>(
-    ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
-    amount: u64,
-    total_repay: u64,
-    route_data: &RouteData,
-) -> Result<()> {
-    // Kamino flash loan instruction
-    let mut data = vec![0xf0, 0x1d, 0xca, 0xfe]; // Kamino flash loan discriminator
-    data.extend_from_slice(&amount.to_le_bytes());
-    
-    let accounts = vec![
-        AccountMeta::new(ctx.accounts.reserve.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_liquidity_supply.key(), false),
-        AccountMeta::new(ctx.accounts.reserve_collateral_mint.key(), false),
-        AccountMeta::new(ctx.accounts.user_token_account.key(), false),
-        AccountMeta::new(ctx.accounts.user.key(), true),
-        AccountMeta::new_readonly(sysvar::instructions::id(), false),
-        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-    ];
-    
-    let flash_loan_ix = Instruction {
-        program_id: ctx.accounts.protocol_program.key(),
-        accounts,
-        data,
-    };
-    
-    invoke(&flash_loan_ix, &[
-        ctx.accounts.reserve.to_account_info(),
-        ctx.accounts.reserve_liquidity_supply.to_account_info(),
-        ctx.accounts.reserve_collateral_mint.to_account_info(),
-        ctx.accounts.user_token_account.to_account_info(),
-        ctx.accounts.user.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-    ])?;
-    
-    execute_swap_route(ctx, route_data)?;
-    
-    Ok(())
-}
-
-fn execute_swap_route<'info>(
+// Helper function to execute swap route
+pub fn execute_swap_route<'info>(
     ctx: &Context<ExecuteAggregatedFlashLoan<'info>>,
     route_data: &RouteData,
 ) -> Result<()> {
@@ -696,8 +528,7 @@ fn execute_swap_route<'info>(
     Ok(())
 }
 
-// Price and profitability calculations
-pub fn calculate_minimum_profit_threshold(
+pub fn estimate_transaction_cost(
     amount: u64,
     fee_bps: u16,
     gas_estimate: u64,
@@ -706,30 +537,33 @@ pub fn calculate_minimum_profit_threshold(
     let safety_margin = amount / 1000; // 0.1% safety margin
     protocol_fee + gas_estimate + safety_margin
 }
-
-pub fn estimate_transaction_cost(
-    priority_fee: u64,
-    compute_units: u32,
-) -> u64 {
-    const BASE_FEE: u64 = 5000;
-    const SIGNATURE_FEE: u64 = 5000;
-    let compute_fee = (compute_units as u64 * priority_fee) / 1_000_000;
-    BASE_FEE + SIGNATURE_FEE + compute_fee
-}
-
-// MEV Protection
-pub fn calculate_jito_tip(
-    expected_profit: u64,
-    network_congestion: f64,
-) -> u64 {
-    const MIN_TIP: u64 = 10_000;
-    const MAX_TIP_PERCENTAGE: u64 = 50; // 50% of profit
+// MEV Protection module
+mod mev_protection {
+    use super::*;
     
-    let base_tip = (expected_profit * 10 / 100).max(MIN_TIP);
-    let congestion_multiplier = (1.0 + network_congestion * 2.0).min(3.0);
-    let adjusted_tip = (base_tip as f64 * congestion_multiplier) as u64;
+    pub fn calculate_jito_tip(
+        expected_profit: u64,
+        network_congestion: f64,
+    ) -> Result<u64, ProgramError> {
+        // Validate inputs
+        if network_congestion < 0.0 || network_congestion > 1.0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        const MIN_TIP: u64 = 10_000;
+        const MAX_TIP_PERCENTAGE: u64 = 50; // 50% of profit
+        
+        let base_tip = (expected_profit * 10 / 100).max(MIN_TIP);
+        let congestion_multiplier = (1.0 + network_congestion * 2.0).min(3.0);
+        let adjusted_tip = (base_tip as f64 * congestion_multiplier) as u64;
+        
+        Ok(calculated_tip.max(min_tip).min(10000000)) // Cap at 0.01 SOL
+    }
     
-    adjusted_tip.min(expected_profit * MAX_TIP_PERCENTAGE / 100)
+    pub fn jito_tip_calibration(tip_amount: u64) -> Result<u64, ProgramError> {
+        let calibrated_tip = (tip_amount * 9) / 10; // 90% of tip amount
+        Ok(calibrated_tip.max(100000)) // 100k, whichever is larger
+    }
 }
 
 // Optimal routing
@@ -854,43 +688,63 @@ pub fn optimize_compute_budget(
     compute_units.min(MAX_COMPUTE)
 }
 
-// Network congestion detection
-pub fn estimate_network_congestion(
-    recent_block_times: &[i64],
-    failed_tx_count: u32,
-    total_tx_count: u32,
-) -> f64 {
-    let avg_block_time = if recent_block_times.len() > 1 {
-        let sum: i64 = recent_block_times.windows(2)
-            .map(|w| w[1] - w[0])
-            .sum();
-        sum as f64 / (recent_block_times.len() - 1) as f64
-    } else {
-        400.0
-    };
+// Network congestion detection module
+mod congestion_detection {
+    use super::*;
     
-    let time_congestion = (avg_block_time - 400.0).max(0.0) / 400.0;
-    let failure_rate = if total_tx_count > 0 {
-        failed_tx_count as f64 / total_tx_count as f64
-    } else {
-        0.0
-    };
-    
-    (time_congestion * 0.7 + failure_rate * 0.3).min(1.0)
+    pub fn estimate_network_congestion(
+        recent_block_times: &[i64],
+        failed_tx_count: u32,
+        total_tx_count: u32,
+    ) -> Result<f64, ProgramError> {
+        // Validate inputs
+        if total_tx_count > 0 && failed_tx_count > total_tx_count {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        let avg_block_time = if recent_block_times.len() > 1 {
+            // Use checked arithmetic to prevent overflow
+            let mut sum: i64 = 0;
+            for window in recent_block_times.windows(2) {
+                sum = sum.saturating_add(window[1].saturating_sub(window[0]));
+            }
+            (sum as f64) / ((recent_block_times.len() - 1) as f64)
+        } else {
+            400.0
+        };
+        
+        let time_congestion = (avg_block_time - 400.0).max(0.0) / 400.0;
+        let failure_rate = if total_tx_count > 0 {
+            (failed_tx_count as f64) / (total_tx_count as f64)
+        } else {
+            0.0
+        };
+        
+        Ok((time_congestion * 0.7 + failure_rate * 0.3).min(1.0))
+    }
 }
 
-// Risk management
-pub fn calculate_position_size(
-    available_capital: u64,
-    risk_percentage: u8,
-    expected_profit_bps: u16,
-) -> u64 {
-    let risk_amount = available_capital * risk_percentage as u64 / 100;
-    let profit_factor = expected_profit_bps as u64 / 10;
+// Risk management module
+mod risk_management {
+    use super::*;
     
-    // Higher expected profit allows larger position
-    let size_multiplier = (profit_factor as f64 / 10.0).min(3.0).max(0.5);
-    (risk_amount as f64 * size_multiplier) as u64
+    pub fn calculate_position_size(
+        available_capital: u64,
+        risk_percentage: u8,
+        expected_profit_bps: u16,
+    ) -> Result<u64, ProgramError> {
+        // Validate inputs
+        if risk_percentage > 100 {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        let risk_amount = available_capital.saturating_mul(risk_percentage as u64) / 100;
+        let profit_factor = expected_profit_bps as u64 / 10;
+        
+        // Higher expected profit allows larger position
+        let size_multiplier = (profit_factor as f64 / 10.0).min(3.0).max(0.5);
+        Ok((risk_amount as f64 * size_multiplier) as u64)
+    }
 }
 
 // Helper to build Jito bundle
@@ -898,8 +752,10 @@ pub fn build_jito_bundle_message(
     transactions: Vec<Vec<u8>>,
     tip_amount: u64,
     tip_account: Pubkey,
-) -> Vec<u8> {
-    let mut bundle = vec![];
+) -> Result<Vec<u8>, ProgramError> {
+    // Pre-allocate vector with estimated capacity to reduce reallocations
+    let estimated_size = 8 + 8 + 32 + transactions.iter().map(|tx| 4 + tx.len()).sum::<usize>();
+    let mut bundle = Vec::with_capacity(estimated_size);
     
     // Bundle header
     bundle.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
@@ -908,11 +764,15 @@ pub fn build_jito_bundle_message(
     
     // Transactions
     for tx in transactions {
+        // Validate transaction size
+        if tx.len() > 1024 * 1024 { // 1MB limit
+            return Err(ProgramError::InvalidAccountData);
+        }
         bundle.extend_from_slice(&(tx.len() as u32).to_le_bytes());
         bundle.extend_from_slice(&tx);
     }
     
-    bundle
+    Ok(bundle)
 }
 
 // Monitoring and metrics
