@@ -1,0 +1,17 @@
+table FloatVector {
+  values: [float];
+}
+
+table ModelWeights {
+  input_weights: [FloatVector];
+  hidden_weights: [FloatVector];
+  output_weights: [FloatVector];
+  input_bias: [float];
+  hidden_bias: [float];
+  output_bias: [float];
+  feature_count: uint;
+  hidden_size: uint;
+  output_size: uint;
+}
+
+root_type ModelWeights;
