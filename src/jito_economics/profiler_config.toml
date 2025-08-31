@@ -1,0 +1,113 @@
+# Validator Latency Profiler Configuration File
+# This file demonstrates all available configuration parameters
+
+# Core latency monitoring parameters
+latency_window_size = 5000
+outlier_threshold_multiplier = 2.5
+min_samples_for_stats = 50
+validator_health_check_interval_secs = 15
+latency_probe_interval_ms = 25
+max_concurrent_probes = 200
+probe_timeout_ms = 150
+critical_latency_ms = 50.0
+optimal_latency_ms = 15.0
+max_consecutive_failures = 3
+
+# Network and connection parameters
+rpc_timeout_ms = 5000
+tpu_timeout_ms = 3000
+websocket_timeout_ms = 10000
+connection_pool_size = 50
+max_retries = 3
+retry_backoff_ms = 100
+enable_tls = true
+verify_certificates = true
+
+# Stake and validator parameters
+stake_update_interval_secs = 120
+min_stake_threshold = 1000000000  # 1 SOL in lamports
+stake_weight_multiplier = 1.5
+validator_score_decay_rate = 0.95
+blacklist_duration_secs = 3600
+
+# TPU and transaction parameters
+tpu_probe_interval_ms = 100
+tpu_connection_timeout_ms = 2000
+transaction_confirmation_timeout_ms = 30000
+max_transaction_retries = 5
+transaction_fee_multiplier = 1.2
+
+# Leader schedule and MEV parameters
+leader_schedule_update_interval_secs = 60
+leader_schedule_lookahead_slots = 100
+mev_opportunity_detection_interval_ms = 500
+min_mev_profit_threshold_lamports = 10000
+mev_confidence_threshold = 0.75
+max_mev_opportunities_per_validator = 10
+
+# Circuit breaker parameters
+circuit_breaker_failure_threshold = 5
+circuit_breaker_recovery_timeout_secs = 30
+circuit_breaker_half_open_max_calls = 3
+circuit_breaker_monitor_interval_secs = 10
+
+# Jito integration parameters
+jito_tip_account_update_interval_secs = 30
+jito_api_url = "https://mainnet.block-engine.jito.wtf"
+jito_bundle_api_url = "https://bundles.jito.wtf"
+jito_tip_floor_update_interval_secs = 15
+jito_request_timeout_ms = 5000
+jito_max_retries = 3
+
+# Memory and performance parameters
+max_memory_usage_mb = 512
+memory_check_interval_secs = 30
+gc_trigger_threshold_mb = 400
+performance_metrics_window_size = 1000
+metrics_retention_hours = 24
+
+# Alert and notification parameters
+alert_queue_size = 1000
+alert_processing_timeout_ms = 5000
+enable_slack_alerts = false
+# slack_webhook_url = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+enable_telegram_alerts = false
+# telegram_bot_token = "YOUR_BOT_TOKEN"
+# telegram_chat_id = "YOUR_CHAT_ID"
+enable_email_alerts = false
+# smtp_server = "smtp.gmail.com:587"
+email_recipients = []
+
+# Monitoring and observability parameters
+enable_prometheus_metrics = false
+prometheus_bind_address = "0.0.0.0"
+prometheus_port = 9090
+enable_jaeger_tracing = false
+# jaeger_endpoint = "http://localhost:14268/api/traces"
+log_level = "info"
+enable_structured_logging = false
+
+# Database integration parameters
+enable_database_storage = false
+# database_url = "postgresql://user:pass@localhost/profiler_db"
+database_connection_pool_size = 10
+database_timeout_ms = 30000
+metrics_batch_size = 100
+metrics_flush_interval_secs = 60
+
+# Load testing parameters
+enable_load_testing = false
+load_test_duration_secs = 300
+load_test_requests_per_second = 100
+load_test_concurrent_connections = 50
+
+# Geographic distribution parameters
+enable_geographic_routing = false
+preferred_regions = ["us-east-1", "us-west-2"]
+max_cross_region_latency_ms = 200.0
+
+# Region latency weights (as TOML inline table)
+[region_latency_weights]
+"us-east-1" = 1.0
+"us-west-2" = 0.9
+"eu-west-1" = 0.8
