@@ -3,17 +3,11 @@ use dashmap::DashMap;
 use futures::future::join_all;
 use lru::LruCache;
 use parking_lot::RwLock;
-use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
-    rpc_filter::{Memcmp, RpcFilterType},
-};
+use rand::{thread_rng, Rng};
 use solana_sdk::{
-    account::Account,
     commitment_config::{CommitmentConfig, CommitmentLevel},
     hash::Hash,
     pubkey::Pubkey,
-    signature::Signature,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -24,9 +18,14 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, RwLock as TokioRwLock, Semaphore},
+    sync::{RwLock as TokioRwLock, Semaphore},
     time::{interval, sleep},
 };
+
+use crate::infrastructure::{CustomRPCEndpoints};
+use crate::infrastructure::custom_rpc_endpoints::EndpointConfig;
+use super::types::{AccountProof, MerkleProof};
+use super::proof_provider::ProofProvider;
 
 const MAX_CACHE_SIZE: usize = 50000;
 const PREFETCH_BATCH_SIZE: usize = 100;
@@ -37,21 +36,6 @@ const RPC_TIMEOUT: Duration = Duration::from_millis(500);
 const PREFETCH_INTERVAL_MS: u64 = 50;
 const MAX_PROOF_DEPTH: usize = 32;
 
-#[derive(Debug, Clone)]
-pub struct MerkleProof {
-    pub root: Hash,
-    pub proof: Vec<Hash>,
-    pub leaf_index: u64,
-    pub timestamp: Instant,
-}
-
-#[derive(Debug, Clone)]
-pub struct AccountProof {
-    pub account: Account,
-    pub proof: MerkleProof,
-    pub slot: u64,
-}
-
 #[derive(Debug)]
 struct CachedProof {
     proof: AccountProof,
@@ -60,7 +44,8 @@ struct CachedProof {
 }
 
 pub struct MerkleProofPrefetcher {
-    rpc_clients: Vec<Arc<RpcClient>>,
+    rpc: Arc<CustomRPCEndpoints>,
+    provider: Arc<dyn ProofProvider>,
     proof_cache: Arc<DashMap<Pubkey, CachedProof>>,
     lru_cache: Arc<RwLock<LruCache<Pubkey, ()>>>,
     prefetch_queue: Arc<TokioRwLock<HashSet<Pubkey>>>,
@@ -85,21 +70,43 @@ impl MerkleProofPrefetcher {
             return Err(anyhow!("No RPC endpoints provided"));
         }
 
-        let rpc_clients = rpc_endpoints
+        let configs: Vec<EndpointConfig> = rpc_endpoints
             .into_iter()
-            .map(|url| {
-                Arc::new(RpcClient::new_with_timeout_and_commitment(
-                    url,
-                    RPC_TIMEOUT,
-                    CommitmentConfig {
-                        commitment: CommitmentLevel::Processed,
-                    },
-                ))
+            .map(|url| EndpointConfig {
+                url: url.clone(),
+                ws_url: String::new(),
+                weight: 1,
+                max_requests_per_second: 1000,
+                timeout_ms: RPC_TIMEOUT.as_millis() as u64,
+                priority: 1,
             })
             .collect();
 
+        let rpc = Arc::new(CustomRPCEndpoints::new(configs));
+        let provider = Arc::new(super::proof_provider::SimulatedProofProvider::new(rpc.clone()));
+
         Ok(Self {
-            rpc_clients,
+            rpc,
+            provider,
+            proof_cache: Arc::new(DashMap::new()),
+            lru_cache: Arc::new(RwLock::new(LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CACHE_SIZE).unwrap(),
+            ))),
+            prefetch_queue: Arc::new(TokioRwLock::new(HashSet::new())),
+            active_prefetches: Arc::new(DashMap::new()),
+            request_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            stats: Arc::new(PrefetcherStats::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn with_provider(
+        rpc: Arc<CustomRPCEndpoints>,
+        provider: Arc<dyn ProofProvider>,
+    ) -> Result<Self> {
+        Ok(Self {
+            rpc,
+            provider,
             proof_cache: Arc::new(DashMap::new()),
             lru_cache: Arc::new(RwLock::new(LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CACHE_SIZE).unwrap(),
@@ -248,141 +255,27 @@ impl MerkleProofPrefetcher {
 
     async fn fetch_proof_with_retry(&self, account: &Pubkey) -> Result<AccountProof> {
         let _permit = self.request_semaphore.acquire().await?;
-        
+
         for attempt in 0..PROOF_RETRY_ATTEMPTS {
-            let client_index = (attempt as usize) % self.rpc_clients.len();
-            let client = &self.rpc_clients[client_index];
-            
-            match self.fetch_single_proof(client, account).await {
+            match self.provider.get_account_with_proof(account).await {
                 Ok(proof) => return Ok(proof),
                 Err(e) => {
                     if attempt == PROOF_RETRY_ATTEMPTS - 1 {
                         return Err(e);
                     }
-                    sleep(Duration::from_millis(10 * (attempt + 1) as u64)).await;
+                    // Exponential backoff with jitter (bounded)
+                    let base_delay = 20u64.saturating_mul(1u64 << attempt);
+                    let jitter: u64 = thread_rng().gen_range(0..=15);
+                    let delay_ms = (base_delay + jitter).min(500);
+                    sleep(Duration::from_millis(delay_ms)).await;
                 }
             }
         }
-        
+
         Err(anyhow!("Failed to fetch proof after retries"))
     }
 
-    async fn fetch_single_proof(
-        &self,
-        client: &Arc<RpcClient>,
-        account: &Pubkey,
-    ) -> Result<AccountProof> {
-        let config = RpcAccountInfoConfig {
-            encoding: None,
-            data_slice: None,
-            commitment: Some(CommitmentConfig::processed()),
-            min_context_slot: None,
-        };
-
-        let response = client
-            .get_account_with_commitment(account, config.commitment.unwrap())
-            .await?;
-
-        let account_data = response
-            .value
-            .ok_or_else(|| anyhow!("Account not found"))?;
-
-        let slot = response.context.slot;
-        let block_height = client.get_block_height().await?;
-        
-        let proof = self.generate_merkle_proof(account, slot, block_height).await?;
-
-        Ok(AccountProof {
-            account: account_data,
-            proof,
-            slot,
-        })
-    }
-
-    async fn generate_merkle_proof(
-        &self,
-        account: &Pubkey,
-        slot: u64,
-        block_height: u64,
-    ) -> Result<MerkleProof> {
-        let leaf_index = self.calculate_leaf_index(account, slot);
-        let tree_size = self.calculate_tree_size(block_height);
-        let proof_path = self.calculate_proof_path(leaf_index, tree_size);
-        
-        let mut proof_hashes = Vec::with_capacity(proof_path.len());
-        let client = &self.rpc_clients[0];
-        
-        for node_info in proof_path {
-            let hash = self.fetch_node_hash(client, node_info.0, node_info.1).await?;
-            proof_hashes.push(hash);
-        }
-
-        let root = self.calculate_root_hash(account, &proof_hashes, leaf_index);
-
-        Ok(MerkleProof {
-            root,
-            proof: proof_hashes,
-            leaf_index,
-            timestamp: Instant::now(),
-        })
-    }
-
-    fn calculate_leaf_index(&self, account: &Pubkey, slot: u64) -> u64 {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(account.as_ref());
-        hasher.update(&slot.to_le_bytes());
-        
-        let hash = hasher.finalize();
-        u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap())
-    }
-
-    fn calculate_tree_size(&self, block_height: u64) -> u64 {
-        let base_size = 1u64 << 20;
-        let growth_factor = block_height / 1000000;
-        base_size.saturating_mul(1 + growth_factor)
-    }
-
-    fn calculate_proof_path(&self, leaf_index: u64, tree_size: u64) -> Vec<(u64, u64)> {
-        let mut path = Vec::new();
-        let mut current_index = leaf_index;
-        let mut level_size = tree_size;
-        
-        while level_size > 1 {
-            let sibling_index = if current_index % 2 == 0 {
-                current_index + 1
-            } else {
-                current_index - 1
-            };
-            
-            if sibling_index < level_size {
-                path.push((sibling_index, level_size));
-            }
-            
-            current_index /= 2;
-            level_size = (level_size + 1) / 2;
-        }
-        
-        path
-    }
-
-    async fn fetch_node_hash(
-        &self,
-        client: &Arc<RpcClient>,
-        node_index: u64,
-        level_size: u64,
-    ) -> Result<Hash> {
-        let slot = client.get_slot().await?;
-        let block = client.get_block(slot).await?;
-        
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&node_index.to_le_bytes());
-        hasher.update(&level_size.to_le_bytes());
-        hasher.update(&block.blockhash.to_bytes());
-        
-        let hash_bytes = hasher.finalize();
-        Ok(Hash::new_from_array(hash_bytes.into()))
-    }
-
+    
     fn calculate_root_hash(&self, account: &Pubkey, proof: &[Hash], leaf_index: u64) -> Hash {
         let mut current_hash = {
             let mut hasher = blake3::Hasher::new();
@@ -451,7 +344,8 @@ impl MerkleProofPrefetcher {
 
     fn clone_self(&self) -> Self {
         Self {
-            rpc_clients: self.rpc_clients.clone(),
+            rpc: self.rpc.clone(),
+            provider: self.provider.clone(),
             proof_cache: self.proof_cache.clone(),
             lru_cache: self.lru_cache.clone(),
             prefetch_queue: self.prefetch_queue.clone(),
@@ -530,6 +424,19 @@ impl MerkleProofPrefetcher {
         }
     }
 
+    pub async fn get_stats_async(&self) -> PrefetcherStatsSnapshot {
+        let queue_len = self.prefetch_queue.read().await.len();
+        PrefetcherStatsSnapshot {
+            cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.stats.cache_misses.load(Ordering::Relaxed),
+            prefetch_requests: self.stats.prefetch_requests.load(Ordering::Relaxed),
+            failed_requests: self.stats.failed_requests.load(Ordering::Relaxed),
+            evictions: self.stats.evictions.load(Ordering::Relaxed),
+            cache_size: self.proof_cache.len(),
+            queue_size: queue_len,
+        }
+    }
+
     pub async fn verify_proof(&self, account: &Pubkey, proof: &AccountProof) -> Result<bool> {
         let calculated_root = self.calculate_root_hash(account, &proof.proof.proof, proof.proof.leaf_index);
         
@@ -537,8 +444,11 @@ impl MerkleProofPrefetcher {
             return Ok(false);
         }
 
-        let client = &self.rpc_clients[0];
-        let current_slot = client.get_slot().await?;
+        let current_slot = self
+            .rpc
+            .get_slot(CommitmentConfig::processed())
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
         
         if current_slot.saturating_sub(proof.slot) > 150 {
             return Ok(false);
@@ -680,4 +590,6 @@ mod tests {
         assert_eq!(stats.cache_size, 0);
     }
 }
+
+
 
