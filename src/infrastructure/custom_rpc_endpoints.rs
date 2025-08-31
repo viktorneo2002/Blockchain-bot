@@ -21,6 +21,43 @@ use url::Url;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use thiserror::Error;
+use anyhow::{Result, anyhow};
+use solana_client::{
+    client_error::{ClientError, ClientErrorKind},
+    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+    rpc_filter::{RpcFilterType, Memcmp},
+    rpc_response::{Response as RpcResponse, RpcKeyedAccount},
+};
+use tracing::{debug, error, warn, info};
+
+#[derive(Debug, Clone)]
+pub struct EndpointHealthStatus {
+    pub url: String,
+    pub is_healthy: bool,
+    pub current_latency_ms: u64,
+    pub average_latency_ms: u64,
+    pub success_rate: f64,
+    pub total_requests: u64,
+    pub consecutive_failures: usize,
+    pub last_failure_time: Option<Instant>,
+    pub priority: u8,
+    pub weight: u32,
+    pub circuit_breaker_open: bool,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct EndpointPerformanceMetrics {
+    pub url: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub average_latency_ms: u64,
+    pub uptime_percentage: f64,
+    pub consecutive_failures: usize,
+    pub is_currently_healthy: bool,
+    pub performance_score: f64,
+}
 
 #[derive(Debug, Error)]
 pub enum RpcError {
