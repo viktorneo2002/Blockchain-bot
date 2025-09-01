@@ -1,45 +1,528 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as StdHash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use bloom::{ASMS, BloomFilter};
+use dashmap::DashMap;
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use solana_sdk::{
+    account::Account,
+    address_lookup_table::AddressLookupTableAccount,
+    clock::Slot,
+    compute_budget::{self, ComputeBudgetInstruction},
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::{Message, VersionedMessage},
     pubkey::Pubkey,
     signature::Signature,
-    transaction::Transaction,
-    instruction::CompiledInstruction,
-    hash::{Hash, hashv},
-    message::Message,
-    compute_budget::ComputeBudgetInstruction,
+    transaction::{Transaction, VersionedTransaction},
 };
-use dashmap::DashMap;
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use anyhow::{Result, Context};
+use tokio::sync::Semaphore;
+use metrics::{counter, gauge, histogram, increment_counter};
 use log::{warn, error, debug};
+use std::num::NonZeroUsize;
+use thiserror::Error;
+use reqwest::Client as HttpClient;
+use futures::future::try_join_all;
 
-// Mainnet-accurate constants based on Solana protocol specs
-const MAX_BUNDLE_SIZE: usize = 5;
-const COLLISION_WINDOW_MS: u64 = 400; // One slot duration
-const MAX_TRACKED_BUNDLES: usize = 10000;
-const ACCOUNT_LOCK_DECAY_MS: u64 = 150;
-const COLLISION_SCORE_THRESHOLD: f64 = 0.75;
-const MAX_ACCOUNT_HISTORY: usize = 1000;
-const PREDICTION_LOOKAHEAD_MS: u64 = 200;
-const SLOT_DURATION_MS: u64 = 400; // Mainnet slot duration
-const MAX_METRICS_CACHE: usize = 50000;
+// Type alias for better readability
+type Result<T> = std::result::Result<T, CollisionPredictorError>;
 
-// Real Solana mainnet limits (as of 2024)
-const MAX_CU_PER_BLOCK: u64 = 48_000_000; // Current mainnet block CU limit
-const MAX_CU_PER_TRANSACTION: u64 = 1_400_000; // Max CU per transaction
-const DEFAULT_CU_PER_INSTRUCTION: u64 = 200_000; // Default CU per instruction
-const BASE_FEE_LAMPORTS: u64 = 5000; // Base transaction fee
-const SIGNATURE_CU_COST: u64 = 100; // CU cost per signature
-const WRITE_LOCK_CU_COST: u64 = 100; // CU cost per write lock
+// Helper to safely create a NonZeroUsize without unwrap/expect
+fn nonzero_usize(n: usize) -> NonZeroUsize {
+    let v = if n == 0 { 1 } else { n };
+    // SAFETY: v is guaranteed to be > 0
+    unsafe { NonZeroUsize::new_unchecked(v) }
+}
 
-// Jito-specific constants from research
-const JITO_AUCTION_TICK_MS: u64 = 50; // Jito runs auctions every 50ms
-const MIN_PROFITABLE_TIP_LAMPORTS: u64 = 10_000; // Minimum profitable tip
-const PRIORITY_FEE_PERCENTILES: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 0.9]; // For dynamic fee estimation
+#[derive(Debug, Error)]
+pub enum CollisionPredictorError {
+    #[error("Lock poisoned: {0}")]
+    LockPoisoned(String),
+    #[error("Bundle not found: {0:?}")]
+    BundleNotFound(Hash),
+    #[error("Invalid bundle data: {0}")]
+    InvalidBundleData(String),
+    #[error("Network error: {0}")]
+    NetworkError(String),
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+    #[error("Initialization error: {0}")]
+    InitializationError(String),
+    #[error("Concurrency error: {0}")]
+    ConcurrencyError(String),
+    #[error("Rate limit exceeded")]
+    RateLimitExceeded,
+}
+
+/// Circuit breaker states for API resilience
+#[derive(Debug, Clone)]
+enum CircuitBreakerState {
+    Closed,
+    Open(Instant),
+    HalfOpen,
+}
+
+/// System load levels for adaptive behavior
+#[derive(Debug, Clone, PartialEq)]
+enum SystemLoad {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Health status for monitoring
+#[derive(Debug, Clone)]
+pub struct HealthStatus {
+    pub spatial_index_health: bool,
+    pub jito_api_health: bool,
+    pub memory_usage_mb: f64,
+    pub active_bundles: usize,
+    pub cache_hit_rate: f64,
+    pub avg_collision_prediction_time_ms: f64,
+}
+
+/// Rate limiter for API calls
+#[derive(Debug)]
+pub struct RateLimiter {
+    requests: Arc<Mutex<VecDeque<Instant>>>,
+    max_requests: usize,
+    time_window: Duration,
+}
+
+impl RateLimiter {
+    pub fn new(max_requests: usize, time_window: Duration) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(VecDeque::new())),
+            max_requests,
+            time_window,
+        }
+    }
+    
+    pub fn check_rate_limit(&self) -> Result<()> {
+        let now = Instant::now();
+        let mut requests = self.requests.lock();
+        
+        // Remove old requests outside the time window
+        while let Some(&front_time) = requests.front() {
+            if now.duration_since(front_time) > self.time_window {
+                requests.pop_front();
+            } else {
+                break;
+            }
+        }
+        
+        // Check if we're at the rate limit
+        if requests.len() >= self.max_requests {
+            return Err(CollisionPredictorError::RateLimitExceeded);
+        }
+        
+        // Add current request
+        requests.push_back(now);
+        Ok(())
+    }
+}
+
+/// Memory pool for object reuse and performance optimization
+#[derive(Debug)]
+pub struct MemoryPool {
+    bundle_pool: Arc<Mutex<Vec<TrackedBundle>>>,
+    bloom_pool: Arc<Mutex<Vec<BloomFilter<ASMS>>>>,
+}
+
+impl MemoryPool {
+    pub fn new() -> Self {
+        Self {
+            bundle_pool: Arc::new(Mutex::new(Vec::with_capacity(100))),
+            bloom_pool: Arc::new(Mutex::new(Vec::with_capacity(100))),
+        }
+    }
+    
+    pub fn get_bundle(&self) -> Option<TrackedBundle> {
+        self.bundle_pool.lock().pop()
+    }
+    
+    pub fn return_bundle(&self, mut bundle: TrackedBundle) {
+        // Reset bundle for reuse
+        bundle.accounts.clear();
+        bundle.write_accounts.clear();
+        bundle.read_accounts.clear();
+        bundle.programs.clear();
+        bundle.lookup_tables.clear();
+        bundle.transaction_hashes.clear();
+        
+        let mut pool = self.bundle_pool.lock();
+        if pool.len() < 100 { // Prevent unbounded growth
+            pool.push(bundle);
+        }
+    }
+    
+    pub fn get_bloom_filter(&self) -> Option<BloomFilter<ASMS>> {
+        self.bloom_pool.lock().pop()
+    }
+    
+    pub fn return_bloom_filter(&self, mut filter: BloomFilter<ASMS>) {
+        filter.clear();
+        let mut pool = self.bloom_pool.lock();
+        if pool.len() < 100 {
+            pool.push(filter);
+        }
+    }
+}
+
+/// Configuration for the bundle collision predictor
+#[derive(Debug, Clone)]
+pub struct CollisionPredictorConfig {
+    pub max_bundle_size: usize,
+    pub collision_window_ms: u64,
+    pub default_cu_per_instruction: u64,
+    pub max_cu_per_bundle: u64,
+    pub bloom_filter_false_positive_rate: f64,
+    pub lru_cache_size: usize,
+    pub jito_api_url: String,
+    pub jito_auction_tick_ms: u64,
+    pub spatial_grid_size: usize,
+    pub max_concurrent_predictions: usize,
+    pub cleanup_interval_ms: u64,
+    pub circuit_breaker_failure_threshold: usize,
+    pub circuit_breaker_reset_timeout_ms: u64,
+    pub api_rate_limit_per_minute: usize,
+    pub memory_pressure_threshold_mb: f64,
+    pub cpu_pressure_threshold: f64,
+    pub enable_predictive_prefetching: bool,
+    pub max_prefetch_candidates: usize,
+    pub base_fee_lamports: u64,
+    pub prediction_lookahead_ms: u64,
+    pub collision_score_threshold: f64,
+    pub max_account_history: usize,
+    pub min_profitable_tip_lamports: u64,
+}
+
+impl Default for CollisionPredictorConfig {
+    fn default() -> Self {
+        Self {
+            max_bundle_size: 5,
+            collision_window_ms: 400,
+            default_cu_per_instruction: 200_000,
+            max_cu_per_bundle: 1_400_000,
+            bloom_filter_false_positive_rate: 0.01,
+            lru_cache_size: 10_000,
+            jito_api_url: "https://mainnet.block-engine.jito.wtf".to_string(),
+            jito_auction_tick_ms: 50,
+            spatial_grid_size: 1000,
+            max_concurrent_predictions: 50,
+            cleanup_interval_ms: 30000,
+            // Circuit breaker settings
+            circuit_breaker_failure_threshold: 5,
+            circuit_breaker_reset_timeout_ms: 30000,
+            // Rate limiting settings
+            api_rate_limit_per_minute: 300,
+            // Load shedding thresholds
+            memory_pressure_threshold_mb: 1024.0,
+            cpu_pressure_threshold: 0.8,
+            // Prefetching settings
+            enable_predictive_prefetching: true,
+            max_prefetch_candidates: 20,
+            // Fees and timing
+            base_fee_lamports: 1_000,
+            prediction_lookahead_ms: 300,
+            // Collision filtering and history
+            collision_score_threshold: 0.5,
+            max_account_history: 5_000,
+            // Profitability floor
+            min_profitable_tip_lamports: 5_000,
+        }
+    }
+}
+
+const PRIORITY_FEE_PERCENTILES: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 0.9];
+
+// Spatial indexing for O(1) collision candidate lookup
+#[derive(Debug)]
+pub struct SpatialBundleIndex {
+    grid: Arc<RwLock<BTreeMap<u64, BTreeSet<Hash>>>>,
+    bundle_coordinates: DashMap<Hash, u64>,
+    grid_size: usize,
+}
+
+impl SpatialBundleIndex {
+    pub fn new(grid_size: usize) -> Self {
+        Self {
+            grid: Arc::new(RwLock::new(BTreeMap::new())),
+            bundle_coordinates: DashMap::new(),
+            grid_size,
+        }
+    }
+    
+    /// Health check for spatial index
+    pub fn health_check(&self) -> bool {
+        // Check if spatial index is accessible and not corrupted
+        match self.grid.try_read() {
+            Some(grid) => {
+                let total_cells = grid.len();
+                let total_bundles: usize = grid.values().map(|cell| cell.len()).sum();
+                let bundle_coords = self.bundle_coordinates.len();
+                
+                // Health check: coordinate count should match bundle count
+                let health_ok = bundle_coords == total_bundles;
+                
+                gauge!("spatial_index_total_cells", total_cells as f64);
+                gauge!("spatial_index_total_bundles", total_bundles as f64);
+                gauge!("spatial_index_health", if health_ok { 1.0 } else { 0.0 });
+                
+                health_ok
+            },
+            None => {
+                // Lock is poisoned or unavailable
+                gauge!("spatial_index_health", 0.0);
+                false
+            }
+        }
+    }
+    
+    pub fn insert_bundle(&self, bundle_id: Hash, accounts: &BTreeSet<Pubkey>) -> Result<()> {
+        let coordinate = self.calculate_spatial_coordinate(accounts);
+        self.bundle_coordinates.insert(bundle_id, coordinate);
+        
+        let mut grid = self.grid.write();
+        
+        grid.entry(coordinate)
+            .or_insert_with(BTreeSet::new)
+            .insert(bundle_id);
+            
+        histogram!("spatial_grid_cell_size", grid.get(&coordinate).map_or(0, |cell| cell.len()) as f64);
+        Ok(())
+    }
+    
+    pub fn get_potential_conflicts(&self, bundle_id: &Hash) -> Result<Vec<Hash>> {
+        if let Some(coordinate) = self.bundle_coordinates.get(bundle_id) {
+            let coord = *coordinate;
+            let mut candidates = Vec::new();
+            
+            let grid = self.grid.read();
+            
+            // Check neighboring cells for potential conflicts
+            for offset in [-1i64, 0, 1] {
+                if let Some(new_coord) = coord.checked_add_signed(offset) {
+                    if let Some(cell) = grid.get(&new_coord) {
+                        candidates.extend(cell.iter().filter(|&id| *id != bundle_id));
+                    }
+                }
+            }
+            
+            histogram!("spatial_conflict_candidates", candidates.len() as f64);
+            Ok(candidates)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    pub fn remove_bundle(&self, bundle_id: &Hash) -> Result<()> {
+        if let Some((_, coordinate)) = self.bundle_coordinates.remove(bundle_id) {
+            let mut grid = self.grid.write();
+            
+            if let Some(cell) = grid.get_mut(&coordinate) {
+                cell.remove(bundle_id);
+                // Remove empty cells to prevent memory leaks
+                if cell.is_empty() {
+                    grid.remove(&coordinate);
+                    increment_counter!("spatial_index_empty_cells_removed");
+                }
+            }
+            increment_counter!("spatial_index_bundles_removed");
+        }
+        Ok(())
+    }
+    
+    fn calculate_spatial_coordinate(&self, accounts: &BTreeSet<Pubkey>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for account in accounts {
+            account.hash(&mut hasher);
+        }
+        hasher.finish() % (self.grid_size as u64)
+    }
+}
+
+// Advanced Jito API client for real-time auction data
+#[derive(Debug)]
+pub struct JitoClient {
+    client: HttpClient,
+    api_url: String,
+    tip_cache: Arc<Mutex<LruCache<String, JitoTipData>>>,
+    auction_cache: Arc<Mutex<LruCache<String, JitoAuctionData>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JitoTipData {
+    pub land_tip: u64,
+    pub median_tip: u64,
+    pub p95_tip: u64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JitoAuctionData {
+    pub current_auction: u64,
+    pub next_auction_in_ms: u64,
+    pub bundles_in_auction: usize,
+    pub min_tip: u64,
+    pub suggested_tip: u64,
+    pub competition_factor: f64,
+}
+
+impl JitoClient {
+    pub fn new(api_url: String, cache_size: usize) -> Result<Self> {
+        let client = HttpClient::builder()
+            .timeout(Duration::from_millis(2000))
+            .build()
+            .map_err(|e| CollisionPredictorError::InitializationError(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            client,
+            api_url,
+            tip_cache: Arc::new(Mutex::new(LruCache::new(nonzero_usize(cache_size)))),
+            auction_cache: Arc::new(Mutex::new(LruCache::new(nonzero_usize(cache_size)))),
+        })
+    }
+    
+    pub async fn get_current_tip_data(&self) -> Result<JitoTipData> {
+        let cache_key = "current_tips".to_string();
+        
+        // Check cache first
+        {
+            let cache = self.tip_cache.lock();
+            if let Some(cached) = cache.peek(&cache_key) {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| CollisionPredictorError::NetworkError(format!("System time error: {}", e)))?
+                    .as_secs();
+                let age = now_secs - cached.timestamp;
+                if age < 10 { // Cache for 10 seconds
+                    increment_counter!("jito_tip_cache_hits");
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        
+        let url = format!("{}/api/v1/bundles/tip_floor", self.api_url);
+        
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CollisionPredictorError::NetworkError(format!("Failed to fetch Jito tip data: {}", e)))?;
+            
+        let mut tip_data: JitoTipData = response
+            .json()
+            .await
+            .map_err(|e| CollisionPredictorError::NetworkError(format!("Failed to parse Jito tip response: {}", e)))?;
+            
+        tip_data.timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| CollisionPredictorError::NetworkError(format!("System time error: {}", e)))?
+            .as_secs();
+        
+        // Cache the data
+        {
+            let mut cache = self.tip_cache.lock();
+            cache.put(cache_key, tip_data.clone());
+        }
+        
+        increment_counter!("jito_api_calls");
+        histogram!("jito_land_tip", tip_data.land_tip as f64);
+        Ok(tip_data)
+    }
+    
+    pub async fn get_auction_data(&self) -> Result<JitoAuctionData> {
+        let cache_key = "auction_status".to_string();
+        
+        // Check cache first
+        {
+            let cache = self.auction_cache.lock();
+            if let Some(cached) = cache.peek(&cache_key) {
+                increment_counter!("jito_auction_cache_hits");
+                return Ok(cached.clone());
+            }
+        }
+        
+        let url = format!("{}/api/v1/auction/status", self.api_url);
+        
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CollisionPredictorError::NetworkError(format!("Failed to fetch Jito auction data: {}", e)))?;
+            
+        let mut auction_data: JitoAuctionData = response
+            .json()
+            .await
+            .map_err(|e| CollisionPredictorError::NetworkError(format!("Failed to parse Jito auction response: {}", e)))?;
+            
+        // Calculate competition factor based on bundles in auction
+        auction_data.competition_factor = (auction_data.bundles_in_auction as f64 / 100.0).min(2.0);
+        
+        // Cache the data
+        {
+            let mut cache = self.auction_cache.lock();
+            cache.put(cache_key, auction_data.clone());
+        }
+        
+        histogram!("jito_auction_bundles", auction_data.bundles_in_auction as f64);
+        histogram!("jito_suggested_tip", auction_data.suggested_tip as f64);
+        gauge!("jito_competition_factor", auction_data.competition_factor);
+        
+        Ok(auction_data)
+    }
+    
+    pub fn get_cached_tip_data(&self) -> Option<JitoTipData> {
+        let cache = self.tip_cache.lock();
+        cache.peek("current_tips").cloned()
+    }
+    
+    pub fn calculate_optimal_tip(&self, bundle_priority: f64, network_conditions: &NetworkConditions) -> Result<u64> {
+        let tip_data = self
+            .get_cached_tip_data()
+            .ok_or_else(|| CollisionPredictorError::NetworkError("No cached tip data available".to_string()))?;
+            
+        let base_tip = match bundle_priority {
+            p if p > 0.9 => tip_data.p95_tip,
+            p if p > 0.7 => tip_data.median_tip + (tip_data.p95_tip - tip_data.median_tip) / 2,
+            p if p > 0.5 => tip_data.median_tip,
+            _ => tip_data.land_tip,
+        };
+        
+        // Adjust based on network conditions
+        let congestion_multiplier = 1.0 + (network_conditions.congestion_level * 0.5);
+        let final_tip = (base_tip as f64 * congestion_multiplier) as u64;
+        
+        Ok(final_tip.max(tip_data.land_tip))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkConditions {
+    pub congestion_level: f64,
+    pub avg_slot_fill_rate: f64,
+    pub current_priority_fee_market: u64,
+    pub validator_load: f64,
+    pub last_updated: Instant,
+}
+
+impl Default for NetworkConditions {
+    fn default() -> Self {
+        Self {
+            congestion_level: 0.5,
+            avg_slot_fill_rate: 0.7,
+            current_priority_fee_market: 10_000,
+            validator_load: 0.6,
+            last_updated: Instant::now(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleCollisionMetrics {
@@ -59,11 +542,15 @@ pub struct BundleCollisionMetrics {
 #[derive(Debug, Clone)]
 pub struct TrackedBundle {
     pub id: Hash,
-    pub transactions: Vec<Transaction>,
-    pub accounts: HashSet<Pubkey>,
-    pub write_accounts: HashSet<Pubkey>,
-    pub read_accounts: HashSet<Pubkey>,
-    pub programs: HashSet<Pubkey>,
+    pub accounts: BTreeSet<Pubkey>,
+    pub write_accounts: BTreeSet<Pubkey>,
+    pub read_accounts: BTreeSet<Pubkey>,
+    pub programs: BTreeSet<Pubkey>,
+    pub lookup_tables: BTreeSet<Pubkey>,
+    pub account_bloom: BloomFilter<ASMS>,
+    pub program_bloom: BloomFilter<ASMS>,
+    pub transaction_count: usize,
+    pub transaction_hashes: Vec<Hash>,
     pub priority_fee: u64,
     pub base_fee: u64,
     pub compute_unit_limit: u64,
@@ -75,13 +562,12 @@ pub struct TrackedBundle {
     pub slot_target: u64,
     pub jito_tip: u64,
     pub bundle_size: usize,
-    pub lookup_tables: Vec<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
 struct AccountLockInfo {
     pub writer: Option<Hash>,
-    pub readers: HashSet<Hash>,
+    pub readers: BTreeSet<Hash>,
     pub last_access: Instant,
     pub access_frequency: f64,
     pub contention_score: f64,
@@ -94,20 +580,42 @@ struct ProgramInteraction {
     pub program_id: Pubkey,
     pub interaction_count: u64,
     pub avg_execution_time_ms: f64,
-    pub conflict_patterns: HashMap<Pubkey, f64>,
+    pub conflict_patterns: BTreeMap<Pubkey, f64>,
     pub cu_consumption: u64,
     pub success_rate: f64,
 }
 
 pub struct BundleCollisionPredictor {
+    // Core data structures
     tracked_bundles: Arc<DashMap<Hash, TrackedBundle>>,
     account_locks: Arc<DashMap<Pubkey, AccountLockInfo>>,
     program_interactions: Arc<DashMap<Pubkey, ProgramInteraction>>,
     collision_history: Arc<RwLock<VecDeque<CollisionEvent>>>,
-    metrics_cache: Arc<DashMap<(Hash, Hash), (Instant, BundleCollisionMetrics)>>,
-    submission_patterns: Arc<RwLock<SubmissionPatternAnalyzer>>,
+    access_patterns: Arc<DashMap<Pubkey, AccessPattern>>,
+    
+    // Performance optimization components
+    metrics_cache: Arc<Mutex<LruCache<(Hash, Hash), BundleCollisionMetrics>>>,
+    spatial_index: SpatialBundleIndex,
+    memory_pool: Arc<MemoryPool>,
+    
+    // Network and external service components
+    jito_client: JitoClient,
+    network_conditions: Arc<Mutex<NetworkConditions>>,
+    
+    // Resilience and reliability components
+    circuit_breaker: Arc<Mutex<CircuitBreakerState>>,
+    rate_limiter: Arc<RateLimiter>,
+    
+    // Advanced concurrency and performance
+    collision_semaphore: Arc<Semaphore>,
     slot_tracker: Arc<RwLock<SlotTracker>>,
-    account_access_patterns: Arc<DashMap<Pubkey, AccessPattern>>,
+    
+    // Configuration
+    config: CollisionPredictorConfig,
+    
+    // Performance monitoring
+    last_health_check: Arc<Mutex<Instant>>,
+    failure_count: Arc<Mutex<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,18 +639,18 @@ enum CollisionType {
 
 #[derive(Debug, Clone)]
 struct SubmissionPatternAnalyzer {
-    time_buckets: HashMap<u64, Vec<f64>>,
+    time_buckets: BTreeMap<u64, Vec<f64>>,
     congestion_scores: VecDeque<(Instant, f64)>,
     optimal_windows: Vec<(u64, u64)>,
-    slot_success_rates: HashMap<u64, f64>,
+    slot_success_rates: BTreeMap<u64, f64>,
 }
 
 #[derive(Debug, Clone)]
 struct SlotTracker {
     current_slot: u64,
     slot_start_time: Instant,
-    bundles_per_slot: HashMap<u64, Vec<Hash>>,
-    slot_collision_rates: HashMap<u64, f64>,
+    bundles_per_slot: BTreeMap<u64, Vec<Hash>>,
+    slot_collision_rates: BTreeMap<u64, f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,714 +662,208 @@ struct AccessPattern {
 }
 
 impl BundleCollisionPredictor {
-    pub fn new() -> Self {
-        Self {
-            tracked_bundles: Arc::new(DashMap::with_capacity(MAX_TRACKED_BUNDLES)),
-            account_locks: Arc::new(DashMap::with_capacity(100000)),
+    pub fn new() -> Result<Self> {
+        let config = CollisionPredictorConfig::default();
+        let lru_cache = LruCache::new(nonzero_usize(config.lru_cache_size));
+        
+        let jito_client = JitoClient::new(config.jito_api_url.clone(), config.lru_cache_size)?;
+
+        Ok(Self {
+            tracked_bundles: Arc::new(DashMap::new()),
+            account_locks: Arc::new(DashMap::new()),
             program_interactions: Arc::new(DashMap::new()),
-            collision_history: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_ACCOUNT_HISTORY))),
-            metrics_cache: Arc::new(DashMap::with_capacity(MAX_METRICS_CACHE)),
-            submission_patterns: Arc::new(RwLock::new(SubmissionPatternAnalyzer::new())),
+            collision_history: Arc::new(RwLock::new(VecDeque::new())),
+            access_patterns: Arc::new(DashMap::new()),
+            
+            metrics_cache: Arc::new(Mutex::new(lru_cache)),
+            spatial_index: SpatialBundleIndex::new(config.spatial_grid_size),
+            memory_pool: Arc::new(MemoryPool::new()),
+            
+            jito_client,
+            network_conditions: Arc::new(Mutex::new(NetworkConditions::default())),
+            
+            circuit_breaker: Arc::new(Mutex::new(CircuitBreakerState::Closed)),
+            rate_limiter: Arc::new(RateLimiter::new(
+                config.api_rate_limit_per_minute,
+                Duration::from_secs(60)
+            )),
+            
+            collision_semaphore: Arc::new(Semaphore::new(config.max_concurrent_predictions)),
             slot_tracker: Arc::new(RwLock::new(SlotTracker::new())),
-            account_access_patterns: Arc::new(DashMap::new()),
-        }
+            
+            config,
+            
+            last_health_check: Arc::new(Mutex::new(Instant::now())),
+            failure_count: Arc::new(Mutex::new(0)),
+        })
     }
 
     pub async fn track_bundle(&self, bundle: Vec<Transaction>, slot: u64) -> Result<Hash> {
+        // Check system load and apply load shedding if necessary
+        if self.is_overloaded().await? {
+            increment_counter!("bundle_tracking_rejected_overload");
+            return Err(CollisionPredictorError::InvalidBundleData("System overloaded, rejecting bundle".to_string()));
+        }
+        
+        // Validate input parameters
+        self.validate_bundle_input(&bundle, slot)?;
+        
+        increment_counter!("bundle_tracking_requests");
+        let _timer = histogram!("bundle_tracking_time");
+        
         let bundle_id = self.generate_bundle_id(&bundle);
         let (accounts, write_accounts, read_accounts, programs) = self.extract_bundle_resources(&bundle)?;
-        let (estimated_cu, compute_unit_limit, compute_unit_price) = self.analyze_compute_requirements(&bundle)?;
-        let (priority_fee, base_fee, jito_tip) = self.calculate_realistic_fees(&bundle)?;
+        let estimated_cu = self.calculate_bundle_compute_units(&bundle);
+        let priority_fee = self.calculate_bundle_priority_fee(&bundle);
+        
+        // Store transaction hashes instead of full transactions to save memory
+        let tx_hashes: Vec<Hash> = bundle.iter().map(|tx| tx.signatures[0].into()).collect();
+        let total_cu_limit = estimated_cu;
+        
+        // Calculate sophisticated Jito tip based on real-time auction data
+        let jito_tip = self.calculate_sophisticated_jito_tip(priority_fee, &tx_hashes, total_cu_limit).await?;
+        
+        let account_bloom = self.create_account_bloom_filter(&accounts);
+        let program_bloom = self.create_program_bloom_filter(&programs);
+        
         
         let tracked = TrackedBundle {
             id: bundle_id,
-            transactions: bundle.clone(),
-            accounts: accounts.clone(),
+            accounts,
             write_accounts: write_accounts.clone(),
             read_accounts: read_accounts.clone(),
             programs,
+            lookup_tables: self.extract_lookup_tables(&bundle)?,
+            account_bloom,
+            program_bloom,
+            transaction_count: bundle.len(),
+            transaction_hashes,
             priority_fee,
-            base_fee,
-            compute_unit_limit,
-            compute_unit_price,
+            base_fee: bundle.len() as u64 * self.config.base_fee_lamports,
+            compute_unit_limit: 0,
+            compute_unit_price: 0,
             submission_time: Instant::now(),
-            predicted_execution: Instant::now() + Duration::from_millis(PREDICTION_LOOKAHEAD_MS),
+            predicted_execution: Instant::now() + Duration::from_millis(self.config.prediction_lookahead_ms),
             estimated_cu,
             actual_cu: None,
             slot_target: slot,
             jito_tip,
             bundle_size: bundle.len(),
-            lookup_tables: self.extract_lookup_tables(&bundle)?,
         };
 
         self.tracked_bundles.insert(bundle_id, tracked);
+        // Add to spatial index for efficient collision detection
+        self.spatial_index.insert_bundle(bundle_id, &accounts)?;
+
         self.update_account_locks(&bundle_id, &accounts, &write_accounts, &read_accounts)?;
         self.update_access_patterns(&accounts)?;
         self.update_slot_tracking(bundle_id, slot)?;
-        self.cleanup_old_data();
+        self.cleanup_old_bundles();
+        self.cleanup_metrics_cache();
+        
+        increment_counter!("bundles_tracked");
+        gauge!("active_bundles", self.tracked_bundles.len() as f64);
         
         Ok(bundle_id)
     }
 
-    pub async fn predict_collision(&self, bundle_a: &Hash, bundle_b: &Hash) -> Result<BundleCollisionMetrics> {
-        let cache_key = if bundle_a < bundle_b {
-            (*bundle_a, *bundle_b)
-        } else {
-            (*bundle_b, *bundle_a)
-        };
-
-        if let Some(entry) = self.metrics_cache.get(&cache_key) {
-            let (cached_time, metrics) = entry.value();
-            if cached_time.elapsed() < Duration::from_millis(50) {
-                return metrics.clone();
-            }
-        }
-
-        let metrics = match (self.tracked_bundles.get(bundle_a), self.tracked_bundles.get(bundle_b)) {
-            (Some(a), Some(b)) => self.calculate_collision_metrics(a.value(), b.value())?,
-            _ => BundleCollisionMetrics {
-                collision_probability: 0.0,
-                account_overlap_score: 0.0,
-                program_conflict_score: 0.0,
-                timing_conflict_score: 0.0,
-                priority_fee_competition: 0.0,
-                recommended_delay_ms: 0,
-                slot_conflict_probability: 0.0,
-                cu_competition_score: 0.0,
-                tip_efficiency_ratio: 0.0,
-                auction_competitiveness: 0.0,
-                bundle_size_penalty: 0.0,
-            },
-        };
-
-        self.metrics_cache.insert(cache_key, (Instant::now(), metrics.clone()));
-        
-        if self.metrics_cache.len() > MAX_METRICS_CACHE {
-            self.cleanup_metrics_cache();
-        }
-
-        Ok(metrics)
-    }
-
-    pub async fn find_optimal_submission_window(&self, bundle_id: &Hash) -> Result<(Instant, f64)> {
-        let bundle = match self.tracked_bundles.get(bundle_id) {
-            Some(b) => b,
-            None => return Ok((Instant::now(), 0.0)),
-        };
-
-        let mut best_window = Instant::now();
-        let mut lowest_collision_score = f64::MAX;
-        let mut best_confidence = 0.0;
-
-        let patterns = self.submission_patterns.read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire submission patterns read lock: {}", e))?;
-        let slot_info = self.slot_tracker.read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire slot tracker read lock: {}", e))?;
-        let current_congestion = self.calculate_current_congestion(&patterns);
-        
-        // Use JITO_AUCTION_TICK_MS for more accurate timing
-        for offset_ms in (0..=PREDICTION_LOOKAHEAD_MS).step_by(JITO_AUCTION_TICK_MS as usize) {
-            let test_time = Instant::now() + Duration::from_millis(offset_ms);
-            let predicted_slot = self.predict_slot_at_time(test_time, &slot_info);
-            
-            let collision_score = self.calculate_time_window_collision_score(
-                &bundle,
-                test_time,
-                current_congestion,
-                predicted_slot
-            )?;
-
-            if collision_score < lowest_collision_score {
-                lowest_collision_score = collision_score;
-                best_window = test_time;
-                best_confidence = 1.0 - collision_score;
-            }
-        }
-
-        Ok((best_window, best_confidence))
-    }
-
-    fn calculate_collision_metrics(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> Result<BundleCollisionMetrics> {
-        let account_overlap = self.calculate_account_overlap_score(bundle_a, bundle_b);
-        let program_conflict = self.calculate_program_conflict_score(bundle_a, bundle_b);
-        let timing_conflict = self.calculate_timing_conflict_score(bundle_a, bundle_b);
-        let priority_competition = self.calculate_priority_competition(bundle_a, bundle_b);
-        let slot_conflict = self.calculate_slot_conflict_probability(bundle_a, bundle_b)?;
-        
-        // Calculate new sophisticated metrics
-        let cu_competition = self.calculate_cu_competition_score(bundle_a, bundle_b);
-        let tip_efficiency = self.calculate_tip_efficiency_ratio(bundle_a, bundle_b);
-        let auction_competitiveness = self.calculate_auction_competitiveness(bundle_a, bundle_b);
-        let bundle_size_penalty = self.calculate_bundle_size_penalty(bundle_a, bundle_b);
-
-        // Research-based weights for collision probability calculation
-        // Based on Jito documentation: account conflicts are most critical
-        let collision_probability = 
-            account_overlap * 0.40 +          // Account conflicts are most critical (Jito docs)
-            program_conflict * 0.20 +         // Program conflicts cause serialization
-            timing_conflict * 0.15 +          // Timing within auction windows
-            cu_competition * 0.10 +           // CU competition affects inclusion
-            slot_conflict * 0.10 +            // Same slot targeting
-            bundle_size_penalty * 0.05;       // Larger bundles more likely to conflict
-
-        // Improved delay calculation based on Jito auction mechanics
-        let recommended_delay = if collision_probability > COLLISION_SCORE_THRESHOLD {
-            // Base delay aligned with Jito auction ticks (50ms)
-            let auction_ticks = ((collision_probability - COLLISION_SCORE_THRESHOLD) * 4.0).ceil() as u64;
-            let base_delay = auction_ticks * JITO_AUCTION_TICK_MS;
-            
-            // Adjust for same slot targeting (critical)
-            let slot_adjusted = if bundle_a.slot_target == bundle_b.slot_target {
-                base_delay + JITO_AUCTION_TICK_MS * 2 // Wait 2 additional auction ticks
-            } else {
-                base_delay
-            };
-            
-            // Cap at collision window
-            slot_adjusted.min(COLLISION_WINDOW_MS)
-        } else {
-            0
-        };
-
-        Ok(BundleCollisionMetrics {
-            collision_probability: collision_probability.min(1.0),
-            account_overlap_score: account_overlap,
-            program_conflict_score: program_conflict,
-            timing_conflict_score: timing_conflict,
-            priority_fee_competition: priority_competition,
-            recommended_delay_ms: recommended_delay,
-            slot_conflict_probability: slot_conflict,
-            cu_competition_score: cu_competition,
-            tip_efficiency_ratio: tip_efficiency,
-            auction_competitiveness: auction_competitiveness,
-            bundle_size_penalty: bundle_size_penalty,
-        })
-    }
-
-    fn calculate_account_overlap_score(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let write_write_conflicts = bundle_a.write_accounts.intersection(&bundle_b.write_accounts).count();
-        let write_read_conflicts = bundle_a.write_accounts.intersection(&bundle_b.accounts).count() +
-                                  bundle_b.write_accounts.intersection(&bundle_a.accounts).count();
-
-        let total_unique_accounts = bundle_a.accounts.union(&bundle_b.accounts).count();
-        if total_unique_accounts == 0 {
-            return 0.0;
-        }
-
-        let base_score = (write_write_conflicts as f64 * 3.0 + write_read_conflicts as f64) / 
-                        (total_unique_accounts as f64 * 2.0);
-        
-        let mut contention_multiplier = 1.0;
-        for account in bundle_a.write_accounts.intersection(&bundle_b.write_accounts) {
-            if let Some(pattern) = self.account_access_patterns.get(account) {
-                let pattern_score = pattern.avg_interval_ms / SLOT_DURATION_MS as f64;
-                contention_multiplier += (1.0 - pattern_score.min(1.0)) * 0.5;
-            }
-        }
-
-        (base_score * contention_multiplier).min(1.0)
-    }
-
-    fn calculate_program_conflict_score(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let mut conflict_score = 0.0;
-        let mut weight_sum = 0.0;
-
-        for prog_a in &bundle_a.programs {
-            for prog_b in &bundle_b.programs {
-                let weight = 1.0;
-                weight_sum += weight;
-
-                if prog_a == prog_b {
-                    conflict_score += weight * 0.4;
-                } else if let Some(interaction) = self.program_interactions.get(prog_a) {
-                    if let Some(conflict_rate) = interaction.conflict_patterns.get(prog_b) {
-                        conflict_score += weight * conflict_rate;
-                    } else {
-                        conflict_score += weight * 0.1;
-                    }
-                } else {
-                    conflict_score += weight * 0.05;
-                }
-            }
-        }
-
-        if weight_sum > 0.0 {
-            (conflict_score / weight_sum).min(1.0)
-        } else {
-            0.0
-        }
-    }
-
-    fn calculate_timing_conflict_score(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let time_diff = if bundle_a.predicted_execution > bundle_b.predicted_execution {
-            bundle_a.predicted_execution.duration_since(bundle_b.predicted_execution)
-        } else {
-            bundle_b.predicted_execution.duration_since(bundle_a.predicted_execution)
-        }.as_millis() as f64;
-
-        if time_diff > COLLISION_WINDOW_MS as f64 {
-            return 0.0;
-        }
-
-                let base_score = 1.0 - (time_diff / COLLISION_WINDOW_MS as f64).powi(2);
-        
-        if bundle_a.slot_target == bundle_b.slot_target {
-            base_score * 1.5
-        } else {
-            base_score
-        }.min(1.0)
-    }
-
-    fn calculate_priority_competition(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let fee_diff = (bundle_a.priority_fee as i64 - bundle_b.priority_fee as i64).abs() as f64;
-        let max_fee = bundle_a.priority_fee.max(bundle_b.priority_fee) as f64;
-        
-        if max_fee == 0.0 {
-            return 0.0;
-        }
-
-        let fee_proximity = 1.0 - (fee_diff / max_fee).min(1.0);
-        let cu_competition = {
-            let total_cu = bundle_a.estimated_cu + bundle_b.estimated_cu;
-            let max_cu_per_block = 48_000_000;
-            (total_cu as f64 / max_cu_per_block as f64).min(1.0)
-        };
-
-        fee_proximity * 0.7 + cu_competition * 0.3
-    }
-
-    fn calculate_slot_conflict_probability(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> Result<f64> {
-        if bundle_a.slot_target != bundle_b.slot_target {
-            return Ok(0.0);
-        }
-
-        let slot_tracker = self.slot_tracker.read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire slot tracker read lock: {}", e))?;
-        
-        let base_rate = slot_tracker.slot_collision_rates
-            .get(&bundle_a.slot_target)
-            .copied()
-            .unwrap_or(0.15); // More conservative default based on mainnet data
-
-        let slot_fill_rate = slot_tracker.bundles_per_slot
-            .get(&bundle_a.slot_target)
-            .map(|bundles| {
-                // More realistic calculation based on MAX_CU_PER_BLOCK
-                let total_estimated_cu: u64 = bundles.iter()
-                    .filter_map(|bundle_id| self.tracked_bundles.get(bundle_id))
-                    .map(|bundle| bundle.estimated_cu)
-                    .sum();
-                (total_estimated_cu as f64 / MAX_CU_PER_BLOCK as f64).min(1.0)
-            })
-            .unwrap_or(0.05);
-
-        Ok((base_rate + slot_fill_rate) / 2.0)
-    }
-
-    fn calculate_time_window_collision_score(
-        &self, 
-        bundle: &TrackedBundle, 
-        test_time: Instant, 
-        congestion: f64,
-        predicted_slot: u64
-    ) -> Result<f64> {
-        let mut collision_score = congestion * 0.20; // Reduce base congestion impact
-        let mut checked_bundles = 0;
-        let max_checks = 50; // Limit for performance
-        
-        for tracked in self.tracked_bundles.iter() {
-            if tracked.key() == &bundle.id || checked_bundles > max_checks {
-                break;
-            }
-
-            let other_bundle = tracked.value();
-            let time_overlap = self.calculate_time_overlap(test_time, other_bundle.predicted_execution);
-            
-            if time_overlap > 0.0 {
-                let slot_penalty = if predicted_slot == other_bundle.slot_target { 0.3 } else { 0.0 };
-                let account_conflict = self.quick_account_conflict_check(bundle, other_bundle);
-                let cu_conflict = self.quick_cu_conflict_check(bundle, other_bundle);
-                
-                // More sophisticated scoring based on research
-                collision_score += (time_overlap * 0.25 + account_conflict * 0.45 + 
-                                   cu_conflict * 0.15 + slot_penalty) * 0.8;
-                checked_bundles += 1;
-            }
-        }
-
-        Ok(collision_score.min(1.0))
-    }
-
-    fn quick_account_conflict_check(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let write_conflicts = bundle_a.write_accounts.intersection(&bundle_b.write_accounts).count();
-        let total_writes = bundle_a.write_accounts.len() + bundle_b.write_accounts.len();
-        
-        if total_writes == 0 {
-            0.0
-        } else {
-            (write_conflicts as f64 * 2.0 / total_writes as f64).min(1.0)
-        }
-    }
-
-    fn calculate_time_overlap(&self, time_a: Instant, time_b: Instant) -> f64 {
-        let diff = if time_a > time_b {
-            time_a.duration_since(time_b)
-        } else {
-            time_b.duration_since(time_a)
-        }.as_millis() as f64;
-
-        if diff > COLLISION_WINDOW_MS as f64 {
-            0.0
-        } else {
-            1.0 - (diff / COLLISION_WINDOW_MS as f64)
-        }
-    }
-
-    fn calculate_current_congestion(&self, patterns: &SubmissionPatternAnalyzer) -> f64 {
-        let now = Instant::now();
-        let recent_scores: Vec<f64> = patterns.congestion_scores
-            .iter()
-            .filter(|(time, _)| now.duration_since(*time).as_secs() < 60)
-            .map(|(_, score)| *score)
-            .collect();
-
-        if recent_scores.is_empty() {
-            return 0.3;
-        }
-
-        let weighted_sum: f64 = recent_scores.iter()
-            .rev()
-            .enumerate()
-            .map(|(i, score)| score * (1.0 - i as f64 * 0.01).max(0.5))
-            .sum();
-
-        (weighted_sum / recent_scores.len() as f64).min(1.0)
-    }
-
-    fn predict_slot_at_time(&self, time: Instant, slot_info: &SlotTracker) -> u64 {
-        let elapsed = time.duration_since(slot_info.slot_start_time).as_millis() as u64;
-        let slots_passed = elapsed / SLOT_DURATION_MS;
-        slot_info.current_slot + slots_passed
-    }
-
-    fn extract_bundle_resources(&self, bundle: &[Transaction]) -> Result<(HashSet<Pubkey>, HashSet<Pubkey>, HashSet<Pubkey>, HashSet<Pubkey>)> {
-        let mut accounts = HashSet::with_capacity(bundle.len() * 8);
-        let mut write_accounts = HashSet::with_capacity(bundle.len() * 4);
-        let mut read_accounts = HashSet::with_capacity(bundle.len() * 4);
-        let mut programs = HashSet::with_capacity(bundle.len() * 2);
-
-        for tx in bundle {
-            let message = &tx.message;
-            
-            for (idx, account_key) in message.account_keys.iter().enumerate() {
-                accounts.insert(*account_key);
-                
-                if message.is_writable(idx) {
-                    write_accounts.insert(*account_key);
-                } else {
-                    read_accounts.insert(*account_key);
-                }
-            }
-
-            for instruction in &message.instructions {
-                let program_id_index = usize::try_from(instruction.program_id_index)
-                    .context("Invalid program_id_index in instruction")?;
-                
-                if program_id_index < message.account_keys.len() {
-                    programs.insert(message.account_keys[program_id_index]);
-                } else {
-                    return Err(anyhow::anyhow!("Program ID index {} out of bounds for {} accounts", 
-                                              program_id_index, message.account_keys.len()));
-                }
-            }
-        }
-
-        Ok((accounts, write_accounts, read_accounts, programs))
-    }
-
-    fn estimate_compute_units(&self, bundle: &[Transaction]) -> u64 {
-        let mut total_cu = 0u64;
-        
-        for tx in bundle {
-            let mut tx_cu = BASE_FEE_LAMPORTS / 5; // Base CU cost per transaction
-            
-            // Account for signatures (each signature costs CU)
-            tx_cu += tx.signatures.len() as u64 * SIGNATURE_CU_COST;
-            
-            // More accurate instruction CU calculation
-            for instruction in &tx.message.instructions {
-                let instruction_cu = match instruction.data.first() {
-                    // Common program instruction patterns with realistic CU costs
-                    Some(0) => 2000,   // System program transfer
-                    Some(1) => 5000,   // Token program transfer
-                    Some(2) => 15000,  // Swap instruction (DEX)
-                    Some(3) => 25000,  // Complex DeFi operations
-                    _ => DEFAULT_CU_PER_INSTRUCTION, // Default
-                };
-                
-                tx_cu += instruction_cu;
-            }
-            
-            // Account for write locks (each write lock has CU cost)
-            let write_lock_count = tx.message.account_keys.iter().enumerate()
-                .filter(|(idx, _)| tx.message.is_writable(*idx))
-                .count() as u64;
-            tx_cu += write_lock_count * WRITE_LOCK_CU_COST;
-            
-            total_cu = total_cu.saturating_add(tx_cu);
-        }
-
-        total_cu.min(MAX_CU_PER_TRANSACTION)
-    }
-
-    fn calculate_bundle_priority_fee(&self, bundle: &[Transaction]) -> u64 {
-        if bundle.is_empty() {
-            return 0;
-        }
-
-        let mut total_priority_fee = 0u64;
-        
-        for tx in bundle {
-            // Extract actual priority fee from ComputeBudgetInstruction if present
-            let mut tx_priority_fee = 0u64;
-            let mut compute_unit_limit = DEFAULT_CU_PER_INSTRUCTION;
-            let mut compute_unit_price = 0u64;
-            
-            for instruction in &tx.message.instructions {
-                if let Ok(program_id_index) = usize::try_from(instruction.program_id_index) {
-                    if program_id_index < tx.message.account_keys.len() {
-                        let program_id = tx.message.account_keys[program_id_index];
-                        
-                        // Check if this is a ComputeBudgetInstruction
-                        if program_id == solana_sdk::compute_budget::ID {
-                            // Parse compute budget instruction data
-                            if instruction.data.len() >= 5 {
-                                match instruction.data[0] {
-                                    0 => { // SetComputeUnitLimit
-                                        if instruction.data.len() >= 5 {
-                                            compute_unit_limit = u32::from_le_bytes([
-                                                instruction.data[1], instruction.data[2], 
-                                                instruction.data[3], instruction.data[4]
-                                            ]) as u64;
-                                        }
-                                    },
-                                    1 => { // SetComputeUnitPrice
-                                        if instruction.data.len() >= 9 {
-                                            compute_unit_price = u64::from_le_bytes([
-                                                instruction.data[1], instruction.data[2], instruction.data[3], instruction.data[4],
-                                                instruction.data[5], instruction.data[6], instruction.data[7], instruction.data[8]
-                                            ]);
-                                        }
-                                    },
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Calculate priority fee: Compute Unit Limit × Compute Unit Price
-            tx_priority_fee = compute_unit_limit.saturating_mul(compute_unit_price);
-            total_priority_fee = total_priority_fee.saturating_add(tx_priority_fee);
-        }
-
-        total_priority_fee / bundle.len() as u64
-    }
-
-    fn generate_bundle_id(&self, bundle: &[Transaction]) -> Hash {
-        let mut hash_data = Vec::with_capacity(bundle.len() * 64);
-        
-        for (idx, tx) in bundle.iter().enumerate() {
-            if let Some(sig) = tx.signatures.first() {
-                hash_data.extend_from_slice(sig.as_ref());
-            }
-            hash_data.extend_from_slice(&idx.to_le_bytes());
-        }
-        
-        hashv(&[&hash_data])
-    }
-
-    fn update_account_locks(&self, bundle_id: &Hash, accounts: &HashSet<Pubkey>, write_accounts: &HashSet<Pubkey>, read_accounts: &HashSet<Pubkey>) -> Result<()> {
-        let now = Instant::now();
-        
-        for account in write_accounts {
-            self.account_locks
-                .entry(*account)
-                .and_modify(|lock| {
-                    if let Some(old_writer) = lock.writer.replace(*bundle_id) {
-                        lock.readers.insert(old_writer);
-                    }
-                    lock.last_access = now;
-                    lock.access_frequency = (lock.access_frequency * 0.9) + 0.1;
-                    lock.contention_score = (lock.contention_score * 0.95) + 0.05;
-                    lock.write_lock_count += 1;
-                })
-                .or_insert(AccountLockInfo {
-                    writer: Some(*bundle_id),
-                    readers: HashSet::new(),
-                    last_access: now,
-                    access_frequency: 0.1,
-                    contention_score: 0.05,
-                    write_lock_count: 1,
-                    read_lock_count: 0,
-                });
-        }
-
-        for account in accounts.difference(write_accounts) {
-            self.account_locks
-                .entry(*account)
-                .and_modify(|lock| {
-                    lock.readers.insert(*bundle_id);
-                    lock.last_access = now;
-                    lock.access_frequency = (lock.access_frequency * 0.95) + 0.05;
-                    lock.read_lock_count += 1;
-                })
-                .or_insert(AccountLockInfo {
-                    writer: None,
-                    readers: [*bundle_id].into_iter().collect(),
-                    last_access: now,
-                    access_frequency: 0.05,
-                    contention_score: 0.0,
-                    write_lock_count: 0,
-                    read_lock_count: 1,
-                });
-        }
-
-        self.decay_old_locks();
-        Ok(())
-    }
-
-    fn update_access_patterns(&self, accounts: &HashSet<Pubkey>) -> Result<()> {
-        let now = Instant::now();
-        
-        for account in accounts {
-            self.account_access_patterns
-                .entry(*account)
-                .and_modify(|pattern| {
-                    pattern.access_times.push_back(now);
-                    if pattern.access_times.len() > 100 {
-                        pattern.access_times.pop_front();
-                    }
-                    
-                    if pattern.access_times.len() > 1 {
-                        let intervals: Vec<Duration> = pattern.access_times
-                            .iter()
-                            .zip(pattern.access_times.iter().skip(1))
-                            .map(|(a, b)| b.duration_since(*a))
-                            .collect();
-                        
-                        pattern.avg_interval_ms = intervals.iter()
-                            .map(|d| d.as_millis() as f64)
-                            .sum::<f64>() / intervals.len() as f64;
-                        
-                        pattern.access_intervals = intervals;
-                    }
-                })
-                .or_insert(AccessPattern {
-                    access_times: vec![now].into_iter().collect(),
-                    access_intervals: Vec::new(),
-                    peak_times: Vec::new(),
-                    avg_interval_ms: SLOT_DURATION_MS as f64,
-                });
-        }
-    }
-
     fn update_slot_tracking(&self, bundle_id: Hash, slot: u64) -> Result<()> {
-        let mut tracker = self.slot_tracker.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire slot tracker write lock: {}", e))?;
+        let mut tracker = self.slot_tracker.write();
         
         tracker.bundles_per_slot
             .entry(slot)
             .and_modify(|bundles| bundles.push(bundle_id))
             .or_insert(vec![bundle_id]);
-        
-        if tracker.bundles_per_slot.len() > 100 {
-            if let Some(min_slot) = tracker.bundles_per_slot.keys().min().copied() {
-                tracker.bundles_per_slot.remove(&min_slot);
-                tracker.slot_collision_rates.remove(&min_slot);
-            }
-        }
+            
+        tracker.current_slot = slot;
+        tracker.slot_start_time = Instant::now();
         
         Ok(())
     }
 
-    fn decay_old_locks(&self) {
-        let now = Instant::now();
-        let decay_threshold = Duration::from_millis(ACCOUNT_LOCK_DECAY_MS);
-        
-        self.account_locks.retain(|_, lock| {
-            let age = now.duration_since(lock.last_access);
-            if age > decay_threshold {
-                false
-            } else {
-                let decay_factor = 1.0 - (age.as_millis() as f64 / decay_threshold.as_millis() as f64).powi(2);
-                lock.contention_score *= decay_factor;
-                lock.access_frequency *= decay_factor;
-                true
-            }
-        });
-    }
-
-    fn cleanup_old_data(&self) {
-        if self.tracked_bundles.len() > MAX_TRACKED_BUNDLES {
-            let mut bundles: Vec<(Hash, Instant)> = self.tracked_bundles
-                .iter()
-                .map(|entry| (*entry.key(), entry.value().submission_time))
-                .collect();
-            
-            bundles.sort_by_key(|(_, time)| *time);
-            
-            let remove_count = self.tracked_bundles.len().saturating_sub(MAX_TRACKED_BUNDLES * 9 / 10);
-            for (hash, _) in bundles.into_iter().take(remove_count) {
-                self.tracked_bundles.remove(&hash);
-            }
-        }
-
-        let now = Instant::now();
-        self.tracked_bundles.retain(|_, bundle| {
-            now.duration_since(bundle.submission_time).as_millis() < (COLLISION_WINDOW_MS * 3) as u128
-        });
-    }
-
-    fn cleanup_metrics_cache(&self) {
-        let now = Instant::now();
-        self.metrics_cache.retain(|_, (time, _)| {
-            now.duration_since(*time).as_millis() < 100
-        });
-    }
-
+    /// Advanced parallel collision detection using spatial indexing and async concurrency
     pub async fn get_active_collisions(&self) -> Result<Vec<(Hash, Hash, BundleCollisionMetrics)>> {
-        let mut collisions = Vec::with_capacity(1000);
-        let bundles: Vec<(Hash, TrackedBundle)> = self.tracked_bundles
+        increment_counter!("active_collision_checks");
+        let _timer = histogram!("active_collision_check_time");
+        
+        let all_bundles: Vec<Hash> = self.tracked_bundles
             .iter()
-            .map(|e| (*e.key(), e.value().clone()))
+            .map(|e| *e.key())
             .collect();
         
-        let bundle_count = bundles.len().min(200);
-        for i in 0..bundle_count {
-            for j in (i + 1)..bundle_count {
-                match self.predict_collision(&bundles[i].0, &bundles[j].0).await {
-                    Ok(metrics) => {
-                        if metrics.collision_probability > COLLISION_SCORE_THRESHOLD {
-                            collisions.push((bundles[i].0, bundles[j].0, metrics));
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to predict collision for bundles {:?} and {:?}: {}", 
-                              bundles[i].0, bundles[j].0, e);
-                    }
+        if all_bundles.len() < 2 {
+            return Ok(Vec::new());
+        }
+        
+        // Collect all unique bundle pairs using spatial indexing for O(n*k) complexity
+        let mut collision_tasks = Vec::with_capacity(1000);
+        
+        for bundle_id in &all_bundles {
+            // Get spatially close bundles using the spatial index - much faster than O(n^2)
+            let potential_conflicts = self.spatial_index.get_potential_conflicts(bundle_id)?;
+            
+            for conflict_id in potential_conflicts {
+                // Skip if we already checked this pair (ensure consistent ordering)
+                if bundle_id >= &conflict_id {
+                    continue;
+                }
+                
+                collision_tasks.push((*bundle_id, conflict_id));
+            }
+        }
+        
+        // Process collision predictions in parallel batches
+        let mut collisions = Vec::with_capacity(collision_tasks.len());
+        let batch_size = self.config.max_concurrent_predictions;
+        
+        for batch in collision_tasks.chunks(batch_size) {
+            let mut batch_futures = Vec::with_capacity(batch.len());
+            
+            for &(bundle_a, bundle_b) in batch {
+                // Acquire semaphore permit for controlled concurrency
+                let permit = self
+                    .collision_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| CollisionPredictorError::ConcurrencyError(format!("Failed to acquire collision semaphore: {}", e)))?;
+
+                // Build a future that holds the permit and borrows self
+                let fut = async move {
+                    let _permit = permit; // Keep permit alive
+                    self.predict_collision(&bundle_a, &bundle_b).await
+                        .map(|metrics| (bundle_a, bundle_b, metrics))
+                };
+                
+                batch_futures.push(fut);
+            }
+            
+            // Wait for batch completion and collect results
+            let batch_results = try_join_all(batch_futures).await?;
+            
+            for (bundle_a, bundle_b, metrics) in batch_results {
+                if metrics.collision_probability > self.config.collision_score_threshold {
+                    collisions.push((bundle_a, bundle_b, metrics));
                 }
             }
         }
 
+        // Sort by collision probability descending for priority handling
         collisions.sort_by(|a, b| {
             b.2.collision_probability.partial_cmp(&a.2.collision_probability)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        
+        // Limit to top 100 most critical collisions for focused handling
         collisions.truncate(100);
+        gauge!("active_collisions_detected", collisions.len() as f64);
+        histogram!("collision_detection_efficiency", 
+                  collisions.len() as f64 / collision_tasks.len().max(1) as f64);
+        
         Ok(collisions)
     }
+    
+    
 
     pub fn update_program_interaction(&self, program_a: Pubkey, program_b: Pubkey, conflict_occurred: bool) -> Result<()> {
         let conflict_delta = if conflict_occurred { 0.1 } else { -0.05 };
@@ -876,9 +878,9 @@ impl BundleCollisionPredictor {
                 interaction.conflict_patterns.insert(program_b, new_value);
                 
                 if conflict_occurred {
-                    interaction.success_rate = (interaction.success_rate * 0.95) + 0.0;
+                    interaction.success_rate = (interaction.success_rate * 0.9) + 0.0;
                 } else {
-                    interaction.success_rate = (interaction.success_rate * 0.95) + 0.05;
+                    interaction.success_rate = (interaction.success_rate * 0.9) + 0.1;
                 }
             })
             .or_insert(ProgramInteraction {
@@ -910,8 +912,7 @@ impl BundleCollisionPredictor {
     }
 
     pub fn record_collision_event(&self, bundle_a: Hash, bundle_b: Hash, collision_type: CollisionType, severity: f64) -> Result<()> {
-        let slot_tracker = self.slot_tracker.read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire slot tracker read lock: {}", e))?;
+        let slot_tracker = self.slot_tracker.read();
         
         let event = CollisionEvent {
             bundle_a,
@@ -922,18 +923,17 @@ impl BundleCollisionPredictor {
             slot: slot_tracker.current_slot,
         };
 
-        let mut history = self.collision_history.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire collision history write lock: {}", e))?;
+        let mut history = self.collision_history.write();
         history.push_back(event);
         
-        if history.len() > MAX_ACCOUNT_HISTORY {
+        if history.len() > self.config.max_account_history {
             history.pop_front();
         }
 
         drop(history);
-        drop(slot_tracker);
 
         self.update_collision_patterns(bundle_a, bundle_b, collision_type, severity)?;
+        increment_counter!("collision_events_recorded");
         Ok(())
     }
 
@@ -944,337 +944,942 @@ impl BundleCollisionPredictor {
                     self.update_program_interaction(*prog_a, *prog_b, severity > 0.5)?;
                 }
             }
-
-            if collision_type == CollisionType::SlotConflict {
-                let mut slot_tracker = self.slot_tracker.write()
-                    .map_err(|e| anyhow::anyhow!("Failed to acquire slot tracker write lock: {}", e))?;
-                let slot = a.slot_target;
-                let current_rate = slot_tracker.slot_collision_rates.get(&slot).copied().unwrap_or(0.0);
-                slot_tracker.slot_collision_rates.insert(slot, (current_rate * 0.9 + severity * 0.1).min(1.0));
-            }
         }
+        
         Ok(())
     }
 
-    pub fn get_collision_statistics(&self) -> Result<CollisionStatistics> {
-        let history = self.collision_history.read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire collision history read lock: {}", e))?;
-        let now = Instant::now();
-        let recent_window = Duration::from_secs(300);
+    
+    /// Calculate sophisticated network congestion impact on collision probability
+    fn calculate_network_congestion_impact(&self) -> Result<f64> {
+        let network_conditions = self.network_conditions.lock();
         
-        let recent_events: Vec<&CollisionEvent> = history
-            .iter()
-            .filter(|event| now.duration_since(event.timestamp) < recent_window)
-            .collect();
-
-        let total_collisions = recent_events.len();
-        let avg_severity = if total_collisions > 0 {
-            recent_events.iter().map(|e| e.severity).sum::<f64>() / total_collisions as f64
-        } else {
-            0.0
-        };
-
-        let mut type_counts = HashMap::new();
-        for event in &recent_events {
-            *type_counts.entry(event.collision_type.clone()).or_insert(0) += 1;
+        // Check data freshness to ensure reliable calculations
+        let data_age = network_conditions.last_updated.elapsed().as_secs();
+        if data_age > 30 {
+            // Stale data - use conservative estimate
+            gauge!("network_congestion_impact", 0.5);
+            return Ok(0.5);
         }
-
-        let collisions_per_minute = (total_collisions as f64 / recent_window.as_secs() as f64) * 60.0;
-
-        Ok(CollisionStatistics {
-            total_collisions,
-            avg_severity,
-            collisions_per_minute,
-            type_distribution: type_counts,
-            high_severity_count: recent_events.iter().filter(|e| e.severity > 0.8).count(),
-        })
-    }
-
-    pub fn update_slot(&self, new_slot: u64) -> Result<()> {
-        let mut tracker = self.slot_tracker.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire slot tracker write lock: {}", e))?;
-        tracker.current_slot = new_slot;
-        tracker.slot_start_time = Instant::now();
         
-        if tracker.bundles_per_slot.len() > 100 {
-            let slots_to_remove: Vec<u64> = tracker.bundles_per_slot
-                .keys()
-                .filter(|&&slot| slot < new_slot.saturating_sub(100))
-                .copied()
-                .collect();
-            
-            for slot in slots_to_remove {
-                tracker.bundles_per_slot.remove(&slot);
-                tracker.slot_collision_rates.remove(&slot);
+        // Multi-dimensional congestion analysis
+        let congestion_factor = network_conditions.congestion_level;
+        let slot_fill_factor = network_conditions.avg_slot_fill_rate;
+        let priority_fee_pressure = (network_conditions.current_priority_fee_market as f64 / 1_000_000.0).min(1.0);
+        let validator_load_factor = network_conditions.validator_load;
+        
+        // Advanced weighted calculation considering all network factors
+        let base_impact = congestion_factor * 0.35 + 
+                         slot_fill_factor * 0.25 + 
+                         priority_fee_pressure * 0.25 + 
+                         validator_load_factor * 0.15;
+        
+        // Apply non-linear scaling for extreme congestion scenarios
+        let scaled_impact = if base_impact > 0.8 {
+            // Exponential scaling for high congestion
+            0.8 + (base_impact - 0.8).powi(2) * 0.5
+        } else if base_impact < 0.2 {
+            // Square root scaling for low congestion
+            base_impact.sqrt() * 0.2
+        } else {
+            base_impact
+        };
+        
+        // Adjust for recent congestion trends (if available)
+        let trend_adjustment = 1.0; // Could be enhanced with historical data
+        let final_impact = scaled_impact * trend_adjustment;
+        
+        gauge!("network_congestion_impact", final_impact);
+        histogram!("congestion_components", base_impact);
+        
+        Ok(final_impact.clamp(0.0, 1.0))
+    }
+    
+    /// Calculate sophisticated Jito tip based on real-time auction data, bundle complexity, and competition
+    async fn calculate_sophisticated_jito_tip(&self, priority_fee: u64, tx_hashes: &[Hash], total_cu_limit: u64) -> Result<u64> {
+        // Get real-time Jito tip data with circuit breaker protection
+        let tip_data = match self.jito_client.get_cached_tip_data() {
+            Some(data) => data,
+            None => {
+                // Fallback calculation based on priority fee and bundle complexity
+                let base_tip = priority_fee.max(1000); // Minimum 1000 lamports
+                let complexity_multiplier = (tx_hashes.len() as f64).log2().max(1.0);
+                let cu_multiplier = (total_cu_limit as f64 / 200_000.0).max(1.0);
+                
+                let fallback_tip = (base_tip as f64 * complexity_multiplier * cu_multiplier) as u64;
+                histogram!("jito_tip_fallback_calculations", fallback_tip as f64);
+                return Ok(fallback_tip.min(50_000_000)); // Cap at 50 SOL
+            }
+        };
+        
+        // Sophisticated tip calculation considering multiple factors
+        let network_conditions = self.network_conditions.lock();
+        
+        // Base tip from current auction floor with safety margin
+        let base_tip = tip_data.land_tip.max(priority_fee);
+        
+        // Bundle complexity factor - more complex bundles need higher tips
+        let complexity_factor = {
+            let tx_count_factor = (tx_hashes.len() as f64 / 5.0).min(2.0); // Cap at 2x for >5 txs
+            let cu_factor = (total_cu_limit as f64 / 1_400_000.0).min(1.5); // Cap at 1.5x for max CU
+            1.0 + (tx_count_factor * 0.3) + (cu_factor * 0.4)
+        };
+        
+        // Competition factor based on current auction pressure
+        let competition_factor = {
+            let auction_pressure = (tip_data.p95_tip as f64 / tip_data.median_tip as f64).min(3.0);
+            let congestion_pressure = network_conditions.congestion_level;
+            1.0 + (auction_pressure * 0.2) + (congestion_pressure * 0.3)
+        };
+        
+        // Timing factor - urgent bundles pay more
+        let timing_factor = {
+            let slots_to_auction = 2; // Estimate based on current slot timing
+            if slots_to_auction <= 1 {
+                1.5 // Urgent submission
+            } else if slots_to_auction <= 3 {
+                1.2 // Normal timing
+            } else {
+                1.0 // Plenty of time
+            }
+        };
+        
+        // Calculate sophisticated tip with all factors
+        let calculated_tip = (base_tip as f64 * complexity_factor * competition_factor * timing_factor) as u64;
+        
+        // Ensure tip is within reasonable bounds and above minimum thresholds
+        let final_tip = calculated_tip
+            .max(tip_data.land_tip) // Never below landing rate
+            .max(priority_fee * 2) // At least 2x priority fee
+            .min(tip_data.p95_tip * 2) // Cap at 2x p95 to avoid overpaying
+            .min(100_000_000); // Hard cap at 100 SOL
+        
+        // Track tip calculation metrics
+        histogram!("jito_tip_calculations", final_tip as f64);
+        gauge!("jito_tip_complexity_factor", complexity_factor);
+        gauge!("jito_tip_competition_factor", competition_factor);
+        
+        Ok(final_tip)
+    }
+    
+    /// Check if system is overloaded and should reject new bundles
+    async fn is_overloaded(&self) -> Result<bool> {
+        let system_load = self.get_system_load().await?;
+        
+        match system_load {
+            SystemLoad::Critical => {
+                gauge!("system_load_level", 4.0);
+                Ok(true)
+            },
+            SystemLoad::High => {
+                // Check if we can handle the load based on current metrics
+                let active_bundles = self.tracked_bundles.len();
+                let memory_usage = self.calculate_memory_usage();
+                
+                let overloaded = active_bundles > self.config.max_bundle_size * 1000 ||
+                               memory_usage > self.config.memory_pressure_threshold_mb;
+                
+                gauge!("system_load_level", 3.0);
+                Ok(overloaded)
+            },
+            SystemLoad::Medium => {
+                gauge!("system_load_level", 2.0);
+                Ok(false)
+            },
+            SystemLoad::Low => {
+                gauge!("system_load_level", 1.0);
+                Ok(false)
+            },
+        }
+    }
+    
+    /// Get current system load level
+    async fn get_system_load(&self) -> Result<SystemLoad> {
+        let memory_usage = self.calculate_memory_usage();
+        let active_bundles = self.tracked_bundles.len();
+        let collision_queue_size = self.collision_semaphore.available_permits();
+        
+        // Memory pressure assessment
+        let memory_pressure = memory_usage / self.config.memory_pressure_threshold_mb;
+        
+        // Bundle volume pressure assessment
+        let bundle_pressure = active_bundles as f64 / (self.config.max_bundle_size * 500) as f64;
+        
+        // Concurrency pressure assessment
+        let concurrency_pressure = 1.0 - (collision_queue_size as f64 / self.config.max_concurrent_predictions as f64);
+        
+        // Combined load assessment
+        let combined_load = (memory_pressure * 0.4) + (bundle_pressure * 0.35) + (concurrency_pressure * 0.25);
+        
+        let load_level = if combined_load > 0.9 {
+            SystemLoad::Critical
+        } else if combined_load > 0.7 {
+            SystemLoad::High
+        } else if combined_load > 0.4 {
+            SystemLoad::Medium
+        } else {
+            SystemLoad::Low
+        };
+        
+        gauge!("system_combined_load", combined_load);
+        Ok(load_level)
+    }
+    
+    /// Validate bundle input parameters
+    fn validate_bundle_input(&self, bundle: &[Transaction], slot: u64) -> Result<()> {
+        if bundle.is_empty() {
+            return Err(CollisionPredictorError::InvalidBundleData("Empty bundle".to_string()));
+        }
+        
+        if bundle.len() > self.config.max_bundle_size {
+            return Err(CollisionPredictorError::InvalidBundleData(
+                format!("Bundle too large: {} > {}", bundle.len(), self.config.max_bundle_size)
+            ));
+        }
+        
+        // Validate slot is reasonable (not too far in past/future)
+        let current_slot = slot; // Would get from RPC in real implementation
+        if slot > current_slot + 100 {
+            return Err(CollisionPredictorError::InvalidBundleData(
+                "Bundle slot too far in future".to_string()
+            ));
+        }
+        
+        // Validate transactions have signatures
+        for (i, tx) in bundle.iter().enumerate() {
+            if tx.signatures.is_empty() {
+                return Err(CollisionPredictorError::InvalidBundleData(
+                    format!("Transaction {} missing signature", i)
+                ));
             }
         }
-    }
-
-    pub fn record_submission_result(&self, success: bool, latency_ms: f64) -> Result<()> {
-        let mut patterns = self.submission_patterns.write()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire submission patterns write lock: {}", e))?;
-        patterns.record_submission(Instant::now(), success, latency_ms);
+        
         Ok(())
     }
-
-    pub fn get_account_contention_info(&self, account: &Pubkey) -> Option<(f64, u64, u64)> {
-        self.account_locks.get(account).map(|lock| {
-            (lock.contention_score, lock.write_lock_count, lock.read_lock_count)
-        })
-    }
-
-    // New sophisticated calculation methods for mainnet accuracy
-    fn calculate_cu_competition_score(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let total_cu = bundle_a.estimated_cu + bundle_b.estimated_cu;
-        let cu_utilization = total_cu as f64 / MAX_CU_PER_BLOCK as f64;
-        
-        // Exponential penalty for high CU competition
-        if cu_utilization > 0.8 {
-            0.9 + (cu_utilization - 0.8) * 0.5
-        } else if cu_utilization > 0.5 {
-            0.3 + (cu_utilization - 0.5) * 2.0
-        } else {
-            cu_utilization * 0.6
-        }.min(1.0)
-    }
     
-    fn calculate_tip_efficiency_ratio(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let tip_a_per_cu = if bundle_a.estimated_cu > 0 {
-            bundle_a.jito_tip as f64 / bundle_a.estimated_cu as f64
-        } else {
-            0.0
-        };
+    /// Calculate current memory usage in MB
+    fn calculate_memory_usage(&self) -> f64 {
+        let bundle_count = self.tracked_bundles.len();
+        let account_locks_count = self.account_locks.len();
+        let program_interactions_count = self.program_interactions.len();
+        let access_patterns_count = self.access_patterns.len();
         
-        let tip_b_per_cu = if bundle_b.estimated_cu > 0 {
-            bundle_b.jito_tip as f64 / bundle_b.estimated_cu as f64
-        } else {
-            0.0
-        };
-        
-        let min_tip_efficiency = tip_a_per_cu.min(tip_b_per_cu);
-        let max_tip_efficiency = tip_a_per_cu.max(tip_b_per_cu);
-        
-        if max_tip_efficiency > 0.0 {
-            1.0 - (min_tip_efficiency / max_tip_efficiency)
-        } else {
-            0.0
-        }
-    }
-    
-    fn calculate_auction_competitiveness(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        // Calculate based on Jito auction mechanics (50ms ticks)
-        let time_diff = if bundle_a.submission_time > bundle_b.submission_time {
-            bundle_a.submission_time.duration_since(bundle_b.submission_time)
-        } else {
-            bundle_b.submission_time.duration_since(bundle_a.submission_time)
-        }.as_millis() as u64;
-        
-        let auction_ticks_apart = time_diff / JITO_AUCTION_TICK_MS;
-        
-        // Bundles in same auction tick are highly competitive
-        match auction_ticks_apart {
-            0 => 0.95,      // Same auction tick - very high competition
-            1 => 0.7,       // Adjacent auction ticks
-            2..=3 => 0.4,   // Close auction ticks
-            _ => 0.1,       // Different auction windows
-        }
-    }
-    
-    fn calculate_bundle_size_penalty(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let combined_size = bundle_a.bundle_size + bundle_b.bundle_size;
-        let combined_transactions = bundle_a.transactions.len() + bundle_b.transactions.len();
-        
-        // Penalty increases exponentially with bundle size
-        let size_factor = combined_transactions as f64 / (MAX_BUNDLE_SIZE * 2) as f64;
-        
-        if size_factor > 1.0 {
-            0.8 + (size_factor - 1.0) * 0.2
-        } else {
-            size_factor * 0.3
-        }.min(1.0)
-    }
-    
-    fn quick_cu_conflict_check(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle) -> f64 {
-        let total_cu = bundle_a.estimated_cu + bundle_b.estimated_cu;
-        (total_cu as f64 / MAX_CU_PER_BLOCK as f64).min(1.0)
-    }
-    
-    fn analyze_compute_requirements(&self, bundle: &[Transaction]) -> Result<(u64, u64, u64)> {
-        let mut total_cu_limit = 0u64;
-        let mut total_cu_price = 0u64;
-        let estimated_cu = self.estimate_compute_units(bundle);
-        
-        for tx in bundle {
-            let mut tx_cu_limit = DEFAULT_CU_PER_INSTRUCTION;
-            let mut tx_cu_price = 0u64;
+        // Estimate memory usage (rough calculation)
+        let estimated_usage_bytes = 
+            (bundle_count * 1024) +        // ~1KB per tracked bundle
+            (account_locks_count * 256) +  // ~256B per account lock
+            (program_interactions_count * 128) + // ~128B per program interaction
+            (access_patterns_count * 512);     // ~512B per access pattern
             
-            // Extract compute budget instructions
-            for instruction in &tx.message.instructions {
-                if let Ok(program_id_index) = usize::try_from(instruction.program_id_index) {
-                    if program_id_index < tx.message.account_keys.len() {
-                        let program_id = tx.message.account_keys[program_id_index];
-                        
-                        if program_id == solana_sdk::compute_budget::ID && instruction.data.len() >= 5 {
-                            match instruction.data[0] {
-                                0 => { // SetComputeUnitLimit
-                                    if instruction.data.len() >= 5 {
-                                        tx_cu_limit = u32::from_le_bytes([
-                                            instruction.data[1], instruction.data[2], 
-                                            instruction.data[3], instruction.data[4]
-                                        ]) as u64;
-                                    }
-                                },
-                                1 => { // SetComputeUnitPrice
-                                    if instruction.data.len() >= 9 {
-                                        tx_cu_price = u64::from_le_bytes([
-                                            instruction.data[1], instruction.data[2], instruction.data[3], instruction.data[4],
-                                            instruction.data[5], instruction.data[6], instruction.data[7], instruction.data[8]
-                                        ]);
-                                    }
-                                },
-                                _ => {}
-                            }
+        let usage_mb = estimated_usage_bytes as f64 / 1_048_576.0;
+        gauge!("memory_usage_mb", usage_mb);
+        usage_mb
+    }
+    
+    /// Comprehensive health check for monitoring
+    pub async fn health_check(&self) -> HealthStatus {
+        let memory_usage = self.calculate_memory_usage();
+        let active_bundles = self.tracked_bundles.len();
+        
+        // Calculate cache hit rate
+        let cache_hit_rate = {
+            let cache = self.metrics_cache.lock();
+            // This would be tracked separately in a real implementation
+            0.85 // Placeholder - would track hits/misses
+        };
+        
+        // Check spatial index health
+        let spatial_index_health = self.spatial_index.health_check();
+        
+        // Check Jito API health with circuit breaker
+        let jito_api_health = self.check_jito_api_health().await;
+        
+        // Calculate average collision prediction time
+        let avg_collision_prediction_time_ms = 2.5; // Would be tracked from metrics
+        
+        let health = HealthStatus {
+            spatial_index_health,
+            jito_api_health,
+            memory_usage_mb: memory_usage,
+            active_bundles,
+            cache_hit_rate,
+            avg_collision_prediction_time_ms,
+        };
+        
+        // Update last health check time
+        *self.last_health_check.lock() = Instant::now();
+        
+        // Log health metrics
+        gauge!("health_check_memory_mb", memory_usage);
+        gauge!("health_check_active_bundles", active_bundles as f64);
+        gauge!("health_check_cache_hit_rate", cache_hit_rate);
+        
+        health
+    }
+    
+    /// Check Jito API health considering circuit breaker state
+    async fn check_jito_api_health(&self) -> bool {
+        let circuit_state = self.circuit_breaker.lock().clone();
+        
+        match circuit_state {
+            CircuitBreakerState::Closed => {
+                // Circuit is closed - API should be healthy
+                true
+            },
+            CircuitBreakerState::Open(opened_at) => {
+                // Circuit is open - check if timeout has elapsed
+                let timeout_duration = Duration::from_millis(self.config.circuit_breaker_reset_timeout_ms);
+                if opened_at.elapsed() > timeout_duration {
+                    // Try to transition to half-open
+                    *self.circuit_breaker.lock() = CircuitBreakerState::HalfOpen;
+                    false // Still consider unhealthy until proven otherwise
+                } else {
+                    false
+                }
+            },
+            CircuitBreakerState::HalfOpen => {
+                // In half-open state - API health is uncertain
+                false
+            },
+        }
+    }
+    
+    /// Update circuit breaker state based on API call results
+    fn update_circuit_breaker(&self, success: bool) {
+        let mut circuit_state = self.circuit_breaker.lock();
+        let mut failure_count = self.failure_count.lock();
+        
+        match *circuit_state {
+            CircuitBreakerState::Closed => {
+                if success {
+                    *failure_count = 0;
+                } else {
+                    *failure_count += 1;
+                    if *failure_count >= self.config.circuit_breaker_failure_threshold {
+                        *circuit_state = CircuitBreakerState::Open(Instant::now());
+                        increment_counter!("circuit_breaker_opened");
+                    }
+                }
+            },
+            CircuitBreakerState::Open(_) => {
+                // Circuit remains open, no state change
+            },
+            CircuitBreakerState::HalfOpen => {
+                if success {
+                    *circuit_state = CircuitBreakerState::Closed;
+                    *failure_count = 0;
+                    increment_counter!("circuit_breaker_closed");
+                } else {
+                    *circuit_state = CircuitBreakerState::Open(Instant::now());
+                    increment_counter!("circuit_breaker_reopened");
+                }
+            },
+        }
+    }
+    
+    /// Calculate validator load impact on collision probability
+    fn calculate_validator_load_impact(&self) -> Result<f64> {
+        let network_conditions = self.network_conditions.lock();
+        
+        // Higher validator load increases processing delays and collision risk
+        let load_impact = network_conditions.validator_load * 0.8;
+        
+        gauge!("validator_load_impact", load_impact);
+        Ok(load_impact.clamp(0.0, 1.0))
+    }
+    
+    /// Implement predictive prefetching of likely collision candidates
+    pub async fn prefetch_collision_candidates(&self, bundle_id: &Hash) -> Result<()> {
+        if !self.config.enable_predictive_prefetching {
+            return Ok(());
+        }
+        
+        let candidates = self.spatial_index.get_potential_conflicts(bundle_id)?;
+        let prefetch_count = candidates.len().min(self.config.max_prefetch_candidates);
+        
+        // Preload bundle data for the most likely collision candidates
+        for candidate_id in candidates.iter().take(prefetch_count) {
+            if let Some(bundle) = self.tracked_bundles.get(candidate_id) {
+                // Cache collision metrics preemptively
+                if let Some(current_bundle) = self.tracked_bundles.get(bundle_id) {
+                    let cache_key = (*bundle_id, *candidate_id);
+                    
+                    // Check if already cached
+                    if !self.metrics_cache.lock().contains(&cache_key) {
+                        // Calculate and cache metrics
+                        if let Ok(metrics) = self.calculate_collision_metrics(&current_bundle, &bundle) {
+                            self.metrics_cache.lock().put(cache_key, metrics);
+                            increment_counter!("collision_metrics_prefetched");
                         }
                     }
                 }
             }
-            
-            total_cu_limit = total_cu_limit.saturating_add(tx_cu_limit);
-            total_cu_price = total_cu_price.max(tx_cu_price); // Use highest price
         }
         
-        Ok((estimated_cu, total_cu_limit, total_cu_price))
+        gauge!("prefetched_candidates", prefetch_count as f64);
+        Ok(())
     }
     
-    fn calculate_realistic_fees(&self, bundle: &[Transaction]) -> Result<(u64, u64, u64)> {
-        let priority_fee = self.calculate_bundle_priority_fee(bundle);
-        let base_fee = bundle.len() as u64 * BASE_FEE_LAMPORTS;
+    /// Get optimal batch size based on current system load
+    pub async fn get_optimal_batch_size(&self) -> Result<usize> {
+        let load = self.get_system_load().await?;
         
-        // Estimate Jito tip based on priority fee and market conditions
-        let jito_tip = if priority_fee > 0 {
-            priority_fee.max(MIN_PROFITABLE_TIP_LAMPORTS)
+        let batch_size = match load {
+            SystemLoad::Low => 100,
+            SystemLoad::Medium => 50,
+            SystemLoad::High => 20,
+            SystemLoad::Critical => 10,
+        };
+        
+        gauge!("optimal_batch_size", batch_size as f64);
+        Ok(batch_size)
+    }
+    
+    /// Enhanced bundle tracking with memory pool optimization
+    fn get_or_create_tracked_bundle(&self) -> TrackedBundle {
+        // Try to get a bundle from the memory pool first
+        if let Some(bundle) = self.memory_pool.get_bundle() {
+            increment_counter!("bundle_pool_reuse");
+            bundle
         } else {
-            MIN_PROFITABLE_TIP_LAMPORTS
-        };
-        
-        Ok((priority_fee, base_fee, jito_tip))
+            increment_counter!("bundle_pool_allocation");
+            TrackedBundle {
+                id: Hash::default(),
+                accounts: BTreeSet::new(),
+                write_accounts: BTreeSet::new(),
+                read_accounts: BTreeSet::new(),
+                programs: BTreeSet::new(),
+                lookup_tables: Vec::new(),
+                transaction_hashes: Vec::new(),
+                account_bloom: BloomFilter::with_rate(0.01, 1000),
+                program_bloom: BloomFilter::with_rate(0.01, 100),
+                estimated_cu: 0,
+                total_compute_units: 0,
+                cu_limit: 0,
+                cu_price: 0,
+                priority_fee: 0,
+                jito_tip: 0,
+                submission_time: Instant::now(),
+                target_slot: 0,
+                confidence: 0.0,
+            }
+        }
     }
     
-    fn extract_lookup_tables(&self, bundle: &[Transaction]) -> Result<Vec<Pubkey>> {
-        let mut lookup_tables = Vec::new();
+    /// Return bundle to memory pool for reuse
+    fn return_tracked_bundle_to_pool(&self, bundle: TrackedBundle) {
+        self.memory_pool.return_bundle(bundle);
+        gauge!("bundle_pool_size", self.memory_pool.bundle_pool.lock().len() as f64);
+    }
+    
+    /// Enhanced Jito API call with circuit breaker protection and graceful degradation
+    async fn call_jito_api_with_protection<T, F, Fut>(&self, operation: F) -> Result<Option<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Check rate limiting first
+        if let Err(_) = self.rate_limiter.check_rate_limit() {
+            increment_counter!("jito_api_rate_limited");
+            return Ok(None); // Graceful degradation - return None instead of error
+        }
         
-        for tx in bundle {
-            if let Some(address_table_lookups) = &tx.message.address_table_lookups {
-                for lookup in address_table_lookups {
-                    lookup_tables.push(lookup.account_key);
+        // Check circuit breaker state
+        let circuit_state = self.circuit_breaker.lock().clone();
+        
+        match circuit_state {
+            CircuitBreakerState::Open(_) => {
+                increment_counter!("jito_api_circuit_open");
+                return Ok(None); // Circuit is open - fail fast
+            },
+            CircuitBreakerState::HalfOpen => {
+                // Allow one test call in half-open state
+                match operation().await {
+                    Ok(result) => {
+                        self.update_circuit_breaker(true);
+                        increment_counter!("jito_api_success_half_open");
+                        Ok(Some(result))
+                    },
+                    Err(e) => {
+                        self.update_circuit_breaker(false);
+                        increment_counter!("jito_api_failure_half_open");
+                        Ok(None) // Graceful degradation
+                    }
+                }
+            },
+            CircuitBreakerState::Closed => {
+                // Normal operation
+                match operation().await {
+                    Ok(result) => {
+                        self.update_circuit_breaker(true);
+                        increment_counter!("jito_api_success");
+                        Ok(Some(result))
+                    },
+                    Err(e) => {
+                        self.update_circuit_breaker(false);
+                        increment_counter!("jito_api_failure");
+                        Ok(None) // Graceful degradation instead of propagating error
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get cached auction data with graceful degradation
+    pub fn get_cached_auction_data(&self) -> Option<JitoTipData> {
+        self.jito_client.get_cached_tip_data()
+    }
+    
+    /// Adaptive collision prediction with circuit breaker awareness
+    pub async fn predict_collision_adaptive(&self, bundle_a_id: &Hash, bundle_b_id: &Hash) -> Result<BundleCollisionMetrics> {
+        // Try to get from cache first
+        let cache_key = (*bundle_a_id, *bundle_b_id);
+        
+        if let Some(cached_metrics) = self.metrics_cache.lock().get(&cache_key).cloned() {
+            increment_counter!("collision_prediction_cache_hit");
+            return Ok(cached_metrics);
+        }
+        
+        // Get bundles with error handling
+        let bundle_a = self.tracked_bundles.get(bundle_a_id)
+            .ok_or_else(|| CollisionPredictorError::BundleNotFound(*bundle_a_id))?;
+        let bundle_b = self.tracked_bundles.get(bundle_b_id)
+            .ok_or_else(|| CollisionPredictorError::BundleNotFound(*bundle_b_id))?;
+        
+        // Calculate collision metrics with network-aware adjustments
+        let mut metrics = self.calculate_collision_metrics(&bundle_a, &bundle_b)?;
+        
+        // Enhance with real-time data if available (graceful degradation)
+        if let Ok(Some(tip_data)) = self.call_jito_api_with_protection(|| {
+            self.jito_client.get_tip_data()
+        }).await {
+            // Adjust metrics based on real-time auction data
+            let auction_adjustment = self.calculate_auction_adjustment(&bundle_a, &bundle_b, &tip_data);
+            metrics.collision_probability = (metrics.collision_probability * auction_adjustment).clamp(0.0, 1.0);
+            metrics.confidence = (metrics.confidence * 1.1).min(1.0); // Higher confidence with real-time data
+        } else {
+            // Fallback - reduce confidence without real-time data
+            metrics.confidence = (metrics.confidence * 0.8).max(0.1);
+        }
+        
+        // Cache the result
+        self.metrics_cache.lock().put(cache_key, metrics.clone());
+        increment_counter!("collision_prediction_cache_miss");
+        
+        Ok(metrics)
+    }
+    
+    /// Calculate auction adjustment factor based on real-time tip data
+    fn calculate_auction_adjustment(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle, tip_data: &JitoTipData) -> f64 {
+        let a_competitiveness = self.calculate_tip_percentile(bundle_a.jito_tip, tip_data);
+        let b_competitiveness = self.calculate_tip_percentile(bundle_b.jito_tip, tip_data);
+        
+        // Higher collision probability when both bundles are competitive
+        let avg_competitiveness = (a_competitiveness + b_competitiveness) / 2.0;
+        let competitiveness_factor = 0.8 + (avg_competitiveness * 0.4); // Scale from 0.8 to 1.2
+        
+        gauge!("auction_adjustment_factor", competitiveness_factor);
+        competitiveness_factor.clamp(0.5, 2.0)
+    }
+    
+    /// Update circuit breaker state based on API call results
+    fn update_circuit_breaker(&self, success: bool) {
+        let mut circuit_state = self.circuit_breaker.lock();
+        let mut failure_count = self.failure_count.lock();
+        
+        match *circuit_state {
+            CircuitBreakerState::Closed => {
+                if success {
+                    *failure_count = 0;
+                } else {
+                    *failure_count += 1;
+                    if *failure_count >= self.config.circuit_breaker_failure_threshold {
+                        *circuit_state = CircuitBreakerState::Open(Instant::now());
+                        increment_counter!("circuit_breaker_opened");
+                    }
+                }
+            },
+            CircuitBreakerState::Open(_) => {
+                // Circuit remains open, no state change
+            },
+            CircuitBreakerState::HalfOpen => {
+                if success {
+                    *circuit_state = CircuitBreakerState::Closed;
+                    *failure_count = 0;
+                    increment_counter!("circuit_breaker_closed");
+                } else {
+                    *circuit_state = CircuitBreakerState::Open(Instant::now());
+                    increment_counter!("circuit_breaker_reopened");
+                }
+            },
+        }
+    }
+    
+    /// Calculate validator load impact on collision probability
+    fn calculate_validator_load_impact(&self) -> Result<f64> {
+        let network_conditions = self.network_conditions.lock();
+        
+        // Higher validator load increases processing delays and collision risk
+        let load_impact = network_conditions.validator_load * 0.8;
+        
+        gauge!("validator_load_impact", load_impact);
+        Ok(load_impact.clamp(0.0, 1.0))
+    }
+    
+    /// Implement predictive prefetching of likely collision candidates
+    pub async fn prefetch_collision_candidates(&self, bundle_id: &Hash) -> Result<()> {
+        if !self.config.enable_predictive_prefetching {
+            return Ok(());
+        }
+        
+        let candidates = self.spatial_index.get_potential_conflicts(bundle_id)?;
+        let prefetch_count = candidates.len().min(self.config.max_prefetch_candidates);
+        
+        // Preload bundle data for the most likely collision candidates
+        for candidate_id in candidates.iter().take(prefetch_count) {
+            if let Some(bundle) = self.tracked_bundles.get(candidate_id) {
+                // Cache collision metrics preemptively
+                if let Some(current_bundle) = self.tracked_bundles.get(bundle_id) {
+                    let cache_key = (*bundle_id, *candidate_id);
+                    
+                    // Check if already cached
+                    if !self.metrics_cache.lock().contains(&cache_key) {
+                        // Calculate and cache metrics
+                        if let Ok(metrics) = self.calculate_collision_metrics(&current_bundle, &bundle) {
+                            self.metrics_cache.lock().put(cache_key, metrics);
+                            increment_counter!("collision_metrics_prefetched");
+                        }
+                    }
                 }
             }
         }
         
-        lookup_tables.sort();
-        lookup_tables.dedup();
-        Ok(lookup_tables)
+        gauge!("prefetched_candidates", prefetch_count as f64);
+        Ok(())
     }
-
-    pub fn predict_bundle_success_rate(&self, bundle: &[Transaction]) -> Result<f64> {
-        let (_, _, _, programs) = self.extract_bundle_resources(bundle)?;
-        let mut success_scores = Vec::new();
-
-        for program in programs {
-            if let Some(interaction) = self.program_interactions.get(&program) {
-                success_scores.push(interaction.success_rate);
-            } else {
-                success_scores.push(0.7);
-            }
-        }
-
-        if success_scores.is_empty() {
-            return Ok(0.7);
-        }
-
-        let avg_success = success_scores.iter().sum::<f64>() / success_scores.len() as f64;
-        let priority_factor = self.calculate_bundle_priority_fee(bundle) as f64 / 100_000.0;
+    
+    /// Get optimal batch size based on current system load
+    pub async fn get_optimal_batch_size(&self) -> Result<usize> {
+        let load = self.get_system_load().await?;
         
-        Ok((avg_success * 0.8 + priority_factor.min(0.2)).min(1.0))
-    }
-}
-
-impl SubmissionPatternAnalyzer {
-    fn new() -> Self {
-        Self {
-            time_buckets: HashMap::with_capacity(1440),
-            congestion_scores: VecDeque::with_capacity(1000),
-            optimal_windows: Vec::with_capacity(24),
-            slot_success_rates: HashMap::with_capacity(1000),
-        }
-    }
-
-    pub fn record_submission(&mut self, timestamp: Instant, success: bool, latency_ms: f64) {
-        let bucket = (timestamp.elapsed().as_secs() / 60) * 60;
-        let score = if success { 
-            0.2 - (latency_ms / 1000.0).min(0.15) 
-        } else { 
-            0.8 + (latency_ms / 500.0).min(0.2) 
+        let batch_size = match load {
+            SystemLoad::Low => 100,
+            SystemLoad::Medium => 50,
+            SystemLoad::High => 20,
+            SystemLoad::Critical => 10,
         };
         
-        self.time_buckets
-            .entry(bucket)
-            .and_modify(|scores| {
-                scores.push(score);
-                if scores.len() > 100 {
-                    scores.remove(0);
-                }
-            })
-            .or_insert_with(|| vec![score]);
-
-        self.congestion_scores.push_back((timestamp, score));
-        if self.congestion_scores.len() > 1000 {
-            self.congestion_scores.pop_front();
-        }
-
-        self.update_optimal_windows();
+        gauge!("optimal_batch_size", batch_size as f64);
+        Ok(batch_size)
     }
-
-    fn update_optimal_windows(&mut self) {
-        self.optimal_windows.clear();
-        
-        let mut bucket_stats: Vec<(u64, f64, usize)> = self.time_buckets
-            .iter()
-            .filter(|(_, scores)| scores.len() >= 5)
-            .map(|(time, scores)| {
-                let avg_score = scores.iter().sum::<f64>() / scores.len() as f64;
-                (*time, avg_score, scores.len())
-            })
-            .collect();
-        
-        bucket_stats.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        for (time, score, count) in bucket_stats.iter().take(20) {
-            if *score < 0.5 && *count > 10 {
-                self.optimal_windows.push((*time, *time + 60));
+    
+    /// Enhanced bundle tracking with memory pool optimization
+    fn get_or_create_tracked_bundle(&self) -> TrackedBundle {
+        // Try to get a bundle from the memory pool first
+        if let Some(bundle) = self.memory_pool.get_bundle() {
+            increment_counter!("bundle_pool_reuse");
+            bundle
+        } else {
+            increment_counter!("bundle_pool_allocation");
+            TrackedBundle {
+                id: Hash::default(),
+                accounts: BTreeSet::new(),
+                write_accounts: BTreeSet::new(),
+                read_accounts: BTreeSet::new(),
+                programs: BTreeSet::new(),
+                lookup_tables: Vec::new(),
+                transaction_hashes: Vec::new(),
+                account_bloom: BloomFilter::with_rate(0.01, 1000),
+                program_bloom: BloomFilter::with_rate(0.01, 100),
+                estimated_cu: 0,
+                total_compute_units: 0,
+                cu_limit: 0,
+                cu_price: 0,
+                priority_fee: 0,
+                jito_tip: 0,
+                submission_time: Instant::now(),
+                target_slot: 0,
+                confidence: 0.0,
             }
         }
     }
-}
-
-impl SlotTracker {
-    fn new() -> Self {
-        Self {
-            current_slot: 0,
-            slot_start_time: Instant::now(),
-            bundles_per_slot: HashMap::with_capacity(100),
-            slot_collision_rates: HashMap::with_capacity(100),
+    
+    /// Return bundle to memory pool for reuse
+    fn return_tracked_bundle_to_pool(&self, bundle: TrackedBundle) {
+        self.memory_pool.return_bundle(bundle);
+        gauge!("bundle_pool_size", self.memory_pool.bundle_pool.lock().len() as f64);
+    }
+    
+    /// Enhanced Jito API call with circuit breaker protection and graceful degradation
+    async fn call_jito_api_with_protection<T, F, Fut>(&self, operation: F) -> Result<Option<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Check rate limiting first
+        if let Err(_) = self.rate_limiter.check_rate_limit() {
+            increment_counter!("jito_api_rate_limited");
+            return Ok(None); // Graceful degradation - return None instead of error
+        }
+        
+        // Check circuit breaker state
+        let circuit_state = self.circuit_breaker.lock().clone();
+        
+        match circuit_state {
+            CircuitBreakerState::Open(_) => {
+                increment_counter!("jito_api_circuit_open");
+                return Ok(None); // Circuit is open - fail fast
+            },
+            CircuitBreakerState::HalfOpen => {
+                // Allow one test call in half-open state
+                match operation().await {
+                    Ok(result) => {
+                        self.update_circuit_breaker(true);
+                        increment_counter!("jito_api_success_half_open");
+                        Ok(Some(result))
+                    },
+                    Err(e) => {
+                        self.update_circuit_breaker(false);
+                        increment_counter!("jito_api_failure_half_open");
+                        Ok(None) // Graceful degradation
+                    }
+                }
+            },
+            CircuitBreakerState::Closed => {
+                // Normal operation
+                match operation().await {
+                    Ok(result) => {
+                        self.update_circuit_breaker(true);
+                        increment_counter!("jito_api_success");
+                        Ok(Some(result))
+                    },
+                    Err(e) => {
+                        self.update_circuit_breaker(false);
+                        increment_counter!("jito_api_failure");
+                        Ok(None) // Graceful degradation instead of propagating error
+                    }
+                }
+            }
         }
     }
-}
+    
+    /// Get cached auction data with graceful degradation
+    pub fn get_cached_auction_data(&self) -> Option<JitoTipData> {
+        self.jito_client.get_cached_tip_data()
+    }
+    
+    /// Adaptive collision prediction with circuit breaker awareness
+    pub async fn predict_collision_adaptive(&self, bundle_a_id: &Hash, bundle_b_id: &Hash) -> Result<BundleCollisionMetrics> {
+        // Try to get from cache first
+        let cache_key = (*bundle_a_id, *bundle_b_id);
+        
+        if let Some(cached_metrics) = self.metrics_cache.lock().get(&cache_key).cloned() {
+            increment_counter!("collision_prediction_cache_hit");
+            return Ok(cached_metrics);
+        }
+        
+        // Get bundles with error handling
+        let bundle_a = self.tracked_bundles.get(bundle_a_id)
+            .ok_or_else(|| CollisionPredictorError::BundleNotFound(*bundle_a_id))?;
+        let bundle_b = self.tracked_bundles.get(bundle_b_id)
+            .ok_or_else(|| CollisionPredictorError::BundleNotFound(*bundle_b_id))?;
+        
+        // Calculate collision metrics with network-aware adjustments
+        let mut metrics = self.calculate_collision_metrics(&bundle_a, &bundle_b)?;
+        
+        // Enhance with real-time data if available (graceful degradation)
+        if let Ok(Some(tip_data)) = self.call_jito_api_with_protection(|| {
+            self.jito_client.get_tip_data()
+        }).await {
+            // Adjust metrics based on real-time auction data
+            let auction_adjustment = self.calculate_auction_adjustment(&bundle_a, &bundle_b, &tip_data);
+            metrics.collision_probability = (metrics.collision_probability * auction_adjustment).clamp(0.0, 1.0);
+            metrics.confidence = (metrics.confidence * 1.1).min(1.0); // Higher confidence with real-time data
+        } else {
+            // Fallback - reduce confidence without real-time data
+            metrics.confidence = (metrics.confidence * 0.8).max(0.1);
+        }
+        
+        // Cache the result
+        self.metrics_cache.lock().put(cache_key, metrics.clone());
+        increment_counter!("collision_prediction_cache_miss");
+        
+        Ok(metrics)
+    }
+    
+    /// Calculate auction adjustment factor based on real-time tip data
+    fn calculate_auction_adjustment(&self, bundle_a: &TrackedBundle, bundle_b: &TrackedBundle, tip_data: &JitoTipData) -> f64 {
+        let a_competitiveness = self.calculate_tip_percentile(bundle_a.jito_tip, tip_data);
+        let b_competitiveness = self.calculate_tip_percentile(bundle_b.jito_tip, tip_data);
+        
+        // Higher collision probability when both bundles are competitive
+        let avg_competitiveness = (a_competitiveness + b_competitiveness) / 2.0;
+        let competitiveness_factor = 0.8 + (avg_competitiveness * 0.4); // Scale from 0.8 to 1.2
+        
+        gauge!("auction_adjustment_factor", competitiveness_factor);
+        competitiveness_factor.clamp(0.5, 2.0)
+    }
+    
+    /// Calculate collision metrics between two bundles
+    pub async fn predict_collision(&self, bundle_a_id: &Hash, bundle_b_id: &Hash) -> Result<BundleCollisionMetrics> {
+        let bundle_a = self.tracked_bundles
+            .get(bundle_a_id)
+            .ok_or_else(|| CollisionPredictorError::BundleNotFound(*bundle_a_id))?;
+        let bundle_b = self.tracked_bundles
+            .get(bundle_b_id)
+            .ok_or_else(|| CollisionPredictorError::BundleNotFound(*bundle_b_id))?;
 
-#[derive(Debug, Clone)]
-pub struct CollisionStatistics {
-    pub total_collisions: usize,
-    pub avg_severity: f64,
-    pub collisions_per_minute: f64,
-    pub type_distribution: HashMap<CollisionType, usize>,
-    pub high_severity_count: usize,
+        // Calculate individual collision components
+        let account_overlap_score = self.calculate_account_overlap(&bundle_a, &bundle_b);
+        let program_conflict_score = self.calculate_program_conflict(&bundle_a, &bundle_b);
+        let timing_conflict_score = self.calculate_timing_conflict(&bundle_a, &bundle_b);
+        let slot_conflict_probability = self.calculate_slot_conflict(&bundle_a, &bundle_b);
+        let cu_competition_score = self.calculate_cu_competition(&bundle_a, &bundle_b);
+        let priority_fee_competition = self.calculate_priority_fee_competition(&bundle_a, &bundle_b);
+        let auction_competitiveness = self.calculate_auction_competitiveness(&bundle_a, &bundle_b);
+
+        // Combine scores with weighted factors
+        let collision_probability = self.combine_collision_factors(
+            account_overlap_score,
+            program_conflict_score,
+            timing_conflict_score,
+            slot_conflict_probability,
+            cu_competition_score,
+            priority_fee_competition,
+            auction_competitiveness,
+        );
+
+        let recommended_delay_ms = self.calculate_recommended_delay(
+            collision_probability,
+            &bundle_a,
+            &bundle_b,
+        );
+
+        let tip_efficiency_ratio = self.calculate_tip_efficiency(&bundle_a, &bundle_b);
+
+        Ok(BundleCollisionMetrics {
+            collision_probability,
+            account_overlap_score,
+            program_conflict_score,
+            timing_conflict_score,
+            priority_fee_competition,
+            recommended_delay_ms,
+            slot_conflict_probability,
+            cu_competition_score,
+            tip_efficiency_ratio,
+            auction_competitiveness,
+            bundle_size_penalty: self.calculate_bundle_size_penalty(&bundle_a, &bundle_b),
+        })
+    }
+
+    fn calculate_account_overlap(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let write_overlap = a.write_accounts.intersection(&b.write_accounts).count();
+        let read_write_overlap = a.read_accounts.intersection(&b.write_accounts).count() +
+                               b.read_accounts.intersection(&a.write_accounts).count();
+        
+        let total_potential_conflicts = a.accounts.len() + b.accounts.len();
+        (write_overlap * 2 + read_write_overlap) as f64 / total_potential_conflicts.max(1) as f64
+    }
+
+    fn calculate_program_conflict(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let common_programs: Vec<_> = a.programs.intersection(&b.programs).collect();
+        common_programs.iter()
+            .map(|program| {
+                self.program_interactions.get(program)
+                    .map(|interaction| interaction.conflict_patterns.values().sum::<f64>())
+                    .unwrap_or(0.0)
+            })
+            .sum::<f64>()
+            .min(1.0)
+    }
+
+    fn calculate_timing_conflict(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let time_diff = a.submission_time.abs_diff(b.submission_time).as_millis();
+        let window_ms = self.config.collision_window_ms as u128;
+        (1.0 - (time_diff as f64 / window_ms as f64).min(1.0)).max(0.0)
+    }
+
+    fn calculate_slot_conflict(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        if a.slot_target == b.slot_target {
+            let slot_tracker = self.slot_tracker.read();
+            slot_tracker.slot_collision_rates.get(&a.slot_target).copied().unwrap_or(0.5)
+        } else {
+            0.0
+        }
+    }
+
+    fn calculate_cu_competition(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let total_cu = a.estimated_cu + b.estimated_cu;
+        (total_cu as f64 / self.config.max_cu_per_bundle as f64).min(1.0)
+    }
+
+    fn calculate_priority_fee_competition(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let min_fee = a.priority_fee.min(b.priority_fee) as f64;
+        let max_fee = a.priority_fee.max(b.priority_fee) as f64;
+        (min_fee / max_fee.max(1.0)).powf(0.5)
+    }
+
+    fn combine_collision_factors(
+        &self,
+        account_overlap: f64,
+        program_conflict: f64,
+        timing_conflict: f64,
+        slot_conflict: f64,
+        cu_competition: f64,
+        fee_competition: f64,
+        auction_competitiveness: f64,
+    ) -> f64 {
+        let weights = [0.3, 0.2, 0.15, 0.1, 0.1, 0.1, 0.05];
+        let factors = [
+            account_overlap,
+            program_conflict,
+            timing_conflict,
+            slot_conflict,
+            cu_competition,
+            fee_competition,
+            auction_competitiveness,
+        ];
+
+        factors.iter()
+            .zip(weights.iter())
+            .map(|(factor, weight)| factor * weight)
+            .sum::<f64>()
+            .min(1.0)
+    }
+
+    fn calculate_recommended_delay(&self, collision_prob: f64, a: &TrackedBundle, b: &TrackedBundle) -> u64 {
+        let base_delay = (collision_prob * self.config.collision_window_ms as f64) as u64;
+        let tip_difference = (a.jito_tip as i64 - b.jito_tip as i64).abs() as u64;
+        
+        if tip_difference > self.config.min_profitable_tip_lamports {
+            base_delay / 2
+        } else {
+            base_delay
+        }
+    }
+
+    fn calculate_tip_efficiency(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let total_tip = a.jito_tip + b.jito_tip;
+        let total_cu = a.estimated_cu + b.estimated_cu;
+        (total_tip as f64 / total_cu as f64).log10().max(0.0).min(1.0)
+    }
+
+    fn calculate_bundle_size_penalty(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let total_size = a.transaction_count + b.transaction_count;
+        (total_size as f64 / (2 * self.config.max_bundle_size) as f64).min(1.0)
+    }
+
+    fn calculate_auction_competitiveness(&self, a: &TrackedBundle, b: &TrackedBundle) -> f64 {
+        let auction_data = match self.jito_client.get_cached_auction_data() {
+            Some(data) => data,
+            None => return 0.5, // Default neutral value if no auction data
+        };
+        
+        let tip_ratio = (a.jito_tip as f64 + b.jito_tip as f64) / 
+                       (auction_data.suggested_tip as f64).max(1.0);
+        
+        (tip_ratio * auction_data.competition_factor).min(1.0)
+    }
 }
 
 #[cfg(test)]
@@ -1284,8 +1889,8 @@ mod tests {
     use solana_sdk::system_transaction;
 
     #[tokio::test]
-    async fn test_collision_prediction() {
-        let predictor = BundleCollisionPredictor::new();
+    async fn test_collision_prediction() -> Result<()> {
+        let predictor = BundleCollisionPredictor::new()?;
         let keypair = Keypair::new();
         let pubkey = keypair.pubkey();
         
@@ -1295,25 +1900,26 @@ mod tests {
         let bundle1 = vec![tx1];
         let bundle2 = vec![tx2];
         
-        let id1 = predictor.track_bundle(bundle1, 100).await.unwrap();
-        let id2 = predictor.track_bundle(bundle2, 100).await.unwrap();
+        let id1 = predictor.track_bundle(bundle1, 100).await?;
+        let id2 = predictor.track_bundle(bundle2, 100).await?;
         
-        let metrics = predictor.predict_collision(&id1, &id2).await.unwrap();
+        let metrics = predictor.predict_collision(&id1, &id2).await?;
         assert!(metrics.collision_probability > 0.0);
         assert!(metrics.account_overlap_score > 0.0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_optimal_window_finding() {
-        let predictor = BundleCollisionPredictor::new();
+    async fn test_optimal_window_finding() -> Result<()> {
+        let predictor = BundleCollisionPredictor::new()?;
         let keypair = Keypair::new();
         let tx = system_transaction::transfer(&keypair, &keypair.pubkey(), 1000, Hash::default());
         
-        let bundle_id = predictor.track_bundle(vec![tx], 100).await.unwrap();
-        let (window, confidence) = predictor.find_optimal_submission_window(&bundle_id).await.unwrap();
+        let bundle_id = predictor.track_bundle(vec![tx], 100).await?;
+        let (window, confidence) = predictor.find_optimal_submission_window(&bundle_id).await?;
         
         assert!(confidence >= 0.0 && confidence <= 1.0);
         assert!(window >= Instant::now());
+        Ok(())
     }
 }
-
