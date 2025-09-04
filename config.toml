@@ -13,6 +13,11 @@ max_concurrent_requests = 100
 rate_limit_per_second = 50
 connection_pool_size = 10
 
+[general]
+rpc_url = "https://api.mainnet-beta.solana.com"
+keypair_path = "~/.config/solana/id.json"
+flash_loan_program = "FLASH_PROGRAM_ID"
+
 [trading]
 wallet_keypair_path = "./wallet.json"
 min_profit_bps = 30
@@ -44,6 +49,14 @@ enable_portfolio_hedging = true
 correlation_threshold = 0.7
 var_confidence_level = 0.95
 max_drawdown_percentage = 15.0
+min_profit_threshold = 1000000  # 0.01 SOL
+max_liquidation_size = 1000000000  # 10 SOL
+max_slippage = 0.05  # 5%
+
+[compute]
+unit_limit = 200000
+unit_price_max = 1000000
+priority_fee_multiplier = 1.5
 
 [fees]
 raydium_fee_bps = 25
@@ -68,6 +81,10 @@ enable_discord_webhook = false
 discord_webhook_url = ""
 performance_sample_size = 1000
 latency_threshold_ms = 100
+
+[metrics]
+listen_addr = "0.0.0.0:9090"
+namespace = "mev_bot"
 
 [execution]
 parallel_execution = true
@@ -157,3 +174,13 @@ jito = 10000
 flashbots = 15000
 
 [fees.custom_fee_markets]
+
+[[protocols]]
+name = "solend"
+program_id = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+adapter = "solend"
+
+[protocols.health_params]
+collateral_factor = 0.8
+liquidation_bonus = 0.05
+partial_step = 0.1
