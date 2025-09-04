@@ -601,3 +601,92 @@ pub struct PrelaunchOracleParams {
     pub price: Option<i64>,
     pub max_price: Option<i64>,
 }
+
+use pyth_client::Price as PythPrice;
+use tokio::sync::RwLock;
+use tokio_tungstenite::connect_async;
+use solana_sdk::pubkey::Pubkey;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub struct Oracle {
+    prices: Arc<RwLock<HashMap<Pubkey, (u64, u64)>>>,
+    health_cohorts: Arc<RwLock<HashMap<Pubkey, f64>>>,
+}
+
+impl Oracle {
+    pub fn new() -> Self {
+        Self {
+            prices: Arc::new(RwLock::new(HashMap::new())),
+            health_cohorts: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn spawn_ws(&self, ws_url: &str) -> tokio::task::JoinHandle<()> {
+        let prices = self.prices.clone();
+        
+        tokio::spawn(async move {
+            let (mut ws_stream, _) = connect_async(ws_url)
+                .await
+                .expect("Failed to connect to WebSocket");
+            
+            // Subscribe to relevant accounts
+            // ...
+            
+            while let Some(msg) = ws_stream.next().await {
+                if let Ok(msg) = msg {
+                    if let tungstenite::Message::Text(text) = msg {
+                        self.parse_ws_message(text).await;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn parse_ws_message(&self, text: String) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Some(price_data) = value.get("data") {
+                if let (Some(pubkey_str), Some(price), Some(conf)) = (
+                    value.get("account").and_then(|v| v.as_str()),
+                    price_data.get("price").and_then(|v| v.as_f64()),
+                    price_data.get("conf").and_then(|v| v.as_f64()),
+                ) {
+                    if let Ok(pubkey) = pubkey_str.parse::<Pubkey>() {
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        
+                        let mut prices = self.prices.write().await;
+                        prices.insert(
+                            pubkey,
+                            (price as u64, conf as u64)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_price(&self, key: &Pubkey) -> Option<(u64, u64)> {
+        self.prices.read().await.get(key).cloned()
+    }
+
+    pub async fn update_health_cohorts(&self, accounts: &[Pubkey], health_scores: &[f64]) {
+        let mut cohorts = self.health_cohorts.write().await;
+        for (account, score) in accounts.iter().zip(health_scores.iter()) {
+            cohorts.insert(*account, *score);
+        }
+    }
+
+    pub async fn get_cohort(&self, account: &Pubkey) -> Option<f64> {
+        self.health_cohorts.read().await.get(account).cloned()
+    }
+}
