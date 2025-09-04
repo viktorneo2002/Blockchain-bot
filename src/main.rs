@@ -1,503 +1,786 @@
-use solana_mev_bot::{
-    core::{
-        config_manager::ConfigManager,
-        flash_loan_orchestrator::{FlashLoanConfig, FlashLoanOrchestrator},
-        risk_manager::{RiskManager, RiskManagerConfig},
-    },
-    flashloan_mev_apocalypse::frontrun_flashloan_weaponizer::FrontrunFlashLoanWeaponizer,
-    monitoring::{
-        health_monitor::{HealthMonitor, HealthMonitorConfig},
-        metrics_collector::MetricsCollector,
-    },
-    solana_flashloan_domination::solend_kamino_port_optimizer::PortOptimizer,
-    strategies::{KalmanOUStrategy, FlashloanITOStrategy},
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{
+    instruction::Instruction,
+    pubkey::Pubkey,
+    system_program,
+    sysvar,
 };
-
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use backoff::{future::retry, ExponentialBackoff};
-use dashmap::DashMap;
 use solana_client::{
-    nonblocking::rpc_client::RpcClient as AsyncRpcClient, rpc_client::RpcClient,
-    rpc_config::RpcConfig,
+    nonblocking::rpc_client::RpcClient,
+    rpc_config::{RpcSimulateTransactionConfig, RpcTransactionConfig},
 };
 use solana_sdk::{
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-    pubkey::Pubkey,
-    signature::{read_keypair_file, Keypair},
+    commitment_config::CommitmentConfig,
+    compute_budget::ComputeBudgetInstruction,
+    signature::{Keypair, Signature},
+    signer::Signer,
+    transaction::Transaction,
 };
-use std::collections::HashMap;
-use std::str::FromStr;
 use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
+    collections::{BinaryHeap, HashMap, HashSet},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use tokio::{
-    sync::{broadcast, mpsc, RwLock, Semaphore},
-    task::JoinSet,
-    time::{interval, timeout},
-};
-use tracing::{debug, error, info, warn};
-use tracing_subscriber::{
-    fmt::time::ChronoLocal, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
-};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use borsh::{BorshDeserialize, BorshSerialize};
+use rust_decimal::prelude::*;
+use serde::{Deserialize, Serialize};
 
-// Strategy trait that all strategies must implement
-#[async_trait::async_trait]
-trait Strategy: Send + Sync {
-    fn name(&self) -> &str;
-    async fn run(&self) -> Result<()>;
-    async fn shutdown(&self) -> Result<()>;
+const MAX_LIQUIDATION_SIZE: u64 = 10_000_000_000;
+const MIN_PROFIT_THRESHOLD: u64 = 1_000_000;
+const COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+const COMPUTE_UNIT_PRICE: u64 = 50_000;
+const MAX_CASCADE_DEPTH: usize = 8;
+const LIQUIDATION_DISCOUNT: f64 = 0.05;
+const FLASH_LOAN_FEE: f64 = 0.0009;
+const MAX_SLIPPAGE: f64 = 0.02;
+const PRIORITY_FEE_PERCENTILE: f64 = 0.95;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiquidationOpportunity {
+    pub account: Pubkey,
+    pub protocol: ProtocolType,
+    pub collateral_value: u64,
+    pub debt_value: u64,
+    pub liquidation_bonus: u64,
+    pub health_factor: f64,
+    pub timestamp: u64,
+    pub priority_score: f64,
 }
 
-// Configuration structures for strategies
-struct FrontrunConfig {
-    rpc_pool: Arc<RpcPool>,
-    authority: Arc<Keypair>,
-    min_profit_threshold: u16,
-    max_priority_fee: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtocolType {
+    Mango,
+    Solend,
+    MarginFi,
+    Kamino,
+    DriftV2,
 }
 
-struct PortOptimizerConfig {
-    rpc_pool: Arc<RpcPool>,
-    authority: Arc<Keypair>,
-    max_leverage: f64,
-    rebalance_threshold_bps: u16,
-}
-
-// Implement Strategy trait for our strategies
-#[async_trait::async_trait]
-impl Strategy for FrontrunFlashLoanWeaponizer {
-    fn name(&self) -> &str {
-        "FrontrunFlashLoanWeaponizer"
-    }
-
-    async fn run(&self) -> Result<()> {
-        self.monitor_transactions().await
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        self.shutdown().await
-    }
-}
-
-#[async_trait::async_trait]
-impl Strategy for PortOptimizer {
-    fn name(&self) -> &str {
-        "PortOptimizer"
-    }
-
-    async fn run(&self) -> Result<()> {
-        self.run_optimization_loop().await
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        self.shutdown().await
-    }
-}
-
-// Health check response structure
 #[derive(Debug, Clone)]
-struct HealthStatus {
-    is_healthy: bool,
-    is_critical: bool,
-    issues: Vec<String>,
-    memory_usage_mb: u64,
-    cpu_usage_percent: f32,
-    active_positions: u64,
-    rpc_latency_ms: u64,
+pub struct CascadePath {
+    pub opportunities: Vec<LiquidationOpportunity>,
+    pub total_profit: u64,
+    pub required_capital: u64,
+    pub execution_cost: u64,
+    pub risk_score: f64,
 }
 
-// Extension methods for HealthMonitor
-impl HealthMonitor {
-    async fn check_health(&self) -> HealthStatus {
-        let memory_info = match sys_info::mem_info() {
-            Ok(info) => {
-                let used_mb = (info.total - info.free) / 1024;
-                let total_mb = info.total / 1024;
-                (used_mb, total_mb)
-            }
-            Err(_) => (0, 0),
-        };
+#[derive(Debug)]
+pub struct LeverageCascadeOptimizer {
+    rpc_client: Arc<RpcClient>,
+    keypair: Arc<Keypair>,
+    opportunities: Arc<RwLock<HashMap<Pubkey, LiquidationOpportunity>>>,
+    cascade_paths: Arc<RwLock<BinaryHeap<CascadePath>>>,
+    execution_semaphore: Arc<Semaphore>,
+    oracle_cache: Arc<RwLock<HashMap<Pubkey, OraclePrice>>>,
+}
 
-        let cpu_usage = match sys_info::loadavg() {
-            Ok(load) => (load.one * 100.0) as f32,
-            Err(_) => 0.0,
-        };
+#[derive(Debug, Clone)]
+struct OraclePrice {
+    price: u64,
+    confidence: u64,
+    timestamp: u64,
+}
 
-        let mut issues = Vec::new();
-        let mut is_critical = false;
-
-        // Check memory usage
-        if memory_info.1 > 0 && memory_info.0 > (memory_info.1 * 90 / 100) {
-            issues.push(format!(
-                "High memory usage: {}MB / {}MB",
-                memory_info.0, memory_info.1
-            ));
-            is_critical = true;
-        }
-
-        // Check CPU usage
-        if cpu_usage > 90.0 {
-            issues.push(format!("High CPU usage: {:.1}%", cpu_usage));
-        }
-
-        // Check if we have active RPC connections
-        let rpc_healthy = self
-            .last_rpc_check()
-            .map(|instant| instant.elapsed() < Duration::from_secs(60))
-            .unwrap_or(false);
-
-        if !rpc_healthy {
-            issues.push("RPC connection unhealthy".to_string());
-            is_critical = true;
-        }
-
-        HealthStatus {
-            is_healthy: issues.is_empty(),
-            is_critical,
-            issues,
-            memory_usage_mb: memory_info.0,
-            cpu_usage_percent: cpu_usage,
-            active_positions: self.get_active_positions(),
-            rpc_latency_ms: self.get_rpc_latency_ms(),
-        }
+impl Ord for CascadePath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_score = (self.total_profit as f64) / (self.risk_score + 1.0);
+        let other_score = (other.total_profit as f64) / (other.risk_score + 1.0);
+        self_score.partial_cmp(&other_score).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
-// Panic handler for production
-fn install_panic_handler() {
-    let default_panic = std::panic::take_hook();
+impl PartialOrd for CascadePath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("unknown");
+impl PartialEq for CascadePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.total_profit == other.total_profit && self.risk_score == other.risk_score
+    }
+}
 
-        let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            s
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            s
+impl Eq for CascadePath {}
+
+impl LeverageCascadeOptimizer {
+    pub fn new(rpc_url: String, keypair: Keypair) -> Self {
+        let rpc_client = Arc::new(RpcClient::new_with_commitment(
+            rpc_url,
+            CommitmentConfig::confirmed(),
+        ));
+
+        Self {
+            rpc_client,
+            keypair: Arc::new(keypair),
+            opportunities: Arc::new(RwLock::new(HashMap::new())),
+            cascade_paths: Arc::new(RwLock::new(BinaryHeap::new())),
+            execution_semaphore: Arc::new(Semaphore::new(3)),
+            oracle_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (tx, mut rx) = mpsc::channel::<LiquidationOpportunity>(1000);
+        
+        let scanner_handle = tokio::spawn({
+            let optimizer = self.clone();
+            async move {
+                optimizer.scan_liquidation_opportunities(tx).await
+            }
+        });
+
+        let optimizer_handle = tokio::spawn({
+            let optimizer = self.clone();
+            async move {
+                optimizer.optimize_cascade_paths().await
+            }
+        });
+
+        let executor_handle = tokio::spawn({
+            let optimizer = self.clone();
+            async move {
+                optimizer.execute_cascades().await
+            }
+        });
+
+        tokio::select! {
+            _ = scanner_handle => {},
+            _ = optimizer_handle => {},
+            _ = executor_handle => {},
+        }
+
+        Ok(())
+    }
+
+    async fn scan_liquidation_opportunities(
+        &self,
+        tx: mpsc::Sender<LiquidationOpportunity>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let protocols = vec![
+            ProtocolType::Mango,
+            ProtocolType::Solend,
+            ProtocolType::MarginFi,
+            ProtocolType::Kamino,
+            ProtocolType::DriftV2,
+        ];
+
+        loop {
+            for protocol in &protocols {
+                match self.scan_protocol_accounts(*protocol).await {
+                    Ok(opportunities) => {
+                        for opp in opportunities {
+                            if opp.health_factor < 1.0 && opp.liquidation_bonus > MIN_PROFIT_THRESHOLD {
+                                let _ = tx.send(opp.clone()).await;
+                                self.opportunities.write().unwrap().insert(opp.account, opp);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error scanning protocol {:?}: {}", protocol, e);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn scan_protocol_accounts(
+        &self,
+        protocol: ProtocolType,
+    ) -> Result<Vec<LiquidationOpportunity>, Box<dyn std::error::Error + Send + Sync>> {
+        let program_id = self.get_protocol_program_id(protocol);
+        let accounts = self.rpc_client.get_program_accounts(&program_id).await?;
+        
+        let mut opportunities = Vec::new();
+        
+        for (pubkey, account) in accounts {
+            if let Some(opportunity) = self.parse_liquidation_opportunity(pubkey, account, protocol).await {
+                opportunities.push(opportunity);
+            }
+        }
+        
+        Ok(opportunities)
+    }
+
+    async fn parse_liquidation_opportunity(
+        &self,
+        account: Pubkey,
+        data: solana_sdk::account::Account,
+        protocol: ProtocolType,
+    ) -> Option<LiquidationOpportunity> {
+        let health = self.calculate_account_health(&data.data, protocol).await?;
+        
+        if health.health_factor >= 1.0 {
+            return None;
+        }
+
+        let liquidation_bonus = self.calculate_liquidation_bonus(
+            health.collateral_value,
+            health.debt_value,
+            protocol,
+        );
+
+        Some(LiquidationOpportunity {
+            account,
+            protocol,
+            collateral_value: health.collateral_value,
+            debt_value: health.debt_value,
+            liquidation_bonus,
+            health_factor: health.health_factor,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            priority_score: self.calculate_priority_score(&health, liquidation_bonus),
+        })
+    }
+
+    async fn calculate_account_health(
+        &self,
+        data: &[u8],
+        protocol: ProtocolType,
+    ) -> Option<AccountHealth> {
+        match protocol {
+            ProtocolType::Mango => self.parse_mango_health(data).await,
+            ProtocolType::Solend => self.parse_solend_health(data).await,
+            ProtocolType::MarginFi => self.parse_marginfi_health(data).await,
+            ProtocolType::Kamino => self.parse_kamino_health(data).await,
+            ProtocolType::DriftV2 => self.parse_drift_health(data).await,
+        }
+    }
+
+    async fn parse_mango_health(&self, data: &[u8]) -> Option<AccountHealth> {
+        if data.len() < 200 {
+            return None;
+        }
+        
+        let collateral_value = u64::from_le_bytes(data[32..40].try_into().ok()?);
+        let debt_value = u64::from_le_bytes(data[40..48].try_into().ok()?);
+        let health_factor = if debt_value > 0 {
+            (collateral_value as f64 * 0.85) / debt_value as f64
         } else {
-            "unknown panic"
+            f64::MAX
         };
 
-        let location = if let Some(location) = panic_info.location() {
-            format!(
-                "{}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
+        Some(AccountHealth {
+            collateral_value,
+            debt_value,
+            health_factor,
+        })
+    }
+
+    async fn parse_solend_health(&self, data: &[u8]) -> Option<AccountHealth> {
+        if data.len() < 180 {
+            return None;
+        }
+        
+        let collateral_value = u64::from_le_bytes(data[48..56].try_into().ok()?);
+        let debt_value = u64::from_le_bytes(data[56..64].try_into().ok()?);
+        let health_factor = if debt_value > 0 {
+            (collateral_value as f64 * 0.8) / debt_value as f64
+        } else {
+            f64::MAX
+        };
+
+        Some(AccountHealth {
+            collateral_value,
+            debt_value,
+            health_factor,
+        })
+    }
+
+    async fn parse_marginfi_health(&self, data: &[u8]) -> Option<AccountHealth> {
+        if data.len() < 256 {
+            return None;
+        }
+        
+        let collateral_value = u64::from_le_bytes(data[64..72].try_into().ok()?);
+        let debt_value = u64::from_le_bytes(data[72..80].try_into().ok()?);
+        let health_factor = if debt_value > 0 {
+            (collateral_value as f64 * 0.82) / debt_value as f64
+        } else {
+            f64::MAX
+        };
+
+        Some(AccountHealth {
+            collateral_value,
+            debt_value,
+            health_factor,
+        })
+    }
+
+    async fn parse_kamino_health(&self, data: &[u8]) -> Option<AccountHealth> {
+        if data.len() < 240 {
+            return None;
+        }
+        
+        let collateral_value = u64::from_le_bytes(data[80..88].try_into().ok()?);
+        let debt_value = u64::from_le_bytes(data[88..96].try_into().ok()?);
+        let health_factor = if debt_value > 0 {
+            (collateral_value as f64 * 0.83) / debt_value as f64
+        } else {
+            f64::MAX
+        };
+
+        Some(AccountHealth {
+            collateral_value,
+            debt_value,
+            health_factor,
+        })
+    }
+
+    async fn parse_drift_health(&self, data: &[u8]) -> Option<AccountHealth> {
+        if data.len() < 300 {
+            return None;
+        }
+        
+        let collateral_value = u64::from_le_bytes(data[96..104].try_into().ok()?);
+        let debt_value = u64::from_le_bytes(data[104..112].try_into().ok()?);
+        let health_factor = if debt_value > 0 {
+            (collateral_value as f64 * 0.875) / debt_value as f64
+        } else {
+            f64::MAX
+        };
+
+        Some(AccountHealth {
+            collateral_value,
+            debt_value,
+            health_factor,
+        })
+    }
+
+    fn calculate_liquidation_bonus(
+        &self,
+        collateral_value: u64,
+        debt_value: u64,
+        protocol: ProtocolType,
+    ) -> u64 {
+        let base_bonus = match protocol {
+            ProtocolType::Mango => 0.05,
+            ProtocolType::Solend => 0.05,
+            ProtocolType::MarginFi => 0.025,
+            ProtocolType::Kamino => 0.04,
+            ProtocolType::DriftV2 => 0.025,
+        };
+        
+        let liquidatable_amount = collateral_value.min(debt_value);
+        ((liquidatable_amount as f64) * base_bonus) as u64
+    }
+
+    fn calculate_priority_score(&self, health: &AccountHealth, bonus: u64) -> f64 {
+        let urgency = 1.0 / (health.health_factor + 0.01);
+        let profitability = bonus as f64 / 1_000_000.0;
+        let size_factor = (health.debt_value as f64).ln() / 10.0;
+        
+                urgency * profitability * size_factor
+    }
+
+    async fn optimize_cascade_paths(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            let opportunities = self.opportunities.read().unwrap().clone();
+            if opportunities.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            let mut cascade_paths = Vec::new();
+            let mut visited = HashSet::new();
+
+            for (_, start_opp) in opportunities.iter() {
+                if visited.contains(&start_opp.account) {
+                    continue;
+                }
+
+                let path = self.build_cascade_path(start_opp, &opportunities, &mut visited).await;
+                if path.total_profit > MIN_PROFIT_THRESHOLD {
+                    cascade_paths.push(path);
+                }
+            }
+
+            cascade_paths.sort_by(|a, b| b.cmp(a));
+            let top_paths: BinaryHeap<_> = cascade_paths.into_iter().take(10).collect();
+            
+            *self.cascade_paths.write().unwrap() = top_paths;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn build_cascade_path(
+        &self,
+        start: &LiquidationOpportunity,
+        opportunities: &HashMap<Pubkey, LiquidationOpportunity>,
+        visited: &mut HashSet<Pubkey>,
+    ) -> CascadePath {
+        let mut path = vec![start.clone()];
+        let mut total_profit = start.liquidation_bonus;
+        let mut required_capital = start.debt_value;
+        let mut current = start.clone();
+        
+        visited.insert(start.account);
+
+        for _ in 1..MAX_CASCADE_DEPTH {
+            if let Some(next) = self.find_next_cascade(&current, opportunities, visited).await {
+                let cascade_profit = self.calculate_cascade_profit(&current, &next);
+                
+                if cascade_profit > 0 {
+                    total_profit += cascade_profit;
+                    required_capital = required_capital.max(next.debt_value);
+                    visited.insert(next.account);
+                    path.push(next.clone());
+                    current = next;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let execution_cost = self.calculate_execution_cost(&path);
+        let risk_score = self.calculate_risk_score(&path, required_capital);
+
+        CascadePath {
+            opportunities: path,
+            total_profit: total_profit.saturating_sub(execution_cost),
+            required_capital,
+            execution_cost,
+            risk_score,
+        }
+    }
+
+    async fn find_next_cascade(
+        &self,
+        current: &LiquidationOpportunity,
+        opportunities: &HashMap<Pubkey, LiquidationOpportunity>,
+        visited: &HashSet<Pubkey>,
+    ) -> Option<LiquidationOpportunity> {
+        opportunities
+            .values()
+            .filter(|opp| {
+                !visited.contains(&opp.account) &&
+                opp.protocol == current.protocol &&
+                opp.health_factor < 1.0 &&
+                self.can_cascade(current, opp)
+            })
+            .max_by(|a, b| {
+                a.priority_score.partial_cmp(&b.priority_score).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
+    }
+
+    fn can_cascade(&self, from: &LiquidationOpportunity, to: &LiquidationOpportunity) -> bool {
+        let time_diff = to.timestamp.saturating_sub(from.timestamp);
+        time_diff < 60 && 
+        to.debt_value <= from.collateral_value * 2 &&
+        to.health_factor < from.health_factor + 0.1
+    }
+
+    fn calculate_cascade_profit(
+        &self,
+        from: &LiquidationOpportunity,
+        to: &LiquidationOpportunity,
+    ) -> u64 {
+        let cascade_bonus = ((to.debt_value as f64) * LIQUIDATION_DISCOUNT * 0.8) as u64;
+        let flash_loan_cost = ((to.debt_value as f64) * FLASH_LOAN_FEE) as u64;
+        cascade_bonus.saturating_sub(flash_loan_cost)
+    }
+
+    fn calculate_execution_cost(&self, path: &[LiquidationOpportunity]) -> u64 {
+        let base_tx_cost = 5000 * path.len() as u64;
+        let compute_cost = COMPUTE_UNIT_PRICE * path.len() as u64;
+        let priority_fee = 100_000 * path.len() as u64;
+        base_tx_cost + compute_cost + priority_fee
+    }
+
+    fn calculate_risk_score(&self, path: &[LiquidationOpportunity], capital: u64) -> f64 {
+        let depth_risk = (path.len() as f64) * 0.1;
+        let capital_risk = (capital as f64 / MAX_LIQUIDATION_SIZE as f64).min(1.0);
+        let timing_risk = path.iter()
+            .map(|opp| 1.0 - opp.health_factor)
+            .sum::<f64>() / path.len() as f64;
+        
+        depth_risk + capital_risk + timing_risk
+    }
+
+    async fn execute_cascades(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            let path = {
+                let mut paths = self.cascade_paths.write().unwrap();
+                paths.pop()
+            };
+
+            if let Some(cascade_path) = path {
+                if cascade_path.total_profit > MIN_PROFIT_THRESHOLD {
+                    let permit = self.execution_semaphore.acquire().await.unwrap();
+                    tokio::spawn({
+                        let optimizer = self.clone();
+                        let path = cascade_path.clone();
+                        async move {
+                            let result = optimizer.execute_cascade_path(path).await;
+                            drop(permit);
+                            if let Err(e) = result {
+                                eprintln!("Cascade execution error: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
+            
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn execute_cascade_path(
+        &self,
+        path: CascadePath,
+    ) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
+        let flash_loan_ix = self.build_flash_loan_instruction(path.required_capital).await?;
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
+            ComputeBudgetInstruction::set_compute_unit_price(COMPUTE_UNIT_PRICE),
+            flash_loan_ix,
+        ];
+
+        for opportunity in &path.opportunities {
+            let liquidation_ix = self.build_liquidation_instruction(opportunity).await?;
+            instructions.push(liquidation_ix);
+        }
+
+        let repay_ix = self.build_flash_loan_repay_instruction(path.required_capital).await?;
+        instructions.push(repay_ix);
+
+        let recent_blockhash = self.rpc_client.get_latest_blockhash().await?;
+        let transaction = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&self.keypair.pubkey()),
+            &[&*self.keypair],
+            recent_blockhash,
+        );
+
+        let config = RpcSimulateTransactionConfig {
+            sig_verify: true,
+            replace_recent_blockhash: true,
+            commitment: Some(CommitmentConfig::confirmed()),
+            ..Default::default()
+        };
+
+        let simulation = self.rpc_client.simulate_transaction_with_config(&transaction, config).await?;
+        
+        if simulation.value.err.is_some() {
+            return Err("Simulation failed".into());
+        }
+
+        let signature = self.rpc_client
+            .send_and_confirm_transaction_with_spinner_and_config(
+                &transaction,
+                CommitmentConfig::confirmed(),
+                RpcTransactionConfig {
+                    skip_preflight: true,
+                    ..Default::default()
+                },
             )
-        } else {
-            "unknown location".to_string()
+            .await?;
+
+        Ok(signature)
+    }
+
+    async fn build_flash_loan_instruction(&self, amount: u64) -> Result<Instruction, Box<dyn std::error::Error + Send + Sync>> {
+        let flash_loan_program = Pubkey::from_str("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo")?;
+        let (pool_pda, _) = Pubkey::find_program_address(&[b"pool"], &flash_loan_program);
+        
+        let accounts = vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(pool_pda, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ];
+
+        let data = FlashLoanInstruction::Borrow { amount }.try_to_vec()?;
+        
+        Ok(Instruction::new_with_bytes(flash_loan_program, &data, accounts))
+    }
+
+    async fn build_liquidation_instruction(
+        &self,
+        opportunity: &LiquidationOpportunity,
+    ) -> Result<Instruction, Box<dyn std::error::Error + Send + Sync>> {
+        let program_id = self.get_protocol_program_id(opportunity.protocol);
+        
+        let accounts = match opportunity.protocol {
+            ProtocolType::Mango => self.build_mango_liquidation_accounts(opportunity),
+            ProtocolType::Solend => self.build_solend_liquidation_accounts(opportunity),
+            ProtocolType::MarginFi => self.build_marginfi_liquidation_accounts(opportunity),
+            ProtocolType::Kamino => self.build_kamino_liquidation_accounts(opportunity),
+            ProtocolType::DriftV2 => self.build_drift_liquidation_accounts(opportunity),
         };
 
-        error!("PANIC in thread '{}' at {}: {}", thread_name, location, msg);
+        let data = LiquidateInstruction {
+            amount: opportunity.debt_value,
+            min_collateral: (opportunity.collateral_value as f64 * (1.0 - MAX_SLIPPAGE)) as u64,
+        }.try_to_vec()?;
 
-        // Call the default panic handler
-        default_panic(panic_info);
-
-        // Force exit to prevent zombie process
-        std::process::exit(1);
-    }));
-}
-
-// Signal handler for graceful shutdown
-fn install_signal_handlers() -> Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let mut sighup = signal(SignalKind::hangup())?;
-
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM, initiating shutdown");
-                }
-                _ = sighup.recv() => {
-                    info!("Received SIGHUP, reloading configuration");
-                }
-            }
-        });
+        Ok(Instruction::new_with_bytes(program_id, &data, accounts))
     }
 
-    Ok(())
+    async fn build_flash_loan_repay_instruction(&self, amount: u64) -> Result<Instruction, Box<dyn std::error::Error + Send + Sync>> {
+        let flash_loan_program = Pubkey::from_str("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo")?;
+        let (pool_pda, _) = Pubkey::find_program_address(&[b"pool"], &flash_loan_program);
+        
+        let repay_amount = ((amount as f64) * (1.0 + FLASH_LOAN_FEE)) as u64;
+        
+        let accounts = vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(pool_pda, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ];
+
+        let data = FlashLoanInstruction::Repay { amount: repay_amount }.try_to_vec()?;
+        
+        Ok(Instruction::new_with_bytes(flash_loan_program, &data, accounts))
+    }
+
+    fn get_protocol_program_id(&self, protocol: ProtocolType) -> Pubkey {
+        match protocol {
+            ProtocolType::Mango => Pubkey::from_str("4MangoMjqJ2firMokCjjGgoK8d4MXcrgL7XJaL3w6fVg").unwrap(),
+            ProtocolType::Solend => Pubkey::from_str("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo").unwrap(),
+            ProtocolType::MarginFi => Pubkey::from_str("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA").unwrap(),
+            ProtocolType::Kamino => Pubkey::from_str("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD").unwrap(),
+            ProtocolType::DriftV2 => Pubkey::from_str("dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH").unwrap(),
+        }
+    }
+
+    fn build_mango_liquidation_accounts(&self, opp: &LiquidationOpportunity) -> Vec<solana_sdk::instruction::AccountMeta> {
+        vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(opp.account, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(system_program::id(), false),
+        ]
+    }
+
+    fn build_solend_liquidation_accounts(&self, opp: &LiquidationOpportunity) -> Vec<solana_sdk::instruction::AccountMeta> {
+        vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(opp.account, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ]
+    }
+
+    fn build_marginfi_liquidation_accounts(&self, opp: &LiquidationOpportunity) -> Vec<solana_sdk::instruction::AccountMeta> {
+        vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(opp.account, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(system_program::id(), false),
+        ]
+    }
+
+        fn build_kamino_liquidation_accounts(&self, opp: &LiquidationOpportunity) -> Vec<solana_sdk::instruction::AccountMeta> {
+        vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(opp.account, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(system_program::id(), false),
+            solana_sdk::instruction::AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ]
+    }
+
+    fn build_drift_liquidation_accounts(&self, opp: &LiquidationOpportunity) -> Vec<solana_sdk::instruction::AccountMeta> {
+        vec![
+            solana_sdk::instruction::AccountMeta::new(self.keypair.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(opp.account, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(system_program::id(), false),
+            solana_sdk::instruction::AccountMeta::new_readonly(sysvar::rent::id(), false),
+        ]
+    }
 }
 
-// Pre-flight checks before starting the bot
-async fn preflight_checks(config: &solana_mev_bot::core::config::Config) -> Result<()> {
-    info!("Running pre-flight checks...");
+impl Clone for LeverageCascadeOptimizer {
+    fn clone(&self) -> Self {
+        Self {
+            rpc_client: self.rpc_client.clone(),
+            keypair: self.keypair.clone(),
+            opportunities: self.opportunities.clone(),
+            cascade_paths: self.cascade_paths.clone(),
+            execution_semaphore: self.execution_semaphore.clone(),
+            oracle_cache: self.oracle_cache.clone(),
+        }
+    }
+}
 
-    // Check disk space
-    let disk_stats = fs2::statvfs::statvfs(".")?;
-    let available_gb = (disk_stats.available_space() / 1_073_741_824) as u64;
-    if available_gb < 10 {
-        anyhow::bail!(
-            "Insufficient disk space: {}GB available, need at least 10GB",
-            available_gb
+#[derive(Debug, Clone)]
+struct AccountHealth {
+    collateral_value: u64,
+    debt_value: u64,
+    health_factor: f64,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+enum FlashLoanInstruction {
+    Borrow { amount: u64 },
+    Repay { amount: u64 },
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+struct LiquidateInstruction {
+    amount: u64,
+    min_collateral: u64,
+}
+
+use std::str::FromStr;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::signature::Keypair;
+
+    #[tokio::test]
+    async fn test_priority_score_calculation() {
+        let optimizer = LeverageCascadeOptimizer::new(
+            "https://api.mainnet-beta.solana.com".to_string(),
+            Keypair::new(),
         );
+
+        let health = AccountHealth {
+            collateral_value: 1_000_000_000,
+            debt_value: 950_000_000,
+            health_factor: 0.95,
+        };
+
+        let score = optimizer.calculate_priority_score(&health, 50_000_000);
+        assert!(score > 0.0);
     }
 
-    // Check memory
-    let mem_info = sys_info::mem_info()?;
-    let available_mb = mem_info.avail / 1024;
-    if available_mb < 4096 {
-        anyhow::bail!(
-            "Insufficient memory: {}MB available, need at least 4GB",
-            available_mb
+    #[tokio::test]
+    async fn test_cascade_profit_calculation() {
+        let optimizer = LeverageCascadeOptimizer::new(
+            "https://api.mainnet-beta.solana.com".to_string(),
+            Keypair::new(),
         );
-    }
 
-    // Verify network connectivity
-    let test_client =
-        RpcClient::new_with_timeout(config.network.primary_rpc.clone(), Duration::from_secs(5));
+        let from = LiquidationOpportunity {
+            account: Pubkey::new_unique(),
+            protocol: ProtocolType::Mango,
+            collateral_value: 2_000_000_000,
+            debt_value: 1_800_000_000,
+            liquidation_bonus: 90_000_000,
+            health_factor: 0.9,
+            timestamp: 1000,
+            priority_score: 10.0,
+        };
 
-    match test_client.get_version() {
-        Ok(version) => {
-            info!("Connected to Solana cluster: {}", version.solana_core);
-        }
-        Err(e) => {
-            anyhow::bail!("Failed to connect to Solana RPC: {:?}", e);
-        }
-    }
+        let to = LiquidationOpportunity {
+            account: Pubkey::new_unique(),
+            protocol: ProtocolType::Mango,
+            collateral_value: 1_500_000_000,
+            debt_value: 1_400_000_000,
+            liquidation_bonus: 70_000_000,
+            health_factor: 0.92,
+            timestamp: 1010,
+            priority_score: 8.0,
+        };
 
-    // Check required programs exist
-    let required_programs = vec![
-        "So11111111111111111111111111111111111111112", // Wrapped SOL
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token Program
-        "11111111111111111111111111111111",            // System Program
-    ];
-
-    for program_str in required_programs {
-        let program_id = program_str.parse::<solana_sdk::pubkey::Pubkey>()?;
-        match test_client.get_account(&program_id) {
-            Ok(account) => {
-                if !account.executable {
-                    anyhow::bail!("Required program {} is not executable", program_str);
-                }
-            }
-            Err(e) => {
-                anyhow::bail!("Failed to verify program {}: {:?}", program_str, e);
-            }
-        }
-    }
-
-    info!("Pre-flight checks passed");
-    Ok(())
-}
-
-// Entry point wrapper with panic protection
-fn main() {
-    install_panic_handler();
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(num_cpus::get())
-        .thread_name("mev-bot-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime");
-
-    let result = runtime.block_on(async {
-        if let Err(e) = install_signal_handlers() {
-            eprintln!("Failed to install signal handlers: {:?}", e);
-            return Err(e);
-        }
-
-        // Load config first for pre-flight checks
-        let config_path =
-            std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-
-        let (config_manager, _) = ConfigManager::with_hot_reload(config_path)?;
-        let config = config_manager.get_config();
-
-        // Run pre-flight checks
-        if let Err(e) = preflight_checks(&config).await {
-            eprintln!("Pre-flight checks failed: {:?}", e);
-            return Err(e);
-        }
-
-        // Run the main async function
-        main_async().await
-    });
-
-    match result {
-        Ok(()) => {
-            info!("MEV bot exited successfully");
-            std::process::exit(0);
-        }
-        Err(e) => {
-            error!("MEV bot failed: {:?}", e);
-            std::process::exit(1);
-        }
+        let profit = optimizer.calculate_cascade_profit(&from, &to);
+        assert!(profit > 0);
     }
 }
 
-// Rename the original main to main_async
-async fn main_async() -> Result<()> {
-    // The entire original main function content goes here
-    // (Everything from the tracing_subscriber initialization to the final Ok(()))
-
-    // Initialize structured logging with timestamps
-    tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "solana_mev_bot=info,tower_abci=warn".into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(ChronoLocal::rfc_3339())
-                .with_thread_ids(true)
-                .with_thread_names(true),
-        )
-        .init();
-
-    // Load configuration
-    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-    let (config_manager, _) = ConfigManager::with_hot_reload(config_path)?;
-    let config = config_manager.get_config();
-
-    // Initialize RPC client
-    let rpc_client = Arc::new(AsyncRpcClient::new_with_commitment(
-        config.network.primary_rpc.clone(),
-        CommitmentConfig::confirmed(),
-    ));
-
-    // Load wallet
-    let wallet_path = config.wallet.keypair_path.clone();
-    let wallet = Arc::new(read_keypair_file(&wallet_path).context("Failed to read keypair file")?);
-
-    // Initialize strategies
-    let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
-    
-    // Add our Kalman-O-U strategy
-    let kalman_ou_strategy = Box::new(KalmanOUStrategy::new(
-        rpc_client.clone(),
-        wallet.clone(),
-    )?);
-    strategies.push(kalman_ou_strategy);
-
-    // Add Flashloan ITO strategy
-    let flashloan_config = config_manager.get_dex_pools_config()?;
-    let flashloan_orchestrator = Arc::new(FlashLoanOrchestrator::new(
-        FlashLoanConfig {
-            max_loan_amount: 1_000_000_000, // 1000 SOL in lamports
-            min_profit_threshold: 1_000_000, // 0.001 SOL in lamports
-            max_slippage_bps: 50, // 0.5%
-            emergency_shutdown_loss: 10_000_000, // 0.01 SOL in lamports
-            rpc_client: rpc_client.clone(),
-            authority: wallet.clone(),
-        },
-        Arc::new(RiskManager::new(RiskManagerConfig::default())),
-        health_monitor.clone(),
-    ));
-    
-    // Parse ITO addresses from config
-    let ito_addresses: Vec<Pubkey> = flashloan_config.ito_addresses
-        .iter()
-        .filter_map(|addr_str| {
-            Pubkey::from_str(addr_str).map_err(|e| {
-                error!("Invalid ITO address in config: {} - {}", addr_str, e);
-                e
-            }).ok()
-        })
-        .collect();
-    
-    // Parse Pyth feeds from config
-    let pyth_feeds: HashMap<Pubkey, Pubkey> = flashloan_config.pyth_feeds
-        .iter()
-        .filter_map(|(token_str, feed_str)| {
-            let token_key = Pubkey::from_str(token_str).map_err(|e| {
-                error!("Invalid token address in Pyth feeds config: {} - {}", token_str, e);
-                e
-            }).ok()?;
-            let feed_key = Pubkey::from_str(feed_str).map_err(|e| {
-                error!("Invalid feed address in Pyth feeds config: {} - {}", feed_str, e);
-                e
-            }).ok()?;
-            Some((token_key, feed_key))
-        })
-        .collect();
-    
-    // Parse Chainlink feeds from config
-    let chainlink_feeds: HashMap<Pubkey, Pubkey> = flashloan_config.chainlink_feeds
-        .iter()
-        .filter_map(|(token_str, feed_str)| {
-            let token_key = Pubkey::from_str(token_str).map_err(|e| {
-                error!("Invalid token address in Chainlink feeds config: {} - {}", token_str, e);
-                e
-            }).ok()?;
-            let feed_key = Pubkey::from_str(feed_str).map_err(|e| {
-                error!("Invalid feed address in Chainlink feeds config: {} - {}", feed_str, e);
-                e
-            }).ok()?;
-            Some((token_key, feed_key))
-        })
-        .collect();
-    
-    let flashloan_ito_strategy = Box::new(FlashloanITOStrategy::new(
-        rpc_client.clone(),
-        wallet.clone(),
-        flashloan_config,
-        flashloan_orchestrator,
-        ito_addresses,
-        pyth_feeds,
-        chainlink_feeds,
-    )?);
-    strategies.push(flashloan_ito_strategy);
-
-    // Initialize health monitor
-    let health_monitor = Arc::new(HealthMonitor::new(HealthMonitorConfig {
-        check_interval_ms: 5000,
-        max_memory_mb: 4096,
-        max_cpu_percent: 80.0,
-        rpc_timeout_ms: 5000,
-    }));
-
-    // Start health monitoring
-    let health_monitor_clone = health_monitor.clone();
-    tokio::spawn(async move {
-        health_monitor_clone.start_monitoring().await;
-    });
-
-    // Start all strategies
-    let mut strategy_handles = Vec::new();
-    for strategy in strategies {
-        info!("Starting strategy: {}", strategy.name());
-        let handle = tokio::spawn(async move {
-            if let Err(e) = strategy.run().await {
-                error!("Strategy {} failed: {:?}", strategy.name(), e);
-            }
-        });
-        strategy_handles.push(handle);
-    }
-
-    // Wait for shutdown signal
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
-        }
-        _ = async {
-            // Wait for any strategy to fail
-            for handle in strategy_handles {
-                if let Err(e) = handle.await {
-                    error!("Strategy task failed: {:?}", e);
-                }
-            }
-        } => {
-            error!("A strategy has failed, shutting down...");
-        }
-    }
-
-    // Shutdown all strategies
-    // In a real implementation, we would have a way to access all strategy instances
-    // for graceful shutdown. For now, we'll just log the shutdown.
-    info!("Shutting down strategies...");
-
-    Ok(())
-}
