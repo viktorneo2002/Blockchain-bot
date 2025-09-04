@@ -4,6 +4,8 @@ pub const MAX_SWAP_ACCOUNTS: usize = 12;
 pub const MAX_SWAP_DATA: usize = 1024;
 pub const CURRENT_VERSION: u8 = 1;
 pub const MAX_PROTOCOLS: usize = 8;
+pub const MAX_RETRIES: u8 = 3;
+pub const MAX_LOAN_AMOUNT: u64 = 10u64.pow(15); // tune to your token's decimals
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
@@ -14,17 +16,11 @@ pub enum ProtocolKind {
     Custom,
 }
 
-/// Program-wide versioned state
 #[account]
 pub struct ProgramState {
     pub version: u8,
 }
 
-impl ProgramState {
-    pub const LEN: usize = 1;
-}
-
-/// Aggregator main account (PDA: ["aggregator"])
 #[account]
 pub struct Aggregator {
     pub authority: Pubkey,
@@ -42,11 +38,6 @@ pub struct Aggregator {
     pub max_execs_per_slot: u16,
 }
 
-impl Aggregator {
-    pub const LEN: usize = 32 + 1 + 1 + 2 + 2 + 16 + 16 + 8 + 1 + 1 + 8 + 2 + 2;
-}
-
-/// Protocol registration entry (PDA: ["protocol", reserve_pubkey])
 #[account]
 pub struct ProtocolInfo {
     pub aggregator: Pubkey,
@@ -64,10 +55,6 @@ pub struct ProtocolInfo {
     pub failure_count: u32,
 }
 
-impl ProtocolInfo {
-    pub const LEN: usize = 32 + 1 + 32 + 32 + 32 + 32 + 2 + 1 + 8 + 8 + 1 + 4 + 4;
-}
-
 #[account]
 pub struct Config {
     pub min_profit_bps: u16,
@@ -76,11 +63,7 @@ pub struct Config {
     pub last_update: i64,
 }
 
-impl Config { 
-    pub const LEN: usize = 2 + 2 + 1 + 8; 
-}
-
-/// Compact typed struct for off-chain -> on-chain route data
+/// RouteData: caller supplies swap_accounts; on-chain maps them to remaining_accounts
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct RouteData {
     pub dex_program: Pubkey,
@@ -94,9 +77,8 @@ pub struct RouteData {
 impl RouteData {
     pub fn validate(&self) -> Result<()> {
         require!(self.dex_program != Pubkey::default(), ErrorCode::InvalidProgramId);
-        require!(self.swap_accounts_len > 0, ErrorCode::InvalidParameter);
         require!(self.swap_accounts_len as usize <= MAX_SWAP_ACCOUNTS, ErrorCode::RouteDataTooLarge);
-        require!(!self.swap_data.is_empty(), ErrorCode::InvalidInstructionData);
+        require!(self.swap_data.len() <= MAX_SWAP_DATA, ErrorCode::RouteDataTooLarge);
         require!(self.expected_amount_out >= self.min_amount_out, ErrorCode::SlippageExceeded);
         Ok(())
     }
