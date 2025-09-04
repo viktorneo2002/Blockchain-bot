@@ -85,6 +85,9 @@ use crate::{
     error::ArbitrageError,
 };
 
+use crate::liquidation::{LiquidationAdapter, LiquidationParams};
+use crate::metrics::Metrics;
+
 // Fixed local utils (implemented inline)
 mod utils {
     pub mod precision {
@@ -264,6 +267,7 @@ pub struct DriftPerpFundingArbitrageur {
     pub last_update: Arc<RwLock<Instant>>,
     pub priority_fee: Arc<RwLock<u64>>,
     pub keypair: Arc<Keypair>,
+    pub metrics: Arc<Metrics>,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +299,7 @@ impl DriftPerpFundingArbitrageur {
         drift_program: Program,
         config: DriftPerpFundingArbitrageurConfig,
         starting_equity: i128,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let execution_engine = ExecutionEngine::new(
             TxManager::new(client.clone()),
@@ -339,6 +344,7 @@ impl DriftPerpFundingArbitrageur {
             last_update: Arc::new(RwLock::new(Instant::now())),
             priority_fee: Arc::new(RwLock::new(PRIORITY_FEE_MICRO_LAMPORTS)),
             keypair: payer,
+            metrics,
         })
     }
 
@@ -670,6 +676,7 @@ impl DriftPerpFundingArbitrageur {
             AccountMeta::new_readonly(self.market_cache.read().unwrap().get(&opp.market_index).unwrap().market.amm.oracle, false),
         ];
         
+        let start = Instant::now();
         let sig = self.execution_engine
             .place_limit_with_fallbacks(
                 base_ix_accounts,
@@ -679,7 +686,11 @@ impl DriftPerpFundingArbitrageur {
             )
             .await
             .map_err(|e| ArbitrageError::ExecutionError(e.to_string()))?;
-
+        
+        let cu_used = self.execution_engine.get_compute_units_used();
+        let profit = calculate_unrealized_pnl(&opp, opp.entry_price);
+        self.metrics.record_exec(cu_used, profit, "funding_arbitrage");
+        
         // Schedule stale order cancellation
         tokio::time::sleep(Duration::from_secs(STALE_ORDER_THRESHOLD_SECONDS)).await;
         self.execution_engine
@@ -825,6 +836,7 @@ impl DriftPerpFundingArbitrageur {
             AccountMeta::new_readonly(self.market_cache.read().unwrap().get(&opp.market_index).unwrap().market.amm.oracle, false),
         ];
         
+        let start = Instant::now();
         let sig = self.execution_engine
             .place_limit_with_fallbacks(
                 base_ix_accounts,
@@ -834,7 +846,11 @@ impl DriftPerpFundingArbitrageur {
             )
             .await
             .map_err(|e| ArbitrageError::ExecutionError(e.to_string()))?;
-
+        
+        let cu_used = self.execution_engine.get_compute_units_used();
+        let profit = calculate_unrealized_pnl(&position, mark_price);
+        self.metrics.record_exec(cu_used, profit, "funding_arbitrage");
+        
         log::info!("Closed position: market={}, tx={}", market_index, sig);
         Ok(())
     }
@@ -1062,6 +1078,29 @@ impl DriftPerpFundingArbitrageur {
 
         Ok(())
     }
+
+    pub async fn handle_liquidation(
+        &self,
+        user: &User,
+        partial_step: Option<f64>,
+        auction_market: Option<Pubkey>,
+    ) -> Result<(), ArbitrageError> {
+        let liquidation_adapter = LiquidationAdapter::new(&self.drift_program);
+        let params = LiquidationParams {
+            partial_step,
+            auction_market,
+        };
+        
+        let ixs = liquidation_adapter.build_liquidation_ix(user, &params);
+        
+        self.execution_engine
+            .submit_instructions(ixs, &self.keypair, &[])
+            .await
+    }
+
+    pub async fn handle_error(&self, error: &ArbitrageError) {
+        self.metrics.record_fail(&format!("{:?}", error));
+    }
 }
 
 fn calculate_mark_price(amm: &AMM, oracle_price: u64) -> u64 {
@@ -1170,6 +1209,7 @@ impl Clone for DriftPerpFundingArbitrageur {
             last_update: Arc::clone(&self.last_update),
             priority_fee: Arc::clone(&self.priority_fee),
             keypair: Arc::clone(&self.keypair),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 }
@@ -1224,6 +1264,7 @@ mod tests {
             last_update: Arc::new(RwLock::new(Instant::now())),
             priority_fee: Arc::new(RwLock::new(PRIORITY_FEE_MICRO_LAMPORTS)),
             keypair: Arc::new(keypair),
+            metrics: Arc::new(Metrics::new()),
         };
         
         assert!(arbitrageur.validate_config().is_ok());
