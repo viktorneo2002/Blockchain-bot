@@ -19,6 +19,11 @@ fn sqrt_decimal(x: Decimal) -> Decimal {
     z
 }
 
+// Convert lamports to SOL; for quote conversion, multiply SOL->quote via external oracle price if available
+fn lamports_to_sol(l: u64) -> Decimal {
+    Decimal::from(l) / dec!(1_000_000_000)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {
     pub entries_attempted: u64,
@@ -805,20 +810,16 @@ impl MartingaleOptimizer {
         if returns.len() < 2 {
             return Decimal::ZERO;
         }
-
-        let mean_return = returns.iter().sum::<Decimal>() / Decimal::from(returns.len());
-        let variance = returns
-            .iter()
-            .map(|r| (*r - mean_return).powi(2))
-            .sum::<Decimal>() / Decimal::from(returns.len());
-
-        let std_dev = sqrt_decimal(variance);
-        
-        if std_dev > Decimal::ZERO {
-            mean_return / std_dev * dec!(15.87)
-        } else {
-            Decimal::ZERO
-        }
+        let n = returns.len() as u64;
+        let mean = returns.iter().copied().sum::<Decimal>() / Decimal::from(n);
+        let var = if n > 1 {
+            returns.iter().map(|r| {
+                let d = *r - mean;
+                d * d
+            }).sum::<Decimal>() / Decimal::from(n - 1)
+        } else { Decimal::ZERO };
+        let std = sqrt_decimal(var);
+        if std > Decimal::ZERO { mean / std } else { Decimal::ZERO }
     }
 
     fn record_trade(&self, state: &mut StrategyState, trade: TradeMetrics, config: &MartingaleConfig) {
