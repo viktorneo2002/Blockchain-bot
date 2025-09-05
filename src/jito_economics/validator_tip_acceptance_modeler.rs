@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock as AsyncRwLock;
 use anyhow::{Result, anyhow};
+use chrono::Timelike;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use prometheus::{register_histogram, register_histogram_vec, register_gauge, register_gauge_vec, register_int_counter_vec, Histogram, HistogramVec, IntCounterVec, Gauge, GaugeVec};
 
 const SLIDING_WINDOW_SIZE: usize = 1000;
 const MIN_SAMPLE_SIZE: usize = 50;
@@ -21,14 +24,149 @@ pub struct TipAcceptanceMetrics {
     pub validator: Pubkey,
     pub accepted_tips: VecDeque<u64>,
     pub rejected_tips: VecDeque<u64>,
-    pub timestamp_history: VecDeque<Instant>,
+    pub outcomes: VecDeque<bool>, // true=accepted, false=rejected
+    pub timestamp_secs: VecDeque<i64>, // epoch seconds
     pub success_rate: f64,
     pub min_accepted_tip: u64,
     pub median_accepted_tip: u64,
     pub percentile_95_tip: u64,
-    pub last_update: Instant,
+    pub last_update_secs: i64,
     pub bundle_inclusion_times: VecDeque<Duration>,
     pub network_congestion_factor: f64,
+}
+
+// --- Prometheus metrics ---
+static TIP_RECOMMENDATION: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!("tip_recommendation_lamports", "Recommended tip").unwrap()
+});
+static TIP_RECOMMENDATION_BY_VALIDATOR: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!("tip_recommendation_by_validator", "Recommended tip per validator", &["validator"]).unwrap()
+});
+static ACCEPT_REJECT: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!("tip_outcome_total", "Tip outcomes", &["validator","outcome"]).unwrap()
+});
+static ACCEPT_PROB: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!("accept_probability", "Predicted acceptance probability").unwrap()
+});
+static ACCEPT_PROB_BY_VALIDATOR: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!("accept_probability_by_validator", "Predicted acceptance probability per validator", &["validator"]).unwrap()
+});
+static INCLUSION_MS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!("bundle_inclusion_ms", "Observed bundle inclusion times (ms)").unwrap()
+});
+static CONGESTION_GAUGE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!("network_congestion", "Current network congestion [0,1]").unwrap()
+});
+static EV_EFFICIENCY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!("ev_efficiency", "Expected value efficiency (EV/Tip)", &["validator"]).unwrap()
+});
+static VALIDATOR_COOLDOWN: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!("validator_cooldown_seconds", "Cooldown seconds remaining per validator", &["validator"]).unwrap()
+});
+
+#[inline]
+fn observe_tip(amt: u64) { TIP_RECOMMENDATION.observe(amt as f64); }
+#[inline]
+fn observe_outcome(v: &Pubkey, accepted: bool) {
+    let v_label = v.to_string();
+    ACCEPT_REJECT.with_label_values(&[&v_label, if accepted { "accept" } else { "reject" }]).inc();
+}
+#[inline]
+fn observe_accept_prob(p: f64) { ACCEPT_PROB.observe(p.clamp(0.0, 1.0)); }
+#[inline]
+fn observe_inclusion(dur: Duration) { INCLUSION_MS.observe(dur.as_secs_f64() * 1000.0); }
+
+#[inline]
+fn label_for(v: &Pubkey) -> String { v.to_string() }
+
+#[inline]
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+#[inline]
+fn sigmoid(x: f64) -> f64 { 1.0 / (1.0 + (-x).exp()) }
+
+#[inline]
+fn wilson_lower_bound(successes: usize, trials: usize, z: f64) -> f64 {
+    if trials == 0 { return 0.0; }
+    let n = trials as f64;
+    let phat = successes as f64 / n;
+    let denom = 1.0 + z.powi(2) / n;
+    let centre = phat + z.powi(2) / (2.0 * n);
+    let adj = z * ((phat * (1.0 - phat) + z.powi(2) / (4.0 * n)) / n).sqrt();
+    ((centre - adj) / denom).clamp(0.0, 1.0)
+}
+
+fn safe_percentile(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() { return BASE_TIP_LAMPORTS; }
+    let p = p.clamp(0.0, 1.0);
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn median(sorted: &[u64]) -> u64 {
+    if sorted.is_empty() { return BASE_TIP_LAMPORTS; }
+    let n = sorted.len();
+    if n % 2 == 1 { sorted[n/2] } else { ((sorted[n/2 - 1] as u128 + sorted[n/2] as u128)/2) as u64 }
+}
+
+fn winsorize(sorted: &mut [u64], p: f64) {
+    if sorted.is_empty() { return; }
+    let low = safe_percentile(sorted, p);
+    let high = safe_percentile(sorted, 1.0 - p);
+    for v in sorted.iter_mut() {
+        if *v < low { *v = low; } else if *v > high { *v = high; }
+    }
+}
+
+impl ValidatorTipAcceptanceModeler {
+    fn leader_phase_multiplier(&self, network: &NetworkConditions, validator: &Pubkey) -> f64 {
+        let cur = network.current_slot;
+        for s in cur..(cur + 2) {
+            if network.slot_leader_schedule.get(&s) == Some(validator) { return 1.10; }
+        }
+        1.0
+    }
+
+    fn slot_phase_multiplier(current_slot: u64) -> f64 {
+        match current_slot % 4 {
+            0 => 1.05,
+            1 | 2 => 1.0,
+            _ => 1.15,
+        }
+    }
+    fn update_validator_statistics_inplace(metrics: &mut TipAcceptanceMetrics) {
+        let total_attempts = metrics.outcomes.len();
+        if total_attempts > 0 {
+            // Exponential decay weighting for recency
+            let mut weighted_accepts = 0.0;
+            let mut weighted_total = 0.0;
+            for (i, outcome) in metrics.outcomes.iter().enumerate() {
+                let w = DECAY_FACTOR.powi((total_attempts - i - 1) as i32);
+                weighted_total += w;
+                if *outcome { weighted_accepts += w; }
+            }
+
+            // Bayesian update with Beta(1,1) prior (uniform)
+            let alpha = 1.0 + weighted_accepts;
+            let beta = 1.0 + (weighted_total - weighted_accepts).max(0.0);
+            let denom = alpha + beta;
+            metrics.success_rate = if denom > 0.0 { alpha / denom } else { 0.5 };
+        }
+
+        if !metrics.accepted_tips.is_empty() {
+            let mut v: Vec<u64> = metrics.accepted_tips.iter().copied().collect();
+            v.sort_unstable();
+            // Robustify against outliers
+            winsorize(&mut v, 0.01);
+            metrics.min_accepted_tip = v[0];
+            metrics.median_accepted_tip = median(&v);
+            metrics.percentile_95_tip = safe_percentile(&v, 0.95);
+        }
+        metrics.last_update_secs = now_secs();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +177,22 @@ pub struct ValidatorProfile {
     pub peak_hours: Vec<u8>,
     pub reliability_score: f64,
     pub recent_performance: VecDeque<f64>,
+    // Online logistic calibration parameters: sigmoid(beta0 + b_tip*log1p(tip) + b_cong*cong + b_hour*hour)
+    pub logistic_beta0: f64,
+    pub logistic_beta_tip: f64,
+    pub logistic_beta_cong: f64,
+    pub logistic_beta_hour: f64,
+    // Online tip dynamics
+    pub tip_elasticity_coef: f64,
+    pub streak_rejects: u32,
+    pub last_recommended_tip: u64,
+    pub last_outcome: Option<bool>,
+    pub last_tip_submitted: Option<u64>,
+    pub cooldown_until_secs: i64,
+    pub last_ev_lost: f64,
+    pub last_bundle_value: u64,
+    pub last_p_accept: f64,
+    pub logistic_updates: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -48,13 +202,15 @@ pub struct NetworkConditions {
     pub slot_leader_schedule: HashMap<u64, Pubkey>,
     pub recent_block_rewards: VecDeque<u64>,
     pub congestion_level: f64,
+    pub current_slot: u64,
 }
 
 pub struct ValidatorTipAcceptanceModeler {
-    validator_metrics: Arc<AsyncRwLock<HashMap<Pubkey, TipAcceptanceMetrics>>>,
-    validator_profiles: Arc<AsyncRwLock<HashMap<Pubkey, ValidatorProfile>>>,
+    validator_metrics: Arc<DashMap<Pubkey, TipAcceptanceMetrics>>,
+    validator_profiles: Arc<DashMap<Pubkey, ValidatorProfile>>,
     network_conditions: Arc<AsyncRwLock<NetworkConditions>>,
-    global_tip_distribution: Arc<RwLock<VecDeque<u64>>>,
+    market_quants: Arc<AsyncRwLock<MarketQuantiles>>,
+    degradation: Arc<DashMap<Pubkey, DegradationState>>,
     model_parameters: ModelParameters,
 }
 
@@ -82,16 +238,18 @@ impl Default for ModelParameters {
 impl ValidatorTipAcceptanceModeler {
     pub fn new() -> Self {
         Self {
-            validator_metrics: Arc::new(AsyncRwLock::new(HashMap::new())),
-            validator_profiles: Arc::new(AsyncRwLock::new(HashMap::new())),
+            validator_metrics: Arc::new(DashMap::new()),
+            validator_profiles: Arc::new(DashMap::new()),
             network_conditions: Arc::new(AsyncRwLock::new(NetworkConditions {
                 current_tps: 2000.0,
                 average_priority_fee: 1_000,
                 slot_leader_schedule: HashMap::new(),
                 recent_block_rewards: VecDeque::with_capacity(100),
                 congestion_level: 0.5,
+                current_slot: 0,
             })),
-            global_tip_distribution: Arc::new(RwLock::new(VecDeque::with_capacity(SLIDING_WINDOW_SIZE))),
+            market_quants: Arc::new(AsyncRwLock::new(MarketQuantiles::new())),
+            degradation: Arc::new(DashMap::new()),
             model_parameters: ModelParameters::default(),
         }
     }
@@ -102,34 +260,84 @@ impl ValidatorTipAcceptanceModeler {
         bundle_value: u64,
         urgency_factor: f64,
     ) -> Result<u64> {
-        let metrics = self.validator_metrics.read().await;
-        let profiles = self.validator_profiles.read().await;
-        let network = self.network_conditions.read().await;
-        
-        let validator_metrics = metrics.get(validator);
-        let validator_profile = profiles.get(validator);
-        
+        // Fetch current views
+        let metrics = &self.validator_metrics;
+        let profiles = &self.validator_profiles;
+        let network = self.network_conditions.read().await.clone();
+
+        let validator_metrics = metrics.get(validator).map(|r| r.value().clone());
+        let validator_profile = profiles.get(validator).map(|r| r.value().clone());
+
+        // Early cooldown guard: if validator is cooling down, avoid spending budget
+        if let Some(profile) = validator_profile.as_ref() {
+            if profile.cooldown_until_secs > now_secs() {
+                let conservative = BASE_TIP_LAMPORTS;
+                let v_label = label_for(validator);
+                TIP_RECOMMENDATION_BY_VALIDATOR.with_label_values(&[&v_label]).observe(conservative as f64);
+                EV_EFFICIENCY.with_label_values(&[&v_label]).set(0.0);
+                return Ok(conservative);
+            }
+        }
+
+        // 1) Base tip
         let base_tip = self.calculate_base_tip(
-            validator_metrics,
-            validator_profile,
+            validator_metrics.as_ref(),
+            validator_profile.as_ref(),
             &network,
             bundle_value,
         );
-        
-        let adjusted_tip = self.apply_dynamic_adjustments(
+
+        // 2) Dynamic adjustments (congestion, UTC hour/leader-phase, urgency)
+        let dynamic_tip = self.apply_dynamic_adjustments(
             base_tip,
             urgency_factor,
             &network,
-            validator_profile,
+            validator_profile.as_ref(),
         );
-        
-        let competitive_tip = self.apply_competitive_analysis(
-            adjusted_tip,
-            validator_metrics,
-        );
-        
-        let final_tip = self.apply_safety_bounds(competitive_tip, bundle_value);
-        
+
+        // 3) Market-aware competition: at least market p75
+        let competitive_tip = {
+            let mq = self.market_quants.read().await;
+            // Volatility-coupled percentile: blend between p50 and p95 depending on vol ratio
+            let p50 = mq.percentile_50().unwrap_or(BASE_TIP_LAMPORTS);
+            let p75 = mq.percentile_75().unwrap_or(BASE_TIP_LAMPORTS);
+            let p95 = mq.percentile_95().unwrap_or(p75);
+            let vol_ratio = if mq.mean() > 0.0 { (mq.std_dev() / mq.mean()).clamp(0.0, 1.0) } else { 0.0 };
+            // Blend: low vol→closer to p50/p75; high vol→closer to p95
+            let target = if vol_ratio < 0.5 {
+                let t = vol_ratio * 2.0; // [0,1]
+                (p50 as f64 * (1.0 - t) + p75 as f64 * t) as u64
+            } else {
+                let t = (vol_ratio - 0.5) * 2.0; // [0,1]
+                (p75 as f64 * (1.0 - t) + p95 as f64 * t) as u64
+            };
+            dynamic_tip.max(target)
+        };
+
+        // 4) Per-validator competition overlay (async, non-blocking)
+        let competitive_tip = self.apply_competitive_analysis_async(competitive_tip, validator_metrics.as_ref()).await;
+
+        // 5) Coarse-to-fine EV optimization around competitive_tip
+        let candidate = self.optimize_tip_ev(validator, bundle_value, competitive_tip / 2, competitive_tip.saturating_mul(2).min(MAX_TIP_LAMPORTS)).await?;
+        let p_accept = self.predict_acceptance_probability(validator, candidate).await?;
+
+        // 6) EV guardrails and finalize
+        let final_tip = self.apply_safety_bounds(candidate, bundle_value, p_accept);
+
+        // Persist and observe
+        if let Some(mut pe) = self.validator_profiles.get_mut(validator) {
+            let pr = pe.value_mut();
+            pr.last_recommended_tip = final_tip;
+            pr.last_bundle_value = bundle_value;
+            pr.last_p_accept = p_accept;
+        }
+        observe_tip(final_tip);
+        let v_label = label_for(validator);
+        ACCEPT_PROB_BY_VALIDATOR.with_label_values(&[&v_label]).observe(p_accept);
+        TIP_RECOMMENDATION_BY_VALIDATOR.with_label_values(&[&v_label]).observe(final_tip as f64);
+        let ev = (bundle_value as f64) * p_accept;
+        let eff = if final_tip > 0 { ev / (final_tip as f64) } else { 0.0 };
+        EV_EFFICIENCY.with_label_values(&[&v_label]).set(eff);
         Ok(final_tip)
     }
 
@@ -175,44 +383,40 @@ impl ValidatorTipAcceptanceModeler {
         profile: Option<&ValidatorProfile>,
     ) -> u64 {
         let congestion_adjustment = 1.0 + (network.congestion_level - 0.5) * 0.5;
-        
-        let time_sensitivity = if let Some(p) = profile {
-            let current_hour = chrono::Local::now().hour() as u8;
-            if p.peak_hours.contains(&current_hour) {
-                1.2
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        };
-        
-        let urgency_multiplier = 1.0 + (urgency_factor - 1.0).min(2.0) * 0.3;
-        
-        ((base_tip as f64) * 
-         congestion_adjustment * 
-         time_sensitivity * 
-         urgency_multiplier) as u64
+
+        let hour = chrono::Utc::now().hour() as u8;
+        let time_sensitivity = profile
+            .map(|p| if p.peak_hours.binary_search(&hour).is_ok() { 1.2 } else { 1.0 })
+            .unwrap_or(1.0);
+
+        let leader_mult = profile.map(|p| self.leader_phase_multiplier(network, &p.pubkey)).unwrap_or(1.0);
+        let slot_phase_mult = Self::slot_phase_multiplier(network.current_slot);
+        let urgency_multiplier = 1.0 + (urgency_factor - 1.0).clamp(0.0, 2.0) * 0.3;
+
+        ((base_tip as f64)
+            * congestion_adjustment
+            * time_sensitivity
+            * leader_mult
+            * slot_phase_mult
+            * urgency_multiplier) as u64
     }
 
-    fn apply_competitive_analysis(
+    async fn apply_competitive_analysis_async(
         &self,
         tip: u64,
         metrics: Option<&TipAcceptanceMetrics>,
     ) -> u64 {
-        let global_distribution = self.global_tip_distribution.read().unwrap();
-        
-        if global_distribution.len() < MIN_SAMPLE_SIZE {
+        let mq_guard = self.market_quants.read().await;
+        if mq_guard.count < MIN_SAMPLE_SIZE {
             return (tip as f64 * self.model_parameters.competitive_factor) as u64;
         }
-        
-        let mut sorted_tips: Vec<u64> = global_distribution.iter().cloned().collect();
-        sorted_tips.sort_unstable();
-        
-        let percentile_75_idx = (sorted_tips.len() as f64 * 0.75) as usize;
-        let market_percentile_75 = sorted_tips[percentile_75_idx];
-        
-        let competitive_tip = tip.max(market_percentile_75);
+        // Clamp competition level to central 98% to ignore outliers
+        let p01 = mq_guard.percentile_01().unwrap_or(tip);
+        let p99 = mq_guard.percentile_99().unwrap_or(tip);
+        let mut p75 = mq_guard.percentile_75().unwrap_or(tip);
+        if p75 < p01 { p75 = p01; }
+        if p75 > p99 { p75 = p99; }
+        let competitive_tip = tip.max(p75);
         
         if let Some(m) = metrics {
             if m.success_rate < 0.7 {
@@ -225,9 +429,11 @@ impl ValidatorTipAcceptanceModeler {
         }
     }
 
-    fn apply_safety_bounds(&self, tip: u64, bundle_value: u64) -> u64 {
+    fn apply_safety_bounds(&self, tip: u64, bundle_value: u64, p_accept: f64) -> u64 {
+        // EV guardrail: cap tip at 25% of EV = value * p_accept
+        let max_tip_ev = (bundle_value as f64 * 0.25 * p_accept.clamp(0.0, 1.0)).floor() as u64;
         let max_reasonable_tip = (bundle_value as f64 * 0.5) as u64;
-        tip.min(max_reasonable_tip).min(MAX_TIP_LAMPORTS).max(BASE_TIP_LAMPORTS)
+        tip.min(max_tip_ev).min(max_reasonable_tip).min(MAX_TIP_LAMPORTS).max(BASE_TIP_LAMPORTS)
     }
 
     pub async fn record_tip_result(
@@ -237,52 +443,85 @@ impl ValidatorTipAcceptanceModeler {
         accepted: bool,
         inclusion_time: Option<Duration>,
     ) -> Result<()> {
-        let mut metrics = self.validator_metrics.write().await;
-        let entry = metrics.entry(*validator).or_insert_with(|| TipAcceptanceMetrics {
-            validator: *validator,
-            accepted_tips: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
-            rejected_tips: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
-            timestamp_history: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
-            success_rate: 0.0,
-            min_accepted_tip: u64::MAX,
-            median_accepted_tip: BASE_TIP_LAMPORTS,
-            percentile_95_tip: BASE_TIP_LAMPORTS,
-            last_update: Instant::now(),
-            bundle_inclusion_times: VecDeque::with_capacity(100),
-            network_congestion_factor: 0.5,
-        });
+        {
+            let mut entry = self.validator_metrics.entry(*validator).or_insert_with(|| TipAcceptanceMetrics {
+                validator: *validator,
+                accepted_tips: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
+                rejected_tips: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
+                outcomes: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
+                timestamp_secs: VecDeque::with_capacity(SLIDING_WINDOW_SIZE),
+                success_rate: 0.0,
+                min_accepted_tip: u64::MAX,
+                median_accepted_tip: BASE_TIP_LAMPORTS,
+                percentile_95_tip: BASE_TIP_LAMPORTS,
+                last_update_secs: now_secs(),
+                bundle_inclusion_times: VecDeque::with_capacity(100),
+                network_congestion_factor: 0.5,
+            });
 
-        if accepted {
-            entry.accepted_tips.push_back(tip_amount);
-            if entry.accepted_tips.len() > SLIDING_WINDOW_SIZE {
-                entry.accepted_tips.pop_front();
+            {
+                let m = entry.value_mut();
+                if accepted {
+                    m.accepted_tips.push_back(tip_amount);
+                    if m.accepted_tips.len() > SLIDING_WINDOW_SIZE { m.accepted_tips.pop_front(); }
+                    if let Some(t) = inclusion_time {
+                        m.bundle_inclusion_times.push_back(t);
+                        if m.bundle_inclusion_times.len() > 100 { m.bundle_inclusion_times.pop_front(); }
+                    }
+                } else {
+                    m.rejected_tips.push_back(tip_amount);
+                    if m.rejected_tips.len() > SLIDING_WINDOW_SIZE { m.rejected_tips.pop_front(); }
+                }
+                m.outcomes.push_back(accepted);
+                if m.outcomes.len() > SLIDING_WINDOW_SIZE { m.outcomes.pop_front(); }
+                m.timestamp_secs.push_back(now_secs());
+                if m.timestamp_secs.len() > SLIDING_WINDOW_SIZE { m.timestamp_secs.pop_front(); }
+                Self::update_validator_statistics_inplace(m);
             }
-            
-            if let Some(time) = inclusion_time {
-                entry.bundle_inclusion_times.push_back(time);
-                if entry.bundle_inclusion_times.len() > 100 {
-                    entry.bundle_inclusion_times.pop_front();
+        }
+
+        // Update global dist after releasing validator lock
+        self.update_global_distribution(tip_amount, accepted).await?;
+
+        // Online logistic calibration update (after releasing metrics map)
+        let network = self.network_conditions.read().await;
+        if let Some(mut entry) = self.validator_profiles.get_mut(validator) {
+            let p = entry.value_mut();
+            Self::logistic_update(p, tip_amount, accepted, &network);
+            // streak logic and elasticity update
+            if accepted { p.streak_rejects = 0; } else { p.streak_rejects = p.streak_rejects.saturating_add(1); }
+            if let Some(prev_outcome) = p.last_outcome {
+                if !prev_outcome && accepted {
+                    if let Some(prev_tip) = p.last_tip_submitted { if tip_amount > prev_tip {
+                        let inc = (tip_amount as f64 / prev_tip.max(1) as f64) - 1.0;
+                        p.tip_elasticity_coef = 0.9 * p.tip_elasticity_coef + 0.1 * inc.clamp(0.0, 0.5);
+                    }}
                 }
             }
-        } else {
-            entry.rejected_tips.push_back(tip_amount);
-            if entry.rejected_tips.len() > SLIDING_WINDOW_SIZE {
-                entry.rejected_tips.pop_front();
+            // Risk-aware cooldown after missed inclusion
+            if !accepted && p.streak_rejects >= 3 {
+                // Approximate EV lost if not provided elsewhere: use tip amount as a conservative proxy
+                let ev_lost = tip_amount as f64; // Replace with bundle_value * p_accept if available
+                p.last_ev_lost = ev_lost;
+                let base = 10.0; // seconds
+                let streak_scale = 1.0 + 0.2 * (p.streak_rejects as f64);
+                let cong = self.network_conditions.read().await.congestion_level.clamp(0.0, 1.0);
+                let cong_scale = 0.5 + cong; // [0.5, 1.5]
+                let ev_scale = 1.0 + ev_lost.ln_1p() / 10.0; // grows slowly
+                let cooldown = (base * streak_scale * cong_scale * ev_scale).round() as i64;
+                p.cooldown_until_secs = now_secs() + cooldown;
+                VALIDATOR_COOLDOWN.with_label_values(&[&validator.to_string()]).set(cooldown as f64);
             }
+            p.last_outcome = Some(accepted);
+            p.last_tip_submitted = Some(tip_amount);
         }
-
-        entry.timestamp_history.push_back(Instant::now());
-        if entry.timestamp_history.len() > SLIDING_WINDOW_SIZE {
-            entry.timestamp_history.pop_front();
-        }
-
-        self.update_validator_statistics(entry).await;
-        self.update_global_distribution(tip_amount, accepted).await;
+        observe_outcome(validator, accepted);
+        if let Some(d) = inclusion_time { observe_inclusion(d); }
 
         Ok(())
     }
 
-    async fn update_validator_statistics(&self, metrics: &mut TipAcceptanceMetrics) {
+    fn update_validator_statistics(metrics: &mut TipAcceptanceMetrics) {
         let total_attempts = metrics.accepted_tips.len() + metrics.rejected_tips.len();
         if total_attempts > 0 {
             metrics.success_rate = metrics.accepted_tips.len() as f64 / total_attempts as f64;
@@ -292,24 +531,21 @@ impl ValidatorTipAcceptanceModeler {
             let mut accepted_vec: Vec<u64> = metrics.accepted_tips.iter().cloned().collect();
             accepted_vec.sort_unstable();
             
-            metrics.min_accepted_tip = *accepted_vec.first().unwrap();
-            metrics.median_accepted_tip = accepted_vec[accepted_vec.len() / 2];
-            
-            let percentile_95_idx = (accepted_vec.len() as f64 * 0.95) as usize;
-            metrics.percentile_95_tip = accepted_vec[percentile_95_idx.min(accepted_vec.len() - 1)];
+            metrics.min_accepted_tip = *accepted_vec.first().unwrap_or(&BASE_TIP_LAMPORTS);
+            let mid = accepted_vec.len() / 2;
+            metrics.median_accepted_tip = accepted_vec.get(mid).copied().unwrap_or(BASE_TIP_LAMPORTS);
+            let p95_idx = ((accepted_vec.len() as f64 * 0.95).floor() as usize).min(accepted_vec.len().saturating_sub(1));
+            metrics.percentile_95_tip = accepted_vec.get(p95_idx).copied().unwrap_or(metrics.median_accepted_tip);
         }
-
-        metrics.last_update = Instant::now();
+        metrics.last_update_secs = now_secs();
     }
 
-    async fn update_global_distribution(&self, tip_amount: u64, accepted: bool) {
+    async fn update_global_distribution(&self, tip_amount: u64, accepted: bool) -> Result<()> {
         if accepted {
-            let mut global_dist = self.global_tip_distribution.write().unwrap();
-            global_dist.push_back(tip_amount);
-            if global_dist.len() > SLIDING_WINDOW_SIZE {
-                global_dist.pop_front();
-            }
+            let mut mq = self.market_quants.write().await;
+            mq.insert(tip_amount);
         }
+        Ok(())
     }
 
     pub async fn update_network_conditions(
@@ -322,6 +558,7 @@ impl ValidatorTipAcceptanceModeler {
         network.current_tps = tps;
         network.average_priority_fee = avg_priority_fee;
         network.congestion_level = congestion_level.min(1.0).max(0.0);
+        CONGESTION_GAUGE.set(network.congestion_level);
         
         Ok(())
     }
@@ -330,13 +567,13 @@ impl ValidatorTipAcceptanceModeler {
         &self,
         validator: &Pubkey,
     ) -> Result<TipRecommendation> {
-        let metrics = self.validator_metrics.read().await;
-        let profiles = self.validator_profiles.read().await;
+        let metrics = &self.validator_metrics;
+        let profiles = &self.validator_profiles;
         let network = self.network_conditions.read().await;
         
         let confidence = self.calculate_confidence(
-            metrics.get(validator),
-            profiles.get(validator),
+            metrics.get(validator).map(|r| r.value()),
+            profiles.get(validator).map(|r| r.value()),
         );
         
         let optimal_tip = self.calculate_optimal_tip(
@@ -350,7 +587,7 @@ impl ValidatorTipAcceptanceModeler {
             recommended_tip: optimal_tip,
             confidence_score: confidence,
             expected_success_rate: metrics.get(validator)
-                .map(|m| m.success_rate)
+                .map(|r| r.value().success_rate)
                 .unwrap_or(0.5),
             network_adjusted: true,
         })
@@ -362,26 +599,17 @@ impl ValidatorTipAcceptanceModeler {
         profile: Option<&ValidatorProfile>,
     ) -> f64 {
         let data_confidence = if let Some(m) = metrics {
-            let sample_size = m.accepted_tips.len() + m.rejected_tips.len();
-            let recency_factor = if let Some(last) = m.timestamp_history.back() {
-                let age = last.elapsed().as_secs() as f64;
+            let trials = m.outcomes.len();
+            let succ = m.outcomes.iter().filter(|&&x| x).count();
+            let w = wilson_lower_bound(succ, trials, 1.96);
+            let recency = m.timestamp_secs.back().copied().map(|last| {
+                let age = (now_secs() - last).max(0) as f64;
                 (-age / 3600.0).exp()
-            } else {
-                0.0
-            };
-            
-            let size_factor = (sample_size as f64 / MIN_SAMPLE_SIZE as f64).min(1.0);
-            size_factor * recency_factor * 0.7
-        } else {
-            0.0
-        };
-        
-        let profile_confidence = if let Some(p) = profile {
-            p.reliability_score * 0.3
-        } else {
-            0.0
-        };
-        
+            }).unwrap_or(0.0);
+            0.7 * w * recency
+        } else { 0.0 };
+
+        let profile_confidence = profile.map(|p| 0.3 * p.reliability_score).unwrap_or(0.0);
         (data_confidence + profile_confidence).min(1.0)
     }
 
@@ -390,40 +618,46 @@ impl ValidatorTipAcceptanceModeler {
         validator: &Pubkey,
         slot_performance: f64,
     ) -> Result<()> {
-        let mut profiles = self.validator_profiles.write().await;
-        let profile = profiles.entry(*validator).or_insert_with(|| ValidatorProfile {
+        let mut entry = self.validator_profiles.entry(*validator).or_insert_with(|| ValidatorProfile {
             pubkey: *validator,
             historical_acceptance_rate: 0.5,
             tip_sensitivity: 1.0,
             peak_hours: vec![14, 15, 16, 17, 18, 19, 20, 21],
             reliability_score: 0.5,
             recent_performance: VecDeque::with_capacity(50),
+            logistic_beta0: 0.0,
+            logistic_beta_tip: 0.0,
+            logistic_beta_cong: 0.0,
+            logistic_beta_hour: 0.0,
+            tip_elasticity_coef: 0.0,
+            streak_rejects: 0,
+            last_recommended_tip: BASE_TIP_LAMPORTS,
+            last_outcome: None,
+            last_tip_submitted: None,
+            cooldown_until_secs: 0,
+            last_ev_lost: 0.0,
+            last_bundle_value: 0,
+            last_p_accept: 0.0,
+            logistic_updates: 0,
         });
-        
-        profile.recent_performance.push_back(slot_performance);
-        if profile.recent_performance.len() > 50 {
-            profile.recent_performance.pop_front();
-        }
-        
-        if profile.recent_performance.len() >= 10 {
-            let avg_performance: f64 = profile.recent_performance.iter().sum::<f64>() 
-                / profile.recent_performance.len() as f64;
-            profile.reliability_score = (profile.reliability_score * 0.7 + avg_performance * 0.3)
-                .min(1.0).max(0.0);
-        }
-        
-        let metrics = self.validator_metrics.read().await;
-        if let Some(m) = metrics.get(validator) {
-            profile.historical_acceptance_rate = m.success_rate;
-            
-            if m.accepted_tips.len() >= MIN_SAMPLE_SIZE && m.rejected_tips.len() >= 10 {
-                let accepted_mean = m.accepted_tips.iter().sum::<u64>() as f64 
-                    / m.accepted_tips.len() as f64;
-                let rejected_mean = m.rejected_tips.iter().sum::<u64>() as f64 
-                    / m.rejected_tips.len() as f64;
-                
-                if rejected_mean > 0.0 {
-                    profile.tip_sensitivity = (accepted_mean / rejected_mean).min(5.0).max(0.2);
+        {
+            let profile = entry.value_mut();
+            profile.recent_performance.push_back(slot_performance);
+            if profile.recent_performance.len() > 50 {
+                profile.recent_performance.pop_front();
+            }
+            if profile.recent_performance.len() >= 10 {
+                let avg_performance: f64 = profile.recent_performance.iter().sum::<f64>() / profile.recent_performance.len() as f64;
+                profile.reliability_score = (profile.reliability_score * 0.7 + avg_performance * 0.3).min(1.0).max(0.0);
+            }
+            if let Some(m) = self.validator_metrics.get(validator) {
+                profile.historical_acceptance_rate = m.value().success_rate;
+                if m.value().accepted_tips.len() >= MIN_SAMPLE_SIZE && m.value().rejected_tips.len() >= 10 {
+                    let accepted_mean = m.value().accepted_tips.iter().sum::<u64>() as f64 / m.value().accepted_tips.len() as f64;
+                    let rejected_mean = m.value().rejected_tips.iter().sum::<u64>() as f64 / m.value().rejected_tips.len() as f64;
+                    if rejected_mean > 0.0 {
+                        profile.tip_sensitivity = (accepted_mean / rejected_mean).min(5.0).max(0.2);
+                    }
                 }
             }
         }
@@ -436,8 +670,8 @@ impl ValidatorTipAcceptanceModeler {
         validator: &Pubkey,
         tip_amount: u64,
     ) -> Result<f64> {
-        let metrics = self.validator_metrics.read().await;
-        let profiles = self.validator_profiles.read().await;
+        let metrics = &self.validator_metrics;
+        let profiles = &self.validator_profiles;
         let network = self.network_conditions.read().await;
         
         let validator_metrics = metrics.get(validator);
@@ -460,49 +694,74 @@ impl ValidatorTipAcceptanceModeler {
         };
         
         let network_adjustment = 1.0 - (network.congestion_level - 0.5).abs() * 0.2;
-        
-        let profile_adjustment = if let Some(p) = validator_profile {
-            1.0 + (p.reliability_score - 0.5) * 0.3
-        } else {
-            1.0
-        };
-        
-        let final_probability = (base_probability * network_adjustment * profile_adjustment)
-            .min(0.99)
-            .max(0.01);
-        
+        let profile_adjustment = if let Some(p) = validator_profile { 1.0 + (p.reliability_score - 0.5) * 0.3 } else { 1.0 };
+
+        // Logistic prediction based on online calibrated parameters
+        let logistic_p = if let Some(p) = validator_profile { Self::logistic_predict(p.value(), tip_amount, &network) } else { base_probability };
+        // Blend logistic and base depending on sample size
+        let trials = validator_metrics.map(|m| m.outcomes.len()).unwrap_or(0);
+        let w_log = if trials >= MIN_SAMPLE_SIZE { 0.6 } else { 0.3 };
+        let blended = w_log * logistic_p + (1.0 - w_log) * base_probability;
+
+        let final_probability = (blended * network_adjustment * profile_adjustment)
+            .clamp(0.01, 0.99);
         Ok(final_probability)
     }
 
+    fn logistic_features(tip: u64, network: &NetworkConditions) -> (f64, f64, f64) {
+        // Diminishing returns for higher tips, bounded congestion, cyclic hour embedding (cosine)
+        let x_tip = (tip as f64).ln_1p();
+        let x_cong = network.congestion_level.clamp(0.0, 1.0);
+        let hour = chrono::Utc::now().hour() as f64;
+        let x_hour = (hour / 24.0) * 2.0 * std::f64::consts::PI;
+        (x_tip, x_cong, x_hour.cos())
+    }
+
+    fn logistic_predict(profile: &ValidatorProfile, tip: u64, network: &NetworkConditions) -> f64 {
+        let (x_tip, x_cong, hour) = Self::logistic_features(tip, network);
+        let z = profile.logistic_beta0 + profile.logistic_beta_tip * x_tip + profile.logistic_beta_cong * x_cong + profile.logistic_beta_hour * hour;
+        sigmoid(z)
+    }
+
+    fn logistic_update(profile: &mut ValidatorProfile, tip: u64, accepted: bool, network: &NetworkConditions) {
+        let (x_tip, x_cong, x_hour) = Self::logistic_features(tip, network);
+        let z = profile.logistic_beta0
+            + profile.logistic_beta_tip * x_tip
+            + profile.logistic_beta_cong * x_cong
+            + profile.logistic_beta_hour * x_hour;
+        let p_hat = sigmoid(z);
+        let y = if accepted { 1.0 } else { 0.0 };
+        let err = y - p_hat;
+        // Decaying learning rate for online Bayesian-flavored adaptation
+        profile.logistic_updates = profile.logistic_updates.saturating_add(1);
+        let lr0 = 0.05;
+        let lr = lr0 / (1.0 + (profile.logistic_updates as f64).sqrt() * 0.1);
+        profile.logistic_beta0 += lr * err;
+        profile.logistic_beta_tip += lr * err * x_tip;
+        profile.logistic_beta_cong += lr * err * x_cong;
+        profile.logistic_beta_hour += lr * err * x_hour;
+    }
+
     pub async fn get_market_insights(&self) -> Result<MarketInsights> {
-        let global_dist = self.global_tip_distribution.read().unwrap();
         let network = self.network_conditions.read().await;
-        let metrics = self.validator_metrics.read().await;
-        
-        let mut all_tips: Vec<u64> = global_dist.iter().cloned().collect();
-        all_tips.sort_unstable();
-        
-        let market_stats = if all_tips.len() >= MIN_SAMPLE_SIZE {
-            let median_idx = all_tips.len() / 2;
-            let p25_idx = all_tips.len() / 4;
-            let p75_idx = (all_tips.len() * 3) / 4;
-            let p95_idx = (all_tips.len() * 95) / 100;
-            
+        let metrics = &self.validator_metrics;
+        let mq = self.market_quants.read().await;
+        let market_stats = if mq.count >= MIN_SAMPLE_SIZE {
             MarketStatistics {
-                median_tip: all_tips[median_idx],
-                percentile_25: all_tips[p25_idx],
-                percentile_75: all_tips[p75_idx],
-                percentile_95: all_tips[p95_idx],
-                average_tip: all_tips.iter().sum::<u64>() / all_tips.len() as u64,
-                std_deviation: calculate_std_dev(&all_tips),
+                median_tip: mq.percentile_50().unwrap_or(0),
+                percentile_25: mq.percentile_25().unwrap_or(0),
+                percentile_75: mq.percentile_75().unwrap_or(0),
+                percentile_95: mq.percentile_95().unwrap_or(0),
+                average_tip: mq.mean() as u64,
+                std_deviation: mq.std_dev() as u64,
             }
         } else {
             MarketStatistics::default()
         };
-        
+
         let top_validators: Vec<(Pubkey, f64)> = metrics.iter()
-            .filter(|(_, m)| m.success_rate > 0.8 && m.accepted_tips.len() >= MIN_SAMPLE_SIZE)
-            .map(|(k, m)| (*k, m.success_rate))
+            .filter(|m| m.value().success_rate > 0.8 && m.value().accepted_tips.len() >= MIN_SAMPLE_SIZE)
+            .map(|m| (*m.key(), m.value().success_rate))
             .collect();
         
         Ok(MarketInsights {
@@ -510,7 +769,7 @@ impl ValidatorTipAcceptanceModeler {
             network_congestion: network.congestion_level,
             recommended_base_tip: market_stats.percentile_75,
             high_performance_validators: top_validators,
-            market_volatility: market_stats.std_deviation as f64 / market_stats.average_tip as f64,
+            market_volatility: if market_stats.average_tip > 0 { market_stats.std_deviation as f64 / market_stats.average_tip as f64 } else { 0.0 },
         })
     }
 
@@ -541,6 +800,18 @@ impl ValidatorTipAcceptanceModeler {
             validator_scores.push((*validator, score, optimal_tip));
         }
         
+        // Cross-validator arbitrage tilt: prefer validators that are competitively priced vs the group
+        if !validator_scores.is_empty() {
+            let mut tips: Vec<u64> = validator_scores.iter().map(|(_,_,t)| *t).collect();
+            tips.sort_unstable();
+            let mid = tips[tips.len()/2];
+            let alpha = 0.2; // mild tilt
+            for (.., score, tip) in validator_scores.iter_mut() {
+                let rel = if *tip > 0 { (mid as f64) / (*tip as f64) } else { 1.0 };
+                *score *= rel.powf(alpha);
+            }
+        }
+
         validator_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         
         for (validator, _, optimal_tip) in validator_scores {
@@ -560,24 +831,18 @@ impl ValidatorTipAcceptanceModeler {
         &self,
         validator: &Pubkey,
     ) -> Result<ValidatorPattern> {
-        let metrics = self.validator_metrics.read().await;
-        let profile = self.validator_profiles.read().await;
-        
-        let validator_metrics = metrics.get(validator)
-            .ok_or_else(|| anyhow!("No metrics found for validator"))?;
-        
-        let acceptance_trend = if validator_metrics.timestamp_history.len() >= 20 {
-            let recent_20: Vec<bool> = validator_metrics.timestamp_history.iter()
-                .rev()
-                .take(20)
-                .zip(validator_metrics.accepted_tips.iter().rev().take(20))
-                .map(|(_, _)| true)
-                .collect();
-            
-            let recent_rate = recent_20.iter().filter(|&&x| x).count() as f64 / 20.0;
-            if recent_rate > validator_metrics.success_rate + 0.1 {
+        // Fetch metrics and optional profile
+        let vm_entry = self.validator_metrics.get(validator).ok_or_else(|| anyhow!("No metrics found for validator"))?;
+        let profile = self.validator_profiles.get(validator).map(|e| e.value().clone());
+        let vm = vm_entry.value();
+
+        // Acceptance trend from last 20 outcomes with fixed denominator
+        let acceptance_trend = if vm.outcomes.len() >= 20 {
+            let recent_true = vm.outcomes.iter().rev().take(20).filter(|&&x| x).count() as f64;
+            let recent_rate = recent_true / 20.0;
+            if recent_rate > vm.success_rate + 0.1 {
                 AcceptanceTrend::Improving
-            } else if recent_rate < validator_metrics.success_rate - 0.1 {
+            } else if recent_rate < vm.success_rate - 0.1 {
                 AcceptanceTrend::Declining
             } else {
                 AcceptanceTrend::Stable
@@ -585,31 +850,132 @@ impl ValidatorTipAcceptanceModeler {
         } else {
             AcceptanceTrend::Unknown
         };
-        
-        let tip_elasticity = if let Some(p) = profile.get(validator) {
-            p.tip_sensitivity
-        } else {
-            1.0
-        };
-        
-        let avg_inclusion_time = if !validator_metrics.bundle_inclusion_times.is_empty() {
-            let total: Duration = validator_metrics.bundle_inclusion_times.iter().sum();
-            total / validator_metrics.bundle_inclusion_times.len() as u32
+
+        let tip_elasticity = profile.as_ref().map(|p| p.tip_sensitivity).unwrap_or(1.0);
+
+        let avg_inclusion_time = if !vm.bundle_inclusion_times.is_empty() {
+            let total: Duration = vm.bundle_inclusion_times.iter().copied().sum();
+            total / (vm.bundle_inclusion_times.len() as u32)
         } else {
             Duration::from_millis(400)
         };
-        
+
         Ok(ValidatorPattern {
             validator: *validator,
             acceptance_trend,
             tip_elasticity,
             average_inclusion_time: avg_inclusion_time,
-            reliability_score: profile.get(validator).map(|p| p.reliability_score).unwrap_or(0.5),
-            peak_performance_hours: profile.get(validator)
-                .map(|p| p.peak_hours.clone())
-                .unwrap_or_default(),
+            reliability_score: profile.as_ref().map(|p| p.reliability_score).unwrap_or(0.5),
+            peak_performance_hours: profile.as_ref().map(|p| p.peak_hours.clone()).unwrap_or_default(),
         })
     }
+}
+
+// --- Online quantile estimation (Jain–Chlamtac P²) and running stats ---
+#[derive(Clone)]
+struct P2Quantile {
+    p: f64,
+    n: [i64; 5],
+    q: [f64; 5],
+    np: [f64; 5],
+    dn: [f64; 5],
+    count: usize,
+}
+
+impl P2Quantile {
+    fn new(p: f64) -> Self {
+        assert!((0.0..=1.0).contains(&p));
+        Self { p, n: [0; 5], q: [0.0; 5], np: [0.0; 5], dn: [0.0; 5], count: 0 }
+    }
+
+    fn insert(&mut self, x: f64) {
+        self.count += 1;
+        if self.count <= 5 {
+            self.q[self.count - 1] = x;
+            if self.count == 5 {
+                self.q.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                self.n = [1, 2, 3, 4, 5];
+                self.np = [1.0, 1.0 + 2.0 * self.p, 1.0 + 4.0 * self.p, 3.0 + 2.0 * self.p, 5.0];
+                self.dn = [0.0, self.p / 2.0, self.p, (1.0 + self.p) / 2.0, 1.0];
+            }
+            return;
+        }
+
+        let mut k = if x < self.q[0] {
+            self.q[0] = x; 0
+        } else if x >= self.q[4] {
+            self.q[4] = x; 3
+        } else {
+            let mut k = 0;
+            for i in 0..4 {
+                if x >= self.q[i] && x < self.q[i + 1] { k = i; break; }
+            }
+            k
+        };
+        for i in (k + 1)..5 { self.n[i] += 1; }
+        for i in 0..5 { self.np[i] += self.dn[i]; }
+        for i in 1..4 {
+            let d = self.np[i] - self.n[i] as f64;
+            if (d >= 1.0 && self.n[i + 1] - self.n[i] > 1) || (d <= -1.0 && self.n[i - 1] - self.n[i] < -1) {
+                let dsign = d.signum() as i64;
+                let qi = self.q[i];
+                let qip = self.q[i + 1];
+                let qim = self.q[i - 1];
+                let nip = self.n[i + 1] as f64;
+                let ni = self.n[i] as f64;
+                let nim = self.n[i - 1] as f64;
+                let mut qn = qi + dsign as f64 * ((qip - qi) / (nip - ni) * (ni - nim + dsign as f64) + (qi - qim) / (ni - nim) * (nip - ni - dsign as f64)) / (nip - nim);
+                if qn <= qim || qn >= qip {
+                    qn = qi + dsign as f64 * (self.q[(i as i64 + dsign) as usize] - qi) / (self.n[(i as i64 + dsign) as usize] - self.n[i]) as f64;
+                }
+                self.q[i] = qn;
+                self.n[i] += dsign;
+            }
+        }
+    }
+
+    fn estimate(&self) -> Option<u64> {
+        if self.count < 5 { None } else { Some(self.q[2].max(0.0) as u64) }
+    }
+}
+
+#[derive(Clone)]
+struct MarketQuantiles {
+    p25: P2Quantile,
+    p50: P2Quantile,
+    p75: P2Quantile,
+    p95: P2Quantile,
+    mean: f64,
+    m2: f64,
+    count: usize,
+}
+
+impl Default for MarketQuantiles {
+    fn default() -> Self { Self::new() }
+}
+
+impl MarketQuantiles {
+    fn new() -> Self {
+        Self { p25: P2Quantile::new(0.25), p50: P2Quantile::new(0.50), p75: P2Quantile::new(0.75), p95: P2Quantile::new(0.95), mean: 0.0, m2: 0.0, count: 0 }
+    }
+    fn insert(&mut self, tip: u64) {
+        let x = tip as f64;
+        self.p25.insert(x); self.p50.insert(x); self.p75.insert(x); self.p95.insert(x);
+        self.count += 1;
+        // Welford
+        let delta = x - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (x - self.mean);
+    }
+    fn percentile_25(&self) -> Option<u64> { self.p25.estimate() }
+    fn percentile_50(&self) -> Option<u64> { self.p50.estimate() }
+    fn percentile_75(&self) -> Option<u64> { self.p75.estimate() }
+    fn percentile_95(&self) -> Option<u64> { self.p95.estimate() }
+    // Approximate 1% and 99% with extra P2s (additionally tracked via p25/p50 etc.); for now derive from p25/p95 ranges conservatively
+    fn percentile_01(&self) -> Option<u64> { Some((self.percentile_25().unwrap_or(0) as f64 * 0.5) as u64) }
+    fn percentile_99(&self) -> Option<u64> { Some((self.percentile_95().unwrap_or(0) as f64 * 1.2) as u64) }
+    fn mean(&self) -> f64 { self.mean }
+    fn std_dev(&self) -> f64 { if self.count > 1 { (self.m2 / (self.count as f64 - 1.0)).sqrt() } else { 0.0 } }
 }
 
 #[derive(Debug, Clone)]
