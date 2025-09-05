@@ -1,0 +1,25 @@
+# Versioned decoder discriminator maps
+[version]
+format = "1.0"
+timestamp = "2025-09-04T20:59:31-04:00"
+
+[phoenix]
+discriminators = [
+    { id = 0, name = "initialize_market" },
+    { id = 1, name = "new_order" },
+    { id = 2, name = "cancel_order" },
+]
+
+[meteora_dlmm]
+discriminators = [
+    { id = 0, name = "initialize_pool" },
+    { id = 1, name = "swap" },
+    { id = 2, name = "add_liquidity" },
+]
+
+[lifinity]
+discriminators = [
+    { id = 0, name = "swap" },
+    { id = 1, name = "deposit" },
+    { id = 2, name = "withdraw" },
+]
