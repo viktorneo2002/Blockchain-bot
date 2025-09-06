@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use ndarray::{Array1, Array2, ArrayView1};
+use tracing::{instrument, debug, info};
+use ndarray::{s, Array1, Array2, ArrayView1, Axis};
 use rand::Rng;
 use std::f64::consts::E;
 
@@ -17,23 +18,307 @@ pub enum MarketRegime {
     LowVolatility,
 }
 
+// =============================
+// BiLSTM over buffered sequence (slow-path analytics)
+// =============================
+
+#[derive(Debug, Clone)]
+pub struct BiLSTM {
+    pub fwd: LSTMLayerLN,
+    pub bwd: LSTMLayerLN,
+    pub hidden: usize, // per direction
+}
+
+impl BiLSTM {
+    pub fn new(input: usize, hidden: usize, peepholes: bool, rng: &mut impl rand::Rng) -> Self {
+        Self {
+            fwd: LSTMLayerLN::new(input, hidden, peepholes, rng),
+            bwd: LSTMLayerLN::new(input, hidden, peepholes, rng),
+            hidden,
+        }
+    }
+    // xs: (T, D) -> (T, 2H)
+    pub fn forward(&mut self, xs: &Array2<f64>) -> Array2<f64> {
+        let t = xs.len_of(Axis(0));
+        let d = self.hidden * 2;
+        let mut out = Array2::<f64>::zeros((t, d));
+        // forward pass
+        self.fwd.reset();
+        for ti in 0..t {
+            let ht = self.fwd.step(&xs.row(ti).view());
+            out.slice_mut(s![ti, 0..self.hidden]).assign(&ht);
+        }
+        // backward pass
+        self.bwd.reset();
+        for off in 0..t {
+            let ti = t - 1 - off;
+            let ht = self.bwd.step(&xs.row(ti).view());
+            out.slice_mut(s![ti, self.hidden..d]).assign(&ht);
+        }
+        out
+    }
+}
+
+// =============================
+// Residual stacked LSTM (LN variants), fixed hidden per layer
+// =============================
+
+#[derive(Debug, Clone)]
+pub struct StackedLSTM {
+    pub layers: Vec<LSTMLayerLN>,
+}
+
+impl StackedLSTM {
+    pub fn new(depth: usize, input: usize, hidden: usize, peepholes: bool, rng: &mut impl rand::Rng) -> Self {
+        let mut layers = Vec::with_capacity(depth);
+        layers.push(LSTMLayerLN::new(input, hidden, peepholes, rng));
+        for _ in 1..depth { layers.push(LSTMLayerLN::new(hidden, hidden, peepholes, rng)); }
+        Self { layers }
+    }
+    #[inline]
+    pub fn step(&mut self, x: &ArrayView1<f64>) -> Array1<f64> {
+        let mut cur = self.layers[0].step(x);
+        for l in 1..self.layers.len() {
+            let prev = cur.clone();
+            cur = self.layers[l].step(&cur.view());
+            cur = &cur + &prev; // residual
+        }
+        cur
+    }
+    pub fn reset(&mut self) { for l in &mut self.layers { l.reset(); } }
+}
+
+// =============================
+// Lightweight single-head additive attention for sequence
+// =============================
+
+#[derive(Debug, Clone)]
+pub struct AdditiveAttention {
+    w_q: Array2<f64>, // (H, H)
+    w_k: Array2<f64>, // (H, H)
+    w_v: Array2<f64>, // (H, H)
+    v: Array1<f64>,   // (H)
+    hidden: usize,
+}
+
+impl AdditiveAttention {
+    pub fn new(hidden: usize, rng: &mut impl rand::Rng) -> Self {
+        let scale = (1.0 / hidden as f64).sqrt();
+        let randm = |rc: (usize, usize)| Array2::from_shape_fn(rc, |_| rng.gen_range(-scale..scale));
+        let randv = |n: usize| Array1::from_shape_fn(n, |_| rng.gen_range(-scale..scale));
+        Self { w_q: randm((hidden, hidden)), w_k: randm((hidden, hidden)), w_v: randm((hidden, hidden)), v: randv(hidden), hidden }
+    }
+    // hs: (T, H), q: (H) -> context: (H)
+    pub fn forward(&self, hs: &Array2<f64>, q: &Array1<f64>) -> Array1<f64> {
+        let t = hs.len_of(Axis(0));
+        if t == 0 { return q.clone(); }
+        let qh = self.w_q.dot(q); // (H)
+        let ks = hs.dot(&self.w_k.t()); // (T, H)
+        let vs = hs.dot(&self.w_v.t()); // (T, H)
+        // e_t = v^T tanh(qh + k_t)
+        let mut e = Array1::<f64>::zeros(t);
+        for ti in 0..t {
+            let s = &(&qh + &ks.row(ti));
+            let score = self.v.dot(&s.mapv(f64::tanh));
+            e[ti] = score;
+        }
+        // softmax
+        let m = e.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let exps = e.mapv(|x| (x - m).exp());
+        let sum = exps.sum().max(1e-12);
+        let attn = &exps / sum; // (T)
+        // context = sum_t attn_t * v_t
+        let mut ctx = Array1::<f64>::zeros(self.hidden);
+        for ti in 0..t { let w = attn[ti]; ctx = ctx + &(vs.row(ti).to_owned() * w); }
+        ctx
+    }
+}
+
+// =============================
+// Layer Normalization & DropConnect
+// =============================
+
+#[derive(Debug, Clone)]
+pub struct LayerNorm {
+    gamma: Array1<f64>,
+    beta: Array1<f64>,
+    eps: f64,
+}
+
+impl LayerNorm {
+    pub fn new(dim: usize) -> Self {
+        Self { gamma: Array1::ones(dim), beta: Array1::zeros(dim), eps: 1e-5 }
+    }
+    #[inline]
+    pub fn forward(&self, x: &ArrayView1<f64>) -> Array1<f64> {
+        let mu = x.mean().unwrap_or(0.0);
+        let var = x.mapv(|v| (v - mu) * (v - mu)).mean().unwrap_or(0.0);
+        let inv_std = 1.0 / (var + self.eps).sqrt();
+        (&((x - mu) * inv_std) * &self.gamma) + &self.beta
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DropConnectMask {
+    mask_wx: Array2<f64>,
+    mask_wh: Array2<f64>,
+    p_keep: f64,
+}
+
+impl DropConnectMask {
+    pub fn new(shape_wx: (usize, usize), shape_wh: (usize, usize), p_keep: f64, rng: &mut impl rand::Rng) -> Self {
+        let mask_wx = Array2::from_shape_fn(shape_wx, |_| if rng.gen::<f64>() < p_keep { 1.0 } else { 0.0 });
+        let mask_wh = Array2::from_shape_fn(shape_wh, |_| if rng.gen::<f64>() < p_keep { 1.0 } else { 0.0 });
+        Self { mask_wx, mask_wh, p_keep }
+    }
+    #[inline]
+    pub fn apply(&self, w_x: &Array2<f64>, w_h: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
+        ((w_x * &self.mask_wx) / self.p_keep, (w_h * &self.mask_wh) / self.p_keep)
+    }
+}
+
+// =============================
+// LSTM with LayerNorm and optional peepholes
+// =============================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LSTMCell {
-    weights_input: Array2<f64>,
-    weights_hidden: Array2<f64>,
-    weights_cell: Array2<f64>,
-    bias: Array1<f64>,
+pub struct LSTMParamsLN {
+    w_x: Array2<f64>, // (4H, D)
+    w_h: Array2<f64>, // (4H, H)
+    b: Array1<f64>,   // (4H)
+    w_ci: Option<Array1<f64>>, // (H)
+    w_cf: Option<Array1<f64>>, // (H)
+    w_co: Option<Array1<f64>>, // (H)
+    ln_i: LayerNorm,
+    ln_f: LayerNorm,
+    ln_g: LayerNorm,
+    ln_o: LayerNorm,
     hidden_size: usize,
+    input_size: usize,
+}
+
+impl LSTMParamsLN {
+    pub fn new(input: usize, hidden: usize, peepholes: bool, rng: &mut impl rand::Rng) -> Self {
+        let scale = (1.0 / ((input + hidden) as f64)).sqrt();
+        let w_x = Array2::from_shape_fn((4 * hidden, input), |_| rng.gen_range(-scale..scale));
+        let w_h = Array2::from_shape_fn((4 * hidden, hidden), |_| rng.gen_range(-scale..scale));
+        let mut b = Array1::zeros(4 * hidden);
+        // forget gate bias +1
+        b.slice_mut(s![hidden..2 * hidden]).fill(1.0);
+        let (w_ci, w_cf, w_co) = if peepholes {
+            (
+                Some(Array1::from_shape_fn(hidden, |_| rng.gen_range(-scale..scale))),
+                Some(Array1::from_shape_fn(hidden, |_| rng.gen_range(-scale..scale))),
+                Some(Array1::from_shape_fn(hidden, |_| rng.gen_range(-scale..scale))),
+            )
+        } else { (None, None, None) };
+        Self {
+            w_x, w_h, b, w_ci, w_cf, w_co,
+            ln_i: LayerNorm::new(hidden),
+            ln_f: LayerNorm::new(hidden),
+            ln_g: LayerNorm::new(hidden),
+            ln_o: LayerNorm::new(hidden),
+            hidden_size: hidden,
+            input_size: input,
+        }
+    }
+    #[inline]
+    fn gate_slices<'a>(&self, z: &'a Array1<f64>) -> (ArrayView1<'a, f64>, ArrayView1<'a, f64>, ArrayView1<'a, f64>, ArrayView1<'a, f64>) {
+        let h = self.hidden_size;
+        (z.slice(s![0..h]), z.slice(s![h..2 * h]), z.slice(s![2 * h..3 * h]), z.slice(s![3 * h..4 * h]))
+    }
+    #[inline]
+    pub fn step(&self, x_t: &ArrayView1<f64>, h_prev: &ArrayView1<f64>, c_prev: &ArrayView1<f64>) -> (Array1<f64>, Array1<f64>) {
+        let z = self.w_x.dot(x_t) + self.w_h.dot(h_prev) + &self.b; // (4H)
+        let (i_lin, f_lin, g_lin, o_lin) = self.gate_slices(&z);
+        let i_norm = self.ln_i.forward(&i_lin);
+        let f_norm = self.ln_f.forward(&f_lin);
+        let g_norm = self.ln_g.forward(&g_lin);
+        let o_norm = self.ln_o.forward(&o_lin);
+        let mut i = i_norm.mapv(sigmoid);
+        let mut f = f_norm.mapv(sigmoid);
+        let g = g_norm.mapv(f64::tanh);
+        if let Some(w_ci) = &self.w_ci { i = &i + &(w_ci * c_prev); i.mapv_inplace(sigmoid); }
+        if let Some(w_cf) = &self.w_cf { f = &f + &(w_cf * c_prev); f.mapv_inplace(sigmoid); }
+        let c_t = &f * c_prev + &i * &g;
+        let mut o_act = o_norm;
+        if let Some(w_co) = &self.w_co { o_act = &o_act + &(w_co * &c_t); }
+        let o = o_act.mapv(sigmoid);
+        let h_t = &o * c_t.mapv(f64::tanh);
+        (h_t, c_t)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LSTMLayerLN {
+    pub params: LSTMParamsLN,
+    pub h: Array1<f64>,
+    pub c: Array1<f64>,
+}
+
+impl LSTMLayerLN {
+    pub fn new(input: usize, hidden: usize, peepholes: bool, rng: &mut impl rand::Rng) -> Self {
+        Self { params: LSTMParamsLN::new(input, hidden, peepholes, rng), h: Array1::zeros(hidden), c: Array1::zeros(hidden) }
+    }
+    #[inline]
+    pub fn step(&mut self, x_t: &ArrayView1<f64>) -> Array1<f64> {
+        let (h_t, c_t) = self.params.step(x_t, &self.h.view(), &self.c.view());
+        self.h = h_t; self.c = c_t; self.h.clone()
+    }
+    pub fn reset(&mut self) { self.h.fill(0.0); self.c.fill(0.0); }
+}
+impl MarketRegime {
+    #[inline]
+    fn from_idx(idx: usize) -> Self {
+        match idx {
+            0 => MarketRegime::StrongBull,
+            1 => MarketRegime::Bull,
+            2 => MarketRegime::Sideways,
+            3 => MarketRegime::Bear,
+            4 => MarketRegime::StrongBear,
+            5 => MarketRegime::HighVolatility,
+            6 => MarketRegime::LowVolatility,
+            _ => MarketRegime::Sideways,
+        }
+    }
+}
+
+    // For latency benches, add criterion in dev-dependencies and enable this bench in a dedicated file.
+    // #[cfg(feature = "bench")]
+    // mod benches {
+    //     use super::*;
+    //     use criterion::{criterion_group, criterion_main, Criterion};
+    //     pub fn bench_tick(c: &mut Criterion) {
+    //         let mut cls = LSTMMarketRegimeClassifier::new();
+    //         c.bench_function("tick->signals", |b| b.iter(|| {
+    //             cls.update_market_data(100.0, 1000.0, 99.99, 100.01, 500.0, 500.0, 10);
+    //             let _ = cls.get_trading_signals();
+    //         }));
+    //     }
+    //     criterion_group!(benches, bench_tick);
+    //     criterion_main!(benches);
+    // }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LSTMParams {
+    // W_x: (4H, D), W_h: (4H, H), b: (4H)
+    w_x: Array2<f64>,
+    w_h: Array2<f64>,
+    b: Array1<f64>,
+    // Optional peepholes (i,f,o gates only)
+    w_ci: Option<Array1<f64>>, // (H)
+    w_cf: Option<Array1<f64>>, // (H)
+    w_co: Option<Array1<f64>>, // (H)
+    hidden_size: usize,
+    input_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LSTMLayer {
-    input_gate: LSTMCell,
-    forget_gate: LSTMCell,
-    cell_gate: LSTMCell,
-    output_gate: LSTMCell,
-    hidden_state: Array1<f64>,
-    cell_state: Array1<f64>,
+    params: LSTMParams,
+    hidden_state: Array1<f64>, // (H)
+    cell_state: Array1<f64>,   // (H)
 }
 
 #[derive(Debug, Clone)]
@@ -52,8 +337,7 @@ pub struct MarketFeatures {
 
 pub struct LSTMMarketRegimeClassifier {
     lstm_layers: Vec<LSTMLayer>,
-    output_layer: Array2<f64>,
-    output_bias: Array1<f64>,
+    output_head: OutputHead,
     feature_buffer: VecDeque<MarketFeatures>,
     price_history: VecDeque<f64>,
     volume_history: VecDeque<f64>,
@@ -61,59 +345,126 @@ pub struct LSTMMarketRegimeClassifier {
     current_regime: Arc<RwLock<MarketRegime>>,
     sequence_length: usize,
     hidden_size: usize,
+    num_classes: usize,
     learning_rate: f64,
     momentum_factor: f64,
-    regime_threshold: f64,
+    regime_state: RegimeState,
+    last_entropy: Option<f64>,
+    last_hidden: Option<Array1<f64>>,
+    normalizers: Vec<(f64, f64)>,
+    // Observability
+    last_lat_us: VecDeque<u64>,
+    // Immutable runtime config
+    config: Arc<ClassifierConfig>,
+    // Optional enhanced backbone for slow-path analytics and optional hot-path step
+    backbone: Option<EnhancedBackbone>,
+    // Scratch buffer to avoid allocs in hot-path inference helpers
+    scratch_hidden: Array1<f64>,
 }
 
-impl LSTMCell {
-    fn new(input_size: usize, hidden_size: usize) -> Self {
-        let mut rng = rand::thread_rng();
-        let xavier_scale = (2.0 / (input_size + hidden_size) as f64).sqrt();
-        
+#[derive(Debug, Clone)]
+pub struct ClassifierConfig {
+    pub th_enter_offset: f64,
+    pub th_exit_offset: f64,
+    pub min_dwell_secs: u64,
+    pub entropy_emergency: f64,
+    pub vol_emergency: f64,
+    pub latency_p99_budget_us: u64,
+    pub latency_window: usize,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
         Self {
-            weights_input: Array2::from_shape_fn((hidden_size, input_size), |_| {
-                rng.gen_range(-xavier_scale..xavier_scale)
-            }),
-            weights_hidden: Array2::from_shape_fn((hidden_size, hidden_size), |_| {
-                rng.gen_range(-xavier_scale..xavier_scale)
-            }),
-            weights_cell: Array2::from_shape_fn((hidden_size, hidden_size), |_| {
-                rng.gen_range(-xavier_scale..xavier_scale)
-            }),
-            bias: Array1::from_shape_fn(hidden_size, |_| 0.1),
-            hidden_size,
+            th_enter_offset: 0.05,
+            th_exit_offset: 0.05,
+            min_dwell_secs: 2,
+            entropy_emergency: 1.9,
+            vol_emergency: 0.08,
+            latency_p99_budget_us: 300,
+            latency_window: 256,
         }
     }
+}
 
-    fn forward(&self, input: &ArrayView1<f64>, hidden: &ArrayView1<f64>, cell: &ArrayView1<f64>) -> Array1<f64> {
-        let z = self.weights_input.dot(input) + self.weights_hidden.dot(hidden) + self.weights_cell.dot(cell) + &self.bias;
-        z.mapv(|x| 1.0 / (1.0 + E.powf(-x)))
+impl LSTMParams {
+    fn new(input: usize, hidden: usize, peepholes: bool) -> Self {
+        let mut rng = rand::thread_rng();
+        let scale = (1.0 / (input as f64 + hidden as f64)).sqrt();
+        let w_x = Array2::from_shape_fn((4 * hidden, input), |_| rng.gen_range(-scale..scale));
+        let w_h = Array2::from_shape_fn((4 * hidden, hidden), |_| rng.gen_range(-scale..scale));
+        // Bias: forget gate +1.0, others 0
+        let mut b = Array1::zeros(4 * hidden);
+        b.slice_mut(s![hidden..2 * hidden]).fill(1.0);
+        let (w_ci, w_cf, w_co) = if peepholes {
+            (
+                Some(Array1::from_shape_fn(hidden, |_| rng.gen_range(-scale..scale))),
+                Some(Array1::from_shape_fn(hidden, |_| rng.gen_range(-scale..scale))),
+                Some(Array1::from_shape_fn(hidden, |_| rng.gen_range(-scale..scale))),
+            )
+        } else {
+            (None, None, None)
+        };
+        Self { w_x, w_h, b, w_ci, w_cf, w_co, hidden_size: hidden, input_size: input }
+    }
+
+    // Health check with latency p99, entropy/NaN guards
+    pub fn health_check(&self) -> Result<(), String> {
+        // NaN checks
+        if let Some(f) = self.feature_buffer.back() {
+            let vals = [f.price_returns, f.volume_ratio, f.volatility, f.rsi, f.macd_signal, f.order_flow_imbalance, f.spread_ratio, f.momentum, f.volume_weighted_price, f.bid_ask_pressure];
+            if vals.iter().any(|v| !v.is_finite()) { return Err("Feature NaN/INF detected".into()); }
+        }
+        // Entropy guard
+        if let Some(e) = self.last_entropy { if e.is_nan() || e.is_infinite() { return Err("Entropy invalid".into()); } }
+        // Latency p99
+        let p99 = self.latency_p99_us();
+        if p99 > self.config.latency_p99_budget_us { return Err(format!("Latency p99 {}us exceeds budget {}us", p99, self.config.latency_p99_budget_us)); }
+        Ok(())
+    }
+
+    fn latency_p99_us(&self) -> u64 {
+        if self.last_lat_us.is_empty() { return 0; }
+        let mut v: Vec<u64> = self.last_lat_us.iter().copied().collect();
+        v.sort_unstable();
+        let idx = ((v.len() as f64) * 0.99).floor() as usize;
+        v[idx.min(v.len()-1)]
+    }
+
+    // One time-step
+    fn step(&self, x_t: &ArrayView1<f64>, h_prev: &ArrayView1<f64>, c_prev: &ArrayView1<f64>) -> (Array1<f64>, Array1<f64>) {
+        let h = self.hidden_size;
+        // z = W_x x_t + W_h h_prev + b  => shape (4H)
+        let z = self.w_x.dot(x_t) + self.w_h.dot(h_prev) + &self.b;
+        let i_lin = z.slice(s![0..h]).to_owned();
+        let f_lin = z.slice(s![h..2 * h]).to_owned();
+        let g_lin = z.slice(s![2 * h..3 * h]).to_owned();
+        let o_lin = z.slice(s![3 * h..4 * h]).to_owned();
+
+        let i = if let Some(w_ci) = &self.w_ci { (&i_lin + &(w_ci * c_prev)).mapv(sigmoid) } else { i_lin.mapv(sigmoid) };
+        let f = if let Some(w_cf) = &self.w_cf { (&f_lin + &(w_cf * c_prev)).mapv(sigmoid) } else { f_lin.mapv(sigmoid) };
+        let g = g_lin.mapv(f64::tanh);
+        let c_t = &f * c_prev + &i * &g;
+        let o = if let Some(w_co) = &self.w_co { (&o_lin + &(w_co * &c_t)).mapv(sigmoid) } else { o_lin.mapv(sigmoid) };
+        let h_t = &o * c_t.mapv(f64::tanh);
+        (h_t, c_t)
     }
 }
 
 impl LSTMLayer {
-    fn new(input_size: usize, hidden_size: usize) -> Self {
+    fn new(input_size: usize, hidden_size: usize, peepholes: bool) -> Self {
         Self {
-            input_gate: LSTMCell::new(input_size, hidden_size),
-            forget_gate: LSTMCell::new(input_size, hidden_size),
-            cell_gate: LSTMCell::new(input_size, hidden_size),
-            output_gate: LSTMCell::new(input_size, hidden_size),
+            params: LSTMParams::new(input_size, hidden_size, peepholes),
             hidden_state: Array1::zeros(hidden_size),
             cell_state: Array1::zeros(hidden_size),
         }
     }
 
-    fn forward(&mut self, input: &ArrayView1<f64>) -> Array1<f64> {
-        let i_gate = self.input_gate.forward(input, &self.hidden_state.view(), &self.cell_state.view());
-        let f_gate = self.forget_gate.forward(input, &self.hidden_state.view(), &self.cell_state.view());
-        let c_gate = self.cell_gate.forward(input, &self.hidden_state.view(), &self.cell_state.view());
-        let o_gate = self.output_gate.forward(input, &self.hidden_state.view(), &self.cell_state.view());
-        
-        let c_gate_tanh = c_gate.mapv(|x| x.tanh());
-        self.cell_state = &f_gate * &self.cell_state + &i_gate * &c_gate_tanh;
-        self.hidden_state = &o_gate * self.cell_state.mapv(|x| x.tanh());
-        
+    // One incremental step: do NOT reset inside
+    fn forward_step(&mut self, x_t: &ArrayView1<f64>) -> Array1<f64> {
+        let (h, c) = self.params.step(x_t, &self.hidden_state.view(), &self.cell_state.view());
+        self.hidden_state = h;
+        self.cell_state = c;
         self.hidden_state.clone()
     }
 
@@ -131,18 +482,16 @@ impl LSTMMarketRegimeClassifier {
         let num_classes = 7;
         
         let mut lstm_layers = Vec::new();
-        lstm_layers.push(LSTMLayer::new(num_features, hidden_size));
-        lstm_layers.push(LSTMLayer::new(hidden_size, hidden_size));
+        // Two-layer LSTM with peepholes disabled by default for stability
+        lstm_layers.push(LSTMLayer::new(num_features, hidden_size, false));
+        lstm_layers.push(LSTMLayer::new(hidden_size, hidden_size, false));
         
+        // Build optional enhanced backbone with LN-based layers for slow-path
         let mut rng = rand::thread_rng();
-        let output_scale = (2.0 / hidden_size as f64).sqrt();
-        
+        let backbone = Some(EnhancedBackbone::new(num_features, hidden_size, 2, &mut rng));
         Self {
             lstm_layers,
-            output_layer: Array2::from_shape_fn((num_classes, hidden_size), |_| {
-                rng.gen_range(-output_scale..output_scale)
-            }),
-            output_bias: Array1::from_shape_fn(num_classes, |_| 0.0),
+            output_head: OutputHead::new(num_classes, hidden_size, &mut rand::thread_rng()),
             feature_buffer: VecDeque::with_capacity(sequence_length),
             price_history: VecDeque::with_capacity(100),
             volume_history: VecDeque::with_capacity(100),
@@ -150,14 +499,35 @@ impl LSTMMarketRegimeClassifier {
             current_regime: Arc::new(RwLock::new(MarketRegime::Sideways)),
             sequence_length,
             hidden_size,
+            num_classes,
             learning_rate: 0.001,
             momentum_factor: 0.9,
-            regime_threshold: 0.65,
+            regime_state: RegimeState { current: MarketRegime::Sideways, last_change_ts: now_unix() },
+            last_entropy: None,
+            last_hidden: None,
+            normalizers: vec![
+                (-0.05, 0.05),   // price_returns
+                (0.0, 3.0),      // volume_ratio
+                (0.0, 0.05),     // volatility
+                (0.0, 1.0),      // rsi
+                (-0.02, 0.02),   // macd_signal
+                (-1.0, 1.0),     // order_flow_imbalance
+                (0.0, 0.01),     // spread_ratio
+                (-0.1, 0.1),     // momentum
+                (-0.02, 0.02),   // volume_weighted_price
+                (-1.0, 1.0),     // bid_ask_pressure
+            ],
+            last_lat_us: VecDeque::with_capacity(256),
+            config: Arc::new(ClassifierConfig::default()),
+            backbone,
+            scratch_hidden: Array1::zeros(hidden_size),
         }
     }
 
+    #[instrument(skip_all, fields(buf_len = self.feature_buffer.len()))]
     pub fn update_market_data(&mut self, price: f64, volume: f64, bid: f64, ask: f64, 
                              bid_size: f64, ask_size: f64, trades_count: u64) {
+        let t0 = std::time::Instant::now();
         self.price_history.push_back(price);
         if self.price_history.len() > 100 {
             self.price_history.pop_front();
@@ -176,11 +546,29 @@ impl LSTMMarketRegimeClassifier {
                 self.feature_buffer.pop_front();
             }
             
-            if self.feature_buffer.len() == self.sequence_length {
-                let regime = self.classify_regime();
-                *self.current_regime.write() = regime;
+            // Incremental LSTM step on the newest feature vector
+            if let Some(last) = self.feature_buffer.back() {
+                let x_t = self.normalize_features(last);
+                let hidden = self.step_all_layers(&x_t.view());
+                self.last_hidden = Some(hidden.clone());
+                // Only start output decisions after warm-up sequence length reached
+                if self.feature_buffer.len() >= self.sequence_length {
+                    let logits = self.output_head.logits(&hidden);
+                    let probs = self.output_head.softmax_temp(&logits);
+                    let (regime_idx, confidence) = probs.iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .map(|(idx, &conf)| (idx, conf))
+                        .unwrap_or((0, 0.0));
+                    *self.regime_confidence.write() = confidence;
+                    *self.current_regime.write() = MarketRegime::from_idx(regime_idx);
+                }
             }
         }
+        let dt = t0.elapsed().as_micros() as u64;
+        if self.last_lat_us.len() == self.config.latency_window { let _ = self.last_lat_us.pop_front(); }
+        self.last_lat_us.push_back(dt);
+        debug!(tick_us = dt, "lstm tick latency");
     }
 
     fn extract_features(&self, price: f64, volume: f64, bid: f64, ask: f64,
@@ -318,58 +706,35 @@ impl LSTMMarketRegimeClassifier {
         weighted_sum / total_volume
     }
 
+    // Classify based on CURRENT hidden state (no resetting or reprocessing)
     fn classify_regime(&mut self) -> MarketRegime {
-        let features_array = self.prepare_features();
-        
-        for layer in &mut self.lstm_layers {
-            layer.reset_states();
-        }
-        
-        let mut hidden = features_array;
-        for layer in &mut self.lstm_layers {
-            hidden = layer.forward(&hidden.view());
-        }
-        
-        let logits = self.output_layer.dot(&hidden) + &self.output_bias;
-        let probs = self.softmax(&logits);
-        
+        let hidden = if let Some(h) = &self.last_hidden { h.clone() } else { Array1::zeros(self.hidden_size) };
+        let logits = self.output_head.logits(&hidden);
+        let probs = self.output_head.softmax_temp(&logits);
         let (regime_idx, confidence) = probs.iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(idx, &conf)| (idx, conf))
             .unwrap_or((0, 0.0));
-        
         *self.regime_confidence.write() = confidence;
-        
-        match regime_idx {
-            0 => MarketRegime::StrongBull,
-            1 => MarketRegime::Bull,
-            2 => MarketRegime::Sideways,
-            3 => MarketRegime::Bear,
-            4 => MarketRegime::StrongBear,
-            5 => MarketRegime::HighVolatility,
-            6 => MarketRegime::LowVolatility,
-            _ => MarketRegime::Sideways,
-        }
+        *self.current_regime.write() = MarketRegime::from_idx(regime_idx);
+        MarketRegime::from_idx(regime_idx)
     }
 
-    fn prepare_features(&self) -> Array1<f64> {
-        let mut features = Array1::zeros(10);
-        
-        if let Some(last_features) = self.feature_buffer.back() {
-            features[0] = self.normalize_value(last_features.price_returns, -0.05, 0.05);
-            features[1] = self.normalize_value(last_features.volume_ratio, 0.0, 3.0);
-            features[2] = self.normalize_value(last_features.volatility, 0.0, 0.05);
-            features[3] = self.normalize_value(last_features.rsi, 0.0, 1.0);
-            features[4] = self.normalize_value(last_features.macd_signal, -0.02, 0.02);
-            features[5] = self.normalize_value(last_features.order_flow_imbalance, -1.0, 1.0);
-            features[6] = self.normalize_value(last_features.spread_ratio, 0.0, 0.01);
-            features[7] = self.normalize_value(last_features.momentum, -0.1, 0.1);
-            features[8] = self.normalize_value(last_features.volume_weighted_price, -0.02, 0.02);
-            features[9] = self.normalize_value(last_features.bid_ask_pressure, -1.0, 1.0);
-        }
-        
-        features
+    fn normalize_features(&self, f: &MarketFeatures) -> Array1<f64> {
+        let mut x = Array1::zeros(10);
+        let n = &self.normalizers;
+        x[0] = self.normalize_value(f.price_returns, n[0].0, n[0].1);
+        x[1] = self.normalize_value(f.volume_ratio, n[1].0, n[1].1);
+        x[2] = self.normalize_value(f.volatility, n[2].0, n[2].1);
+        x[3] = self.normalize_value(f.rsi, n[3].0, n[3].1);
+        x[4] = self.normalize_value(f.macd_signal, n[4].0, n[4].1);
+        x[5] = self.normalize_value(f.order_flow_imbalance, n[5].0, n[5].1);
+        x[6] = self.normalize_value(f.spread_ratio, n[6].0, n[6].1);
+        x[7] = self.normalize_value(f.momentum, n[7].0, n[7].1);
+        x[8] = self.normalize_value(f.volume_weighted_price, n[8].0, n[8].1);
+        x[9] = self.normalize_value(f.bid_ask_pressure, n[9].0, n[9].1);
+        x
     }
 
     fn normalize_value(&self, value: f64, min: f64, max: f64) -> f64 {
@@ -383,13 +748,53 @@ impl LSTMMarketRegimeClassifier {
         exp_logits / sum_exp
     }
 
-    pub fn get_current_regime(&self) -> MarketRegime {
-        *self.current_regime.read()
+    // Step all layers once with x_t; returns last hidden
+    fn step_all_layers(&mut self, x_t: &ArrayView1<f64>) -> Array1<f64> {
+        let mut cur = x_t.to_owned();
+        for layer in &mut self.lstm_layers {
+            cur = layer.forward_step(&cur.view());
+        }
+        cur
     }
 
-    pub fn get_regime_confidence(&self) -> f64 {
-        *self.regime_confidence.read()
+    // ========= Optional enhanced inference helpers =========
+    // Hot-path helper using EnhancedBackbone's streaming stack without changing public path
+    #[inline]
+    pub fn infer_tick(&mut self, x_t: &ArrayView1<f64>) -> (usize, f64, Array1<f64>) {
+        let h = if let Some(b) = &mut self.backbone { b.step(x_t) } else { self.step_all_layers(x_t) };
+        self.scratch_hidden.assign(&h);
+        let logits = self.output_head.logits(&self.scratch_hidden);
+        let probs = self.output_head.softmax_temp(&logits);
+        let (cls, conf) = probs
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(i, p)| (i, p))
+            .unwrap_or((0, 0.0));
+        (cls, conf, probs)
     }
+
+    // Slow-path helper to get sequence-enhanced probabilities via BiLSTM + attention
+    pub fn infer_sequence(&mut self, xs: &Array2<f64>) -> Array1<f64> {
+        if let Some(b) = &mut self.backbone {
+            let ctx = b.sequence_context(xs); // (2H)
+            // If 2H == H * 2, slice or project down to H for the existing head; simple slice here
+            let h_len = self.scratch_hidden.len();
+            let h_proj = ctx.slice_move(s![0..h_len]);
+            let logits = self.output_head.logits(&h_proj);
+            self.softmax(&logits)
+        } else {
+            // Fallback to last hidden
+            let h = if let Some(h) = &self.last_hidden { h.clone() } else { Array1::zeros(self.hidden_size) };
+            let logits = self.output_head.logits(&h);
+            self.softmax(&logits)
+        }
+    }
+
+    pub fn get_current_regime(&self) -> MarketRegime { *self.current_regime.read() }
+
+    pub fn get_regime_confidence(&self) -> f64 { *self.regime_confidence.read() }
 
     pub fn get_regime_features(&self) -> Option<RegimeAnalysis> {
         if self.feature_buffer.is_empty() {
@@ -662,41 +1067,45 @@ impl LSTMMarketRegimeClassifier {
         }
     }
 
-    pub fn optimize_for_latency(&mut self) {
-        self.sequence_length = self.sequence_length.min(15);
-        self.price_history = VecDeque::with_capacity(50);
-        self.volume_history = VecDeque::with_capacity(50);
-    }
-
     pub fn get_trading_signals(&self) -> TradingSignals {
         let regime = self.get_current_regime();
-        let confidence = self.get_regime_confidence();
-        let analysis = self.get_regime_features().unwrap_or_default();
-        
-        let position_bias = match regime {
+        let features = self.feature_buffer.back().unwrap_or(&MarketFeatures {
+            price_returns: 0.0,
+            volume_ratio: 1.0,
+            volatility: 0.01,
+            rsi: 0.5,
+            macd_signal: 0.0,
+            order_flow_imbalance: 0.0,
+            spread_ratio: 0.001,
+            momentum: 0.0,
+            volume_weighted_price: 0.0,
+            bid_ask_pressure: 0.0,
+        });
+        // Calibrated confidence and risk budget
+        let conf = self.get_regime_confidence();
+        let entropy = self.last_entropy.unwrap_or(1.5);
+        let vol = features.volatility;
+        let risk_budget = (1.0 / (1.0 + vol * 200.0)) * (1.5 - entropy).clamp(0.25, 1.25);
+        let dwell_secs = now_unix().saturating_sub(self.regime_state.last_change_ts) as f64;
+        let dwell_weight = (dwell_secs / 10.0).clamp(0.5, 1.0);
+
+        let raw_bias = match regime {
             MarketRegime::StrongBull => 1.0,
             MarketRegime::Bull => 0.6,
             MarketRegime::Sideways => 0.0,
             MarketRegime::Bear => -0.6,
             MarketRegime::StrongBear => -1.0,
             MarketRegime::HighVolatility => 0.0,
-            MarketRegime::LowVolatility => 0.0,
+            MarketRegime::LowVolatility => 0.3,
         };
-        
-        let risk_multiplier = match regime {
-            MarketRegime::HighVolatility => 0.5,
-            MarketRegime::LowVolatility => 1.5,
-            MarketRegime::StrongBull | MarketRegime::StrongBear => 0.8,
-            _ => 1.0,
-        };
-        
+        let position_bias = raw_bias * conf * risk_budget * dwell_weight;
+        let risk_multiplier = risk_budget.clamp(0.2, 1.5);
         let stop_loss_distance = match regime {
             MarketRegime::HighVolatility => 0.02,
             MarketRegime::LowVolatility => 0.005,
             MarketRegime::StrongBull | MarketRegime::StrongBear => 0.015,
             _ => 0.01,
         };
-        
         let take_profit_ratio = match regime {
             MarketRegime::StrongBull | MarketRegime::StrongBear => 3.0,
             MarketRegime::Bull | MarketRegime::Bear => 2.5,
@@ -704,15 +1113,14 @@ impl LSTMMarketRegimeClassifier {
             MarketRegime::LowVolatility => 1.5,
             MarketRegime::Sideways => 2.0,
         };
-        
         TradingSignals {
-            position_bias: position_bias * confidence,
+            position_bias,
             risk_multiplier,
             stop_loss_distance,
             take_profit_ratio,
-            entry_threshold: 0.7 * confidence,
+            entry_threshold: 0.7 * conf,
             exit_threshold: 0.3,
-            max_position_size: self.calculate_max_position_size(regime, confidence),
+            max_position_size: self.calculate_max_position_size(regime, conf),
             time_in_force: self.calculate_time_in_force(regime),
         }
     }
