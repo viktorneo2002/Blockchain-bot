@@ -1,3 +1,254 @@
+// ===== Verifier-friendly bounded readers =====
+#[inline(always)]
+fn load_bytes<'a>(payload: &'a [u8], off: usize, n: usize) -> Result<&'a [u8], ()> {
+    if off.checked_add(n).ok_or(())? > payload.len() { return Err(()); }
+
+// ===== Flash loan correlation flags and helpers =====
+const FL_BORROW: u8 = 0x01;
+const FL_TRADE:  u8 = 0x02;
+const FL_REPAY:  u8 = 0x04;
+
+#[inline(always)]
+fn flash_prog_prefix(program_id: &[u8; 32]) -> bool {
+    (program_id[0] == 0x87 && program_id[1] == 0x62) || // Solend (example prefix)
+    (program_id[0] == 0x4a && program_id[1] == 0x67) || // Port
+    (program_id[0] == 0x22 && program_id[1] == 0xd6)    // Larix
+}
+
+#[inline(always)]
+fn correlate_flash_bits(program_id: &[u8; 32], data_len: u16, accs: u8, flags: &mut u8) {
+    if flash_prog_prefix(program_id) && data_len >= 8 { *flags |= FL_BORROW; }
+    if accs >= 4 && data_len >= 8 { *flags |= FL_TRADE; }
+    if flash_prog_prefix(program_id) && data_len >= 4 && accs >= 2 { *flags |= FL_REPAY; }
+}
+
+#[inline(always)]
+fn detect_flash_loan_correlated(event: &PacketEvent, corr_flags: u8) -> bool {
+    let pattern = (corr_flags & (FL_BORROW | FL_TRADE | FL_REPAY)) == (FL_BORROW | FL_TRADE | FL_REPAY);
+    if pattern { return true; }
+    let program_match = (event.program_id[0] == 0x87 && event.program_id[1] == 0x62) ||
+                        (event.program_id[0] == 0x4a && event.program_id[1] == 0x67) ||
+                        (event.program_id[0] == 0x22 && event.program_id[1] == 0xd6);
+    let suspicious = event.compute_units > 350_000 && event.instructions_count >= 3 && event.accounts_count >= 6;
+    program_match && suspicious
+}
+
+// ===== Per-slot rolling Bloom for flash bursts =====
+const FL_BLOOM_BITS: usize = 2048;
+const FL_BLOOM_WORDS: usize = FL_BLOOM_BITS / 64;
+const SLOT_NS: u64 = 400_000_000; // ~400ms
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashBloom { words: [u64; FL_BLOOM_WORDS], epoch_ns: u64 }
+
+#[map]
+static FLASH_BLOOM_PCPU: PerCpuArray<FlashBloom> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn mix64(mut x: u64) -> u64 { x = x.wrapping_add(0x9E37_79B9_7F4A_7C15); let mut z = x; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9); z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^ (z >> 31) }
+
+#[inline(always)]
+fn fl_bloom_index(h: u64) -> (usize, u64, usize, u64) {
+    let h1 = mix64(h); let h2 = mix64(h ^ 0x517c_c1b1_c2a3_e4f5);
+    let i1 = (h1 as usize) & (FL_BLOOM_BITS - 1); let i2 = (h2 as usize) & (FL_BLOOM_BITS - 1);
+    (i1 / 64, 1u64 << (i1 & 63), i2 / 64, 1u64 << (i2 & 63))
+}
+
+#[inline(always)]
+fn amount_bucket(lamports: u64) -> u32 {
+    if lamports >= 1_000_000_000 { 3 } else if lamports >= 100_000_000 { 2 } else if lamports >= 10_000_000 { 1 } else { 0 }
+}
+
+#[inline(always)]
+fn flash_burst_mark(now: u64, borrower_prefix8: u64, lamports: u64) -> bool {
+    unsafe {
+        if let Some(b) = FLASH_BLOOM_PCPU.get_ptr_mut(0) {
+            let rotate = now.wrapping_sub((*b).epoch_ns) > SLOT_NS;
+            if rotate { (*b).words = [0u64; FL_BLOOM_WORDS]; (*b).epoch_ns = now; }
+            let key = borrower_prefix8 ^ (amount_bucket(lamports) as u64);
+            let (w1,m1,w2,m2) = fl_bloom_index(key);
+            let seen = ((*b).words[w1] & m1) != 0 && ((*b).words[w2] & m2) != 0;
+            (*b).words[w1] |= m1; (*b).words[w2] |= m2;
+            seen
+        } else { false }
+    }
+}
+
+// ================= Tail-call stages =================
+#[inline(always)]
+fn prefilter_stage(ctx: &XdpContext) -> Result<(), ()> {
+    let eth_hdr: *const EthHdr = unsafe { ptr_at(ctx, 0) }?;
+    if unsafe { (*eth_hdr).h_proto } != u16::from_be(ETH_P_IP) { return Err(()); }
+    let ip_hdr: *const IpHdr = unsafe { ptr_at(ctx, ETH_HLEN) }?;
+    if unsafe { (*ip_hdr).protocol } != IPPROTO_UDP { return Err(()); }
+    let udp_hdr: *const UdpHdr = unsafe { ptr_at(ctx, ETH_HLEN + IP_HLEN) }?;
+    let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
+    let src_port = u16::from_be(unsafe { (*udp_hdr).source });
+    let payload_off = (ETH_HLEN + IP_HLEN + UDP_HLEN) as u16;
+    let payload_len = (u16::from_be(unsafe { (*udp_hdr).len }) as usize).saturating_sub(UDP_HLEN);
+    if payload_len < 24 || payload_len > MAX_PACKET_SIZE { return Err(()); }
+    let data = ctx.data(); let data_end = ctx.data_end();
+    if (data + payload_off as usize + payload_len) > data_end { return Err(()); }
+    let payload = unsafe { core::slice::from_raw_parts((data + payload_off as usize) as *const u8, payload_len) };
+    if !is_quic_like(payload) { return Err(()); }
+    unsafe {
+        if let Some(s) = SCRATCH_PCPU.get_ptr_mut(0) {
+            (*s).dst_port = dst_port; (*s).src_port = src_port;
+            (*s).payload_off = payload_off; (*s).payload_len = payload_len as u16;
+            (*s).flags = 1; // quic-like
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn signature_stage(_ctx: &XdpContext) -> Result<(), ()> {
+    // Minimal stage reserved for future bounded signature pre-decode.
+    Ok(())
+}
+
+#[inline(always)]
+fn hot_path_decision(ctx: &XdpContext, payload: &[u8], event: &mut PacketEvent) -> u32 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    if mark_bundle_flow(now, payload) { event.flags |= 0x01; }
+    classify_mev_type(event);
+    event.priority = mev_priority_sigmoid(event);
+    let ttl = get_cache_duration(event);
+    if bloom_check_set(now, ttl, event.hash) {
+        // Keep policy simple: drop at XDP for duplicates
+        return xdp_action::XDP_DROP;
+    }
+    // Flash-loan correlation using bounded proxies
+    let mut corr: u8 = 0;
+    correlate_flash_bits(&event.program_id, event.data_len, event.accounts_count, &mut corr);
+    // Per-slot burst mark keyed by program_id prefix (approx borrower)
+    let mut borrower_prefix8 = 0u64;
+    borrower_prefix8 = u64::from_le_bytes([event.program_id[0],event.program_id[1],event.program_id[2],event.program_id[3],event.program_id[4],event.program_id[5],event.program_id[6],event.program_id[7]]);
+    let burst = flash_burst_mark(now, borrower_prefix8, event.lamports);
+    if detect_flash_loan_correlated(event, corr) || ( (corr & (FL_BORROW|FL_TRADE)) == (FL_BORROW|FL_TRADE) && burst ) {
+        // Mark as flash loan aggressively
+        event.mev_type = 4; // Liquidation/flash bucket re-used for signal
+        event.priority = event.priority.saturating_add(2).min(15);
+    }
+    // Emit lite event
+    let lite = PacketEventLite { ts: event.timestamp, src_ip: event.src_ip, dst_ip: event.dst_ip,
+        src_port: event.src_port, dst_port: event.dst_port, lamports: event.lamports,
+        cu: event.compute_units, prio: event.priority, mev: event.mev_type, flags: event.flags,
+        accs: event.accounts_count, insts: event.instructions_count, hash: event.hash,
+        program_id_prefix: [event.program_id[0],event.program_id[1],event.program_id[2],event.program_id[3]] };
+    unsafe { HOT_HEADERS.output(ctx, &lite, 0); }
+    // AF_XDP redirect for ultra-priority
+    if event.priority >= 13 || optimize_packet_routing(event) >= 2 {
+        let qid: u32 = (event.hash as u32) & 0x3F;
+        let act = unsafe { XSK_SOCKS.redirect(ctx, qid) };
+        if act != 0 { return act; }
+    }
+    xdp_action::XDP_PASS
+}
+
+#[inline(always)]
+fn classify_stage(ctx: &XdpContext) -> Result<u32, ()> {
+    // Fetch scratch
+    let s = unsafe { SCRATCH_PCPU.get_ptr(0) }.ok_or(())?;
+    if unsafe { (*s).flags & 1 } == 0 { return Err(()); }
+    let payload_off = unsafe { (*s).payload_off } as usize;
+    let payload_len = unsafe { (*s).payload_len } as usize;
+    let data = ctx.data();
+    let payload = unsafe { core::slice::from_raw_parts((data + payload_off) as *const u8, payload_len) };
+
+    // Bounded extract
+    let mut event = unsafe { mem::zeroed::<PacketEvent>() };
+    match extract_transaction_info(payload) {
+        Ok(mut ev) => { event = ev; }
+        Err(_) => { return Err(()); }
+    }
+    // Fill ip/ports
+    let ip_hdr: *const IpHdr = unsafe { ptr_at(ctx, ETH_HLEN) }?;
+    event.timestamp = unsafe { bpf_ktime_get_ns() };
+    event.src_ip = u32::from_be(unsafe { (*ip_hdr).saddr });
+    event.dst_ip = u32::from_be(unsafe { (*ip_hdr).daddr });
+    let udp_hdr: *const UdpHdr = unsafe { ptr_at(ctx, ETH_HLEN + IP_HLEN) }?;
+    event.src_port = u16::from_be(unsafe { (*udp_hdr).source });
+    event.dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
+
+    let act = hot_path_decision(ctx, payload, &mut event);
+    if act != xdp_action::XDP_PASS { return Ok(act); }
+    // For very hot flows, also emit full event
+    if event.priority >= 12 {
+        unsafe { let _ = PRIORITY_QUEUE.push(&event, 0); PACKET_EVENTS.output(ctx, &event, 0); }
+    }
+    Ok(xdp_action::XDP_PASS)
+}
+
+// Tail-called XDP entrypoints
+#[xdp]
+pub fn prog_prefilter(ctx: XdpContext) -> u32 {
+    if prefilter_stage(&ctx).is_ok() {
+        unsafe { PROGS.tail_call(&ctx, 1); }
+    }
+    xdp_action::XDP_PASS
+}
+
+#[xdp]
+pub fn prog_sigparse(ctx: XdpContext) -> u32 {
+    if signature_stage(&ctx).is_ok() {
+        unsafe { PROGS.tail_call(&ctx, 2); }
+    }
+    xdp_action::XDP_PASS
+}
+
+#[xdp]
+pub fn prog_classify(ctx: XdpContext) -> u32 {
+    match classify_stage(&ctx) { Ok(a) => a, Err(_) => xdp_action::XDP_PASS }
+}
+    Ok(&payload[off..off + n])
+}
+
+#[inline(always)]
+fn load_u16_le(payload: &[u8], off: usize) -> Result<u16, ()> {
+    let b = load_bytes(payload, off, 2)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
+}
+
+#[inline(always)]
+fn load_u32_le(payload: &[u8], off: usize) -> Result<u32, ()> {
+    let b = load_bytes(payload, off, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[inline(always)]
+fn load_u32_be(payload: &[u8], off: usize) -> Result<u32, ()> {
+    let b = load_bytes(payload, off, 4)?;
+    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[inline(always)]
+fn copy_32(payload: &[u8], off: usize, dst: &mut [u8; 32]) -> Result<(), ()> {
+    let s = load_bytes(payload, off, 32)?;
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), dst.as_mut_ptr(), 32) };
+    Ok(())
+}
+
+// Compact-u16, bounded and local
+#[inline(always)]
+fn parse_compact_u16_bounded(payload: &[u8], off: &mut usize) -> Result<u16, ()> {
+    let b0 = *load_bytes(payload, *off, 1)? .first().ok_or(())?;
+    if b0 < 0x80 {
+        *off += 1;
+        Ok(b0 as u16)
+    } else if b0 < 0xFE {
+        let b1 = *load_bytes(payload, *off + 1, 1)? .first().ok_or(())?;
+        let v = ((b0 & 0x7F) as u16) | ((b1 as u16) << 7);
+        *off += 2;
+        Ok(v)
+    } else {
+        let v = load_u16_le(payload, *off + 1)?;
+        *off += 3;
+        Ok(v)
+    }
+}
+
 #![no_std]
 #![no_main]
 
@@ -5,7 +256,7 @@ use aya_bpf::{
     bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{bpf_ktime_get_ns, bpf_get_prandom_u32},
     macros::{classifier, map, xdp},
-    maps::{HashMap, PerfEventArray, Queue, LruHashMap},
+    maps::{HashMap, PerfEventArray, Queue, LruHashMap, PerCpuArray, XskMap, ProgramArray},
     programs::{TcContext, XdpContext, ProbeContext},
     BpfContext,
 };
@@ -15,6 +266,97 @@ use memoffset::offset_of;
 
 mod bindings {
     pub use aya_bpf::bindings::*;
+}
+
+#[inline(always)]
+fn is_solana_port(p: u16) -> bool {
+    (p >= SOLANA_PORT_START && p <= SOLANA_PORT_END) ||
+    p == SOLANA_GOSSIP_PORT ||
+    p == SOLANA_TPU_PORT ||
+    p == SOLANA_TPU_FWD_PORT ||
+    p == SOLANA_TPU_VOTE_PORT
+}
+
+#[inline(always)]
+fn should_deep_parse_udp(dst_port: u16, payload: &[u8]) -> bool {
+    if !is_solana_port(dst_port) { return false; }
+    if payload.len() < 24 { return false; }
+    is_quic_like(payload)
+}
+
+// ===== Adaptive Bloom (per-CPU rotating) + global LRU =====
+const BLOOM_BITS: usize = 4096; // 4k bits per CPU
+const BLOOM_WORDS: usize = BLOOM_BITS / 64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Bloom { words: [u64; BLOOM_WORDS], epoch_ns: u64 }
+
+#[map]
+static BLOOM_PCPU: PerCpuArray<Bloom> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn hash_mix64(mut x: u64) -> u64 {
+    // SplitMix64
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline(always)]
+fn bloom_indices(h: u64) -> (usize, u64, usize, u64) {
+    let h1 = hash_mix64(h);
+    let h2 = hash_mix64(h ^ 0x517c_c1b1_c2a3_e4f5);
+    let i1 = (h1 as usize) & (BLOOM_BITS - 1);
+    let i2 = (h2 as usize) & (BLOOM_BITS - 1);
+    (i1 / 64, 1u64 << (i1 & 63), i2 / 64, 1u64 << (i2 & 63))
+}
+
+#[inline(always)]
+fn bloom_check_set(now: u64, ttl_ns: u64, sig_hash: u64) -> bool {
+    unsafe {
+        if let Some(b) = BLOOM_PCPU.get_ptr_mut(0) {
+            // rotate every ~100ms to prevent saturation
+            let rotate = now.wrapping_sub((*b).epoch_ns) > 100_000_000;
+            if rotate { (*b).words = [0u64; BLOOM_WORDS]; (*b).epoch_ns = now; }
+            let (w1, m1, w2, m2) = bloom_indices(sig_hash);
+            let seen = ((*b).words[w1] & m1) != 0 && ((*b).words[w2] & m2) != 0;
+            (*b).words[w1] |= m1; (*b).words[w2] |= m2;
+            // confirm via LRU TTL
+            if let Some(v) = TRANSACTION_CACHE.get(&sig_hash) { if now.wrapping_sub((*v).ts) < ttl_ns { return true; } }
+            let v = CacheVal { ts: now }; let _ = TRANSACTION_CACHE.insert(&sig_hash, &v, 0);
+            seen
+        } else { false }
+    }
+}
+
+// AF_XDP socket map for zero-copy handoff of hot flows to userspace
+#[map]
+static XSK_SOCKS: XskMap = XskMap::with_max_entries(64, 0);
+
+// Program array for tail calls (future split: prog0/prefilter, prog1/parse, prog2/score)
+#[map]
+static PROGS: ProgramArray = ProgramArray::with_max_entries(4, 0);
+
+// Probabilistic priority via LUT (maps into 0..15)
+static SIGMOID_LUT: [u8; 17] = [0,1,2,3,5,7,9,11,12,13,14,14,15,15,15,15,15];
+
+#[inline(always)]
+fn clamp_i32(x: i32, lo: i32, hi: i32) -> i32 { if x < lo { lo } else if x > hi { hi } else { x } }
+
+#[inline(always)]
+fn mev_priority_sigmoid(event: &PacketEvent) -> u8 {
+    let mut s: i32 = 0;
+    s = s.saturating_add(((event.lamports / 100_000_000) as i32).min(100) * 3);
+    s = s.saturating_add(((event.compute_units / 100_000) as i32).min(20) * 4);
+    s = s.saturating_add((event.accounts_count as i32).min(32));
+    s = s.saturating_add((event.instructions_count as i32).min(16) * 2);
+    s = s.saturating_add(match event.mev_type { 4 => 10, 2 => 8, 3 => 6, 1 => 4, _ => 0 } as i32);
+    s = clamp_i32(s - 32, -64, 64);
+    let idx = ((s + 64) as u32 / 8) as usize;
+    SIGMOID_LUT[idx.min(SIGMOID_LUT.len() - 1)]
 }
 
 const SOLANA_PORT_START: u16 = 8000;
@@ -34,6 +376,20 @@ const IPPROTO_UDP: u8 = 17;
 const ETH_HLEN: usize = 14;
 const IP_HLEN: usize = 20;
 const UDP_HLEN: usize = 8;
+
+// Shared per-CPU scratch for tail-call pipeline
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Scratch {
+    pub dst_port: u16,
+    pub src_port: u16,
+    pub payload_off: u16,
+    pub payload_len: u16,
+    pub flags: u8, // bit0: quic-like
+}
+
+#[map]
+static SCRATCH_PCPU: PerCpuArray<Scratch> = PerCpuArray::with_max_entries(1, 0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -90,6 +446,26 @@ pub struct PacketEvent {
     pub hash: u64,
 }
 
+// Lightweight event for perf (compact hot path emission)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PacketEventLite {
+    pub ts: u64,
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub lamports: u64,
+    pub cu: u32,
+    pub prio: u8,
+    pub mev: u8,
+    pub flags: u8,
+    pub accs: u8,
+    pub insts: u8,
+    pub hash: u64,
+    pub program_id_prefix: [u8; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FilterStats {
@@ -115,7 +491,10 @@ pub struct ProgramInfo {
 static PACKET_EVENTS: PerfEventArray<PacketEvent> = PerfEventArray::with_max_entries(4096, 0);
 
 #[map]
-static FILTER_STATS: HashMap<u32, FilterStats> = HashMap::with_max_entries(1, 0);
+static HOT_HEADERS: PerfEventArray<PacketEventLite> = PerfEventArray::with_max_entries(4096, 0);
+
+#[map]
+static FILTER_STATS: PerCpuArray<FilterStats> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static PRIORITY_QUEUE: Queue<PacketEvent> = Queue::with_max_entries(2048, 0);
@@ -123,32 +502,31 @@ static PRIORITY_QUEUE: Queue<PacketEvent> = Queue::with_max_entries(2048, 0);
 #[map]
 static KNOWN_DEX_PROGRAMS: HashMap<[u8; 32], ProgramInfo> = HashMap::with_max_entries(128, 0);
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CacheVal { ts: u64 }
+
 #[map]
-static TRANSACTION_CACHE: LruHashMap<u64, u64> = LruHashMap::with_max_entries(8192, 0);
+static TRANSACTION_CACHE: LruHashMap<u64, CacheVal> = LruHashMap::with_max_entries(8192, 0);
 
-const SERUM_V3_PROGRAM: [u8; 32] = [
-    0x9a, 0xf0, 0x01, 0xee, 0x78, 0x9f, 0xe5, 0x51, 0x4e, 0xb0, 0xd8, 0xee, 0x8e, 0xba, 0x87,
-    0x30, 0x7b, 0x6b, 0x8d, 0x9e, 0xc0, 0x2f, 0x9f, 0xa3, 0x30, 0xe8, 0x3e, 0x10, 0xaf, 0x01,
-    0xb9, 0x25
-];
+// Flow-level tagging for bundles via DCID hashing
+#[map]
+static BUNDLE_FLOWS: LruHashMap<u64, CacheVal> = LruHashMap::with_max_entries(4096, 0);
 
-const RAYDIUM_AMM_V4: [u8; 32] = [
-    0x67, 0x5k, 0xPX, 0x87, 0xnK, 0x7N, 0x4V, 0xvJ, 0xTA, 0x4j, 0x15, 0x4z, 0x6c, 0x3D, 0xB1,
-    0x4a, 0x5C, 0xF7, 0x4B, 0x5f, 0x3e, 0xDD, 0x45, 0xA1, 0x96, 0x74, 0x81, 0x8a, 0xE5, 0x0B,
-    0x8E, 0xfa
-];
+#[inline(always)]
+fn cache_check_and_update(hash: u64, now: u64, ttl_ns: u64) -> bool {
+    // returns true if considered duplicate within TTL
+    unsafe {
+        if let Some(val) = TRANSACTION_CACHE.get(&hash) {
+            if now.wrapping_sub((*val).ts) < ttl_ns { return true; }
+        }
+        let v = CacheVal { ts: now };
+        let _ = TRANSACTION_CACHE.insert(&hash, &v, 0);
+    }
+    false
+}
 
-const ORCA_WHIRLPOOL: [u8; 32] = [
-    0x85, 0xBf, 0xD9, 0x14, 0x7f, 0x16, 0xCa, 0xa8, 0xD7, 0x12, 0xEe, 0x99, 0x30, 0x01, 0x23,
-    0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01,
-    0x23, 0x45
-];
-
-const OPENBOOK_V2: [u8; 32] = [
-    0xC1, 0xAF, 0xA5, 0x67, 0xb5, 0x48, 0x17, 0x24, 0x98, 0xFB, 0x68, 0x1f, 0x4e, 0x49, 0x2d,
-    0xaE, 0xC5, 0x93, 0x7F, 0xfE, 0x6A, 0x89, 0x96, 0x36, 0x96, 0x4D, 0x73, 0x4A, 0x8F, 0x01,
-    0x23, 0x45
-];
+// Program IDs are supplied from userland via KNOWN_DEX_PROGRAMS map.
 
 #[inline(always)]
 fn parse_compact_u16(data: &[u8]) -> Result<(u16, usize), ()> {
@@ -198,14 +576,29 @@ unsafe fn ptr_at_tc<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
 
 #[inline(always)]
 fn is_dex_program(program_id: &[u8; 32]) -> bool {
-    *program_id == SERUM_V3_PROGRAM || 
-    *program_id == RAYDIUM_AMM_V4 ||
-    *program_id == ORCA_WHIRLPOOL ||
-    *program_id == OPENBOOK_V2 ||
-    (program_id[0] == 0x67 && program_id[1] == 0x5b) ||
-    (program_id[0] == 0x9a && program_id[1] == 0xf0) ||
-    (program_id[0] == 0x85 && program_id[1] == 0xBf) ||
-    (program_id[0] == 0xC1 && program_id[1] == 0xAF)
+    // Prefer classifier map to allow hot-swappable updates from userland.
+    unsafe { KNOWN_DEX_PROGRAMS.get(program_id).is_some() }
+}
+
+// ===== QUIC gate: shallow, bounded, verifier-friendly =====
+#[inline(always)]
+fn is_quic_like(payload: &[u8]) -> bool {
+    if payload.len() < 7 { return false; }
+    let b0 = payload[0];
+    if (b0 & 0xC0) == 0xC0 {
+        if payload.len() < 12 { return false; }
+        let ver = ((payload[1] as u32) << 24) | ((payload[2] as u32) << 16) | ((payload[3] as u32) << 8) | (payload[4] as u32);
+        if ver == 0 { return false; }
+        let dcid_len = payload[5] as usize;
+        if dcid_len == 0 || dcid_len > 20 { return false; }
+        let off_scid_len = 6 + dcid_len; if off_scid_len >= payload.len() { return false; }
+        let scid_len = payload[off_scid_len] as usize;
+        let off_after_ids = off_scid_len + 1 + scid_len; if off_after_ids >= payload.len() { return false; }
+        let pn_len = ((b0 & 0x03) as usize) + 1;
+        off_after_ids + pn_len < payload.len()
+    } else {
+        (b0 & 0x40) == 0x40
+    }
 }
 
 #[inline(always)]
@@ -227,101 +620,58 @@ fn calculate_transaction_hash(signature: &[u8; 64]) -> u64 {
 
 #[inline(always)]
 fn extract_transaction_info(payload: &[u8]) -> Result<PacketEvent, ()> {
-    if payload.len() < 176 {
-        return Err(());
-    }
+    if payload.len() < 176 { return Err(()); }
 
     let mut event = unsafe { mem::zeroed::<PacketEvent>() };
     event.compute_units = 200_000;
-    
-    let mut offset = 0;
-    
-    let (sig_count, sig_offset) = parse_compact_u16(&payload[offset..]).map_err(|_| ())?;
-    offset += sig_offset;
-    
-    if sig_count == 0 || sig_count > 8 || payload.len() < offset + (sig_count as usize * SIGNATURE_LEN) {
-        return Err(());
-    }
-    
-    if offset + SIGNATURE_LEN <= payload.len() {
-        for i in 0..SIGNATURE_LEN {
-            event.signature[i] = payload[offset + i];
-        }
-    }
+
+    let mut off: usize = 0;
+    // signatures count
+    let sig_count = parse_compact_u16_bounded(payload, &mut off)?;
+    if sig_count == 0 || sig_count > 8 { return Err(()); }
+    // copy first signature (64) in two fixed chunks of 32
+    copy_32(payload, off, unsafe { &mut *(&mut event.signature[0] as *mut u8 as *mut [u8;32]) })?;
+    copy_32(payload, off + 32, unsafe { &mut *(&mut event.signature[32] as *mut u8 as *mut [u8;32]) })?;
     event.hash = calculate_transaction_hash(&event.signature);
-    offset += sig_count as usize * SIGNATURE_LEN;
+    // advance by sig_count * 64 safely
+    let sig_bytes = (sig_count as usize).saturating_mul(SIGNATURE_LEN);
+    let _ = load_bytes(payload, off, sig_bytes)?; // bounds guard
+    off += sig_bytes;
 
-    if offset + 2 > payload.len() {
-        return Err(());
-    }
-    
-    let message_header = payload[offset];
-    let num_required_signatures = message_header & 0x0f;
-    let num_readonly_signed = (message_header >> 4) & 0x0f;
-    offset += 1;
+    // message header: 2 bytes (message_header + num_readonly_unsigned)
+    let header = *load_bytes(payload, off, 1)?.first().ok_or(())?; off += 1;
+    let _num_readonly_unsigned = *load_bytes(payload, off, 1)?.first().ok_or(())?; off += 1;
+    let _num_required_signatures = header & 0x0f;
+    let _num_readonly_signed = (header >> 4) & 0x0f;
 
-    let num_readonly_unsigned = payload[offset];
-    offset += 1;
-
-    let (account_keys_len, keys_offset) = parse_compact_u16(&payload[offset..]).map_err(|_| ())?;
-    offset += keys_offset;
-    
-    if account_keys_len == 0 || account_keys_len > MAX_ACCOUNTS as u16 {
-        return Err(());
-    }
-    
+    // account keys length and table
+    let account_keys_len = parse_compact_u16_bounded(payload, &mut off)?;
+    if account_keys_len == 0 || account_keys_len > MAX_ACCOUNTS as u16 { return Err(()); }
     event.accounts_count = account_keys_len.min(255) as u8;
-    
-    let account_keys_start = offset;
-    let total_keys_size = account_keys_len as usize * PUBKEY_LEN;
-    
-    if payload.len() < offset + total_keys_size + BLOCKHASH_LEN {
-        return Err(());
-    }
-    offset += total_keys_size;
-    offset += BLOCKHASH_LEN;
+    let account_keys_start = off;
+    let total_keys = (account_keys_len as usize).saturating_mul(PUBKEY_LEN);
+    let _ = load_bytes(payload, off, total_keys + BLOCKHASH_LEN)?; // ensure keys + blockhash exist
+    off += total_keys + BLOCKHASH_LEN;
 
-    let (instructions_len, inst_offset) = parse_compact_u16(&payload[offset..]).map_err(|_| ())?;
-    offset += inst_offset;
-    
+    // instructions length
+    let instructions_len = parse_compact_u16_bounded(payload, &mut off)?;
     event.instructions_count = instructions_len.min(255) as u8;
 
-    if instructions_len > 0 && payload.len() > offset + 1 {
-        let program_id_index = payload[offset] as usize;
-        
+    if instructions_len > 0 {
+        let program_id_index = *load_bytes(payload, off, 1)?.first().ok_or(())? as usize; off += 1;
         if program_id_index < account_keys_len as usize {
-            let key_start = account_keys_start + (program_id_index * PUBKEY_LEN);
-            if key_start + PUBKEY_LEN <= payload.len() {
-                for i in 0..PUBKEY_LEN {
-                    event.program_id[i] = payload[key_start + i];
-                }
-            }
+            let key_start = account_keys_start + program_id_index * PUBKEY_LEN;
+            copy_32(payload, key_start, &mut event.program_id)?;
         }
-
-        offset += 1;
-        let (accounts_len, acc_offset) = parse_compact_u16(&payload[offset..]).map_err(|_| ())?;
-        offset += acc_offset + accounts_len as usize;
-
-                let (data_len, data_offset) = parse_compact_u16(&payload[offset..]).map_err(|_| ())?;
-        event.data_len = data_len;
-        offset += data_offset;
-
-        if data_len >= 8 && offset + 8 <= payload.len() {
-            event.lamports = u64::from_le_bytes([
-                payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
-                payload[offset + 4], payload[offset + 5], payload[offset + 6], payload[offset + 7],
-            ]);
-        }
-
-        if data_len >= 12 && offset + 12 <= payload.len() {
-            let potential_cu = u32::from_le_bytes([
-                payload[offset + 8], payload[offset + 9], 
-                payload[offset + 10], payload[offset + 11],
-            ]);
-            if potential_cu > 0 && potential_cu <= 1_400_000 {
-                event.compute_units = potential_cu;
-            }
-        }
+        // accounts length and skip accounts indices
+        let accounts_len = parse_compact_u16_bounded(payload, &mut off)? as usize;
+        let _ = load_bytes(payload, off, accounts_len)?; off += accounts_len;
+        // data length
+        let data_len = parse_compact_u16_bounded(payload, &mut off)?; event.data_len = data_len;
+        // lamports best-effort from first 8 bytes of instruction data
+        if data_len >= 8 { if let Ok(b) = load_bytes(payload, off, 8) { event.lamports = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]); } }
+        // potential CU at offset +8..+12
+        if data_len >= 12 { if let Ok(b) = load_bytes(payload, off + 8, 4) { let cu = u32::from_le_bytes([b[0],b[1],b[2],b[3]]); if cu > 0 && cu <= 1_400_000 { event.compute_units = cu; } } }
     }
 
     if is_dex_program(&event.program_id) {
@@ -487,29 +837,16 @@ fn classify_mev_type(event: &mut PacketEvent) {
 
 #[inline(always)]
 fn detect_jito_bundle(payload: &[u8]) -> bool {
-    if payload.len() < 256 {
-        return false;
+    if payload.len() < 12 { return false; }
+    let b0 = payload[0];
+    let quic_long = (b0 & 0xC0) == 0xC0;
+    let quic_short = (b0 & 0x40) == 0x40 && (b0 & 0x80) == 0x00;
+    if quic_long {
+        let ver = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        let dcid_len = payload[5];
+        return ver != 0 && dcid_len > 0;
     }
-    
-    const JITO_TIP_ACCOUNTS: [[u8; 4]; 4] = [
-        [0x0b, 0x00, 0x00, 0x00],
-        [0x96, 0xbb, 0x61, 0xfa],
-        [0xDT, 0xTC, 0x1z, 0xJT],
-        [0x3A, 0xWR, 0xB2, 0xBT],
-    ];
-    
-    let mut tip_indicators = 0u8;
-    
-    for pattern in &JITO_TIP_ACCOUNTS {
-        for window in payload.windows(4) {
-            if window == pattern {
-                tip_indicators += 1;
-                break;
-            }
-        }
-    }
-    
-    tip_indicators >= 1
+    quic_short
 }
 
 #[inline(always)]
@@ -529,27 +866,13 @@ fn should_frontrun(event: &PacketEvent) -> bool {
 
 #[inline(always)]
 fn update_stats(event: &PacketEvent) {
-    let stats_key = 0u32;
     unsafe {
-        if let Some(stats) = FILTER_STATS.get_ptr_mut(&stats_key) {
+        if let Some(stats) = FILTER_STATS.get_ptr_mut(0) {
             (*stats).packets_processed = (*stats).packets_processed.wrapping_add(1);
-            
-            if event.priority >= 8 {
-                (*stats).packets_filtered = (*stats).packets_filtered.wrapping_add(1);
-            }
-            
-            if event.mev_type > 0 {
-                (*stats).mev_opportunities = (*stats).mev_opportunities.wrapping_add(1);
-            }
-            
-            if event.lamports > 100_000_000 {
-                (*stats).high_value_txs = (*stats).high_value_txs.wrapping_add(1);
-            }
-            
-            if is_dex_program(&event.program_id) {
-                (*stats).defi_interactions = (*stats).defi_interactions.wrapping_add(1);
-            }
-            
+            if event.priority >= 8 { (*stats).packets_filtered = (*stats).packets_filtered.wrapping_add(1); }
+            if event.mev_type > 0 { (*stats).mev_opportunities = (*stats).mev_opportunities.wrapping_add(1); }
+            if event.lamports > 100_000_000 { (*stats).high_value_txs = (*stats).high_value_txs.wrapping_add(1); }
+            if is_dex_program(&event.program_id) { (*stats).defi_interactions = (*stats).defi_interactions.wrapping_add(1); }
             match event.mev_type {
                 2 => (*stats).arbitrage_detected = (*stats).arbitrage_detected.wrapping_add(1),
                 3 => (*stats).sandwich_detected = (*stats).sandwich_detected.wrapping_add(1),
@@ -602,7 +925,7 @@ fn process_packet(ctx: &XdpContext) -> Result<u32, ()> {
     let payload_offset = ETH_HLEN + IP_HLEN + UDP_HLEN;
     let payload_len = (u16::from_be(unsafe { (*udp_hdr).len }) as usize).saturating_sub(UDP_HLEN);
     
-    if payload_len < 176 || payload_len > MAX_PACKET_SIZE {
+    if payload_len < 7 || payload_len > MAX_PACKET_SIZE {
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -620,6 +943,11 @@ fn process_packet(ctx: &XdpContext) -> Result<u32, ()> {
         )
     };
 
+    // QUIC-aware gating via helper
+    if !(should_deep_parse_udp(dst_port, payload) && payload.len() >= 176) {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     match extract_transaction_info(payload) {
         Ok(mut event) => {
             event.timestamp = unsafe { bpf_ktime_get_ns() };
@@ -629,7 +957,7 @@ fn process_packet(ctx: &XdpContext) -> Result<u32, ()> {
             event.dst_port = dst_port;
             
             classify_mev_type(&mut event);
-            event.priority = calculate_priority(&event);
+            event.priority = mev_priority_sigmoid(&event);
             event.expected_profit = calculate_expected_profit(&event);
             
             if detect_jito_bundle(payload) {
@@ -637,26 +965,37 @@ fn process_packet(ctx: &XdpContext) -> Result<u32, ()> {
                 event.priority = event.priority.saturating_add(3).min(15);
             }
             
-            let cache_hit = unsafe {
-                TRANSACTION_CACHE.get(&event.hash).is_some()
-            };
-            
-            if cache_hit {
-                return Ok(xdp_action::XDP_DROP);
-            }
-            
-            unsafe {
-                let _ = TRANSACTION_CACHE.insert(&event.hash, &event.timestamp, 0);
-            }
-            
+            // Adaptive Bloom + LRU TTL
+            let now = event.timestamp;
+            let ttl = get_cache_duration(&event);
+            if bloom_check_set(now, ttl, event.hash) { return Ok(xdp_action::XDP_DROP); }
+
             update_stats(&event);
 
+            // Optional mark bundle flows (DCID-based) for slight bump
+            if mark_bundle_flow(now, payload) { event.flags |= 0x01; }
+
+            // Optional AF_XDP fast-path handoff for ultra-hot flows
+            let routing = optimize_packet_routing(&event);
+            if event.priority >= 13 || routing >= 2 {
+                let qid: u32 = (event.hash as u32) & 0x3F; // 64 queues
+                let act = unsafe { XSK_SOCKS.redirect(&ctx, qid) };
+                if act != 0 {
+                    let lite = PacketEventLite { ts: event.timestamp, src_ip: event.src_ip, dst_ip: event.dst_ip, src_port: event.src_port, dst_port: event.dst_port, lamports: event.lamports, cu: event.compute_units, prio: event.priority, mev: event.mev_type, flags: event.flags, accs: event.accounts_count, insts: event.instructions_count, hash: event.hash, program_id_prefix: [event.program_id[0],event.program_id[1],event.program_id[2],event.program_id[3]] };
+                    unsafe { HOT_HEADERS.output(&ctx, &lite, 0); }
+                    return Ok(act);
+                }
+            }
+
+            // Emit lightweight header widely; full event for selected packets
             if event.priority >= 8 || event.mev_type > 0 {
-                unsafe {
-                    if event.priority >= 12 {
-                                                let _ = PRIORITY_QUEUE.push(&event, 0);
+                let lite = PacketEventLite { ts: event.timestamp, src_ip: event.src_ip, dst_ip: event.dst_ip, src_port: event.src_port, dst_port: event.dst_port, lamports: event.lamports, cu: event.compute_units, prio: event.priority, mev: event.mev_type, flags: event.flags, accs: event.accounts_count, insts: event.instructions_count, hash: event.hash, program_id_prefix: [event.program_id[0],event.program_id[1],event.program_id[2],event.program_id[3]] };
+                unsafe { HOT_HEADERS.output(&ctx, &lite, 0); }
+                if event.priority >= 12 {
+                    unsafe {
+                        let _ = PRIORITY_QUEUE.push(&event, 0);
+                        PACKET_EVENTS.output(&ctx, &event, 0);
                     }
-                    PACKET_EVENTS.output(&ctx, &event, 0);
                 }
             }
         }
@@ -695,7 +1034,7 @@ fn process_tc_packet(ctx: &TcContext) -> Result<i32, ()> {
     let payload_offset = ETH_HLEN + IP_HLEN + UDP_HLEN;
     let payload_len = (u16::from_be(unsafe { (*udp_hdr).len }) as usize).saturating_sub(UDP_HLEN);
     
-    if payload_len < 176 || payload_len > MAX_PACKET_SIZE {
+    if payload_len < 7 || payload_len > MAX_PACKET_SIZE {
         return Ok(TC_ACT_OK);
     }
 
@@ -713,6 +1052,12 @@ fn process_tc_packet(ctx: &TcContext) -> Result<i32, ()> {
         )
     };
 
+    // QUIC-aware gating for TC path as well
+    let is_tpu = dst_port == SOLANA_TPU_PORT || dst_port == SOLANA_TPU_FWD_PORT || dst_port == SOLANA_TPU_VOTE_PORT;
+    if !(is_tpu && is_quic_like(payload) && payload.len() >= 176) {
+        return Ok(TC_ACT_OK);
+    }
+
     match extract_transaction_info(payload) {
         Ok(mut event) => {
             event.timestamp = unsafe { bpf_ktime_get_ns() };
@@ -722,7 +1067,7 @@ fn process_tc_packet(ctx: &TcContext) -> Result<i32, ()> {
             event.dst_port = dst_port;
             
             classify_mev_type(&mut event);
-            event.priority = calculate_priority(&event);
+            event.priority = mev_priority_sigmoid(&event);
             event.expected_profit = calculate_expected_profit(&event);
             
             if detect_jito_bundle(payload) {
@@ -730,36 +1075,22 @@ fn process_tc_packet(ctx: &TcContext) -> Result<i32, ()> {
                 event.priority = event.priority.saturating_add(3).min(15);
             }
             
-            // Outbound MEV protection - drop high priority competing transactions
-            if is_outbound && event.priority >= 12 && should_frontrun(&event) {
-                return Ok(TC_ACT_SHOT);
-            }
-            
-            // Smart routing for inbound high-value transactions
-            if is_inbound && event.mev_type > 0 {
-                event.flags |= 0x02; // Mark for special handling
-            }
-            
-            let cache_hit = unsafe {
-                TRANSACTION_CACHE.get(&event.hash).is_some()
-            };
-            
-            if cache_hit && is_outbound {
-                return Ok(TC_ACT_SHOT);
-            }
-            
-            unsafe {
-                let _ = TRANSACTION_CACHE.insert(&event.hash, &event.timestamp, 0);
-            }
-            
+            let now = event.timestamp; let ttl = get_cache_duration(&event);
+            if is_outbound && bloom_check_set(now, ttl, event.hash) { return Ok(TC_ACT_SHOT); }
+
             update_stats(&event);
 
+            // Smooth priority and emit telemetry
+            classify_mev_type(&mut event);
+            event.priority = mev_priority_sigmoid(&event);
             if event.priority >= 8 || event.mev_type > 0 {
-                unsafe {
-                    if event.priority >= 13 {
+                let lite = PacketEventLite { ts: event.timestamp, src_ip: event.src_ip, dst_ip: event.dst_ip, src_port: event.src_port, dst_port: event.dst_port, lamports: event.lamports, cu: event.compute_units, prio: event.priority, mev: event.mev_type, flags: event.flags, accs: event.accounts_count, insts: event.instructions_count, hash: event.hash, program_id_prefix: [event.program_id[0],event.program_id[1],event.program_id[2],event.program_id[3]] };
+                unsafe { HOT_HEADERS.output(&ctx, &lite, 0); }
+                if event.priority >= 13 {
+                    unsafe {
                         let _ = PRIORITY_QUEUE.push(&event, 0);
+                        PACKET_EVENTS.output(&ctx, &event, 0);
                     }
-                    PACKET_EVENTS.output(&ctx, &event, 0);
                 }
             }
         }
