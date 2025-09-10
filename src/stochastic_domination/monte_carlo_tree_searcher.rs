@@ -8,11 +8,35 @@ use solana_sdk::pubkey::Pubkey;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 use indexmap::IndexMap;
-use ahash::{AHasher, RandomState};
+use ahash::{AHasher, RandomState, AHashSet};
+use smallvec::SmallVec;
+use lru::LruCache;
 use std::hash::{Hash, Hasher};
 use tracing::{debug, info, instrument, span, Level};
 use prometheus::{IntCounter, IntCounterVec, Gauge, Histogram, HistogramOpts, register_int_counter, register_int_counter_vec, register_gauge, register_histogram};
 use std::sync::OnceLock;
+
+// === Zobrist/TT helpers (splitmix64, constants, and load helper) ===
+#[inline(always)]
+fn smix64(mut x: u64) -> u64 {
+    // SplitMix64 mixer (public domain); deterministic and fast
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+const ZOBRIST_BASE: u64 = 0xA1B2_C3D4_E5F6_0011;
+const ZOBRIST_K0:   u64 = 0x9E37_79B9_85EB_CA77;
+const ZOBRIST_K1:   u64 = 0xC2B2_AE3D_27D4_EB4F;
+
+#[inline(always)]
+fn load_u64_le(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[0..8]);
+    u64::from_le_bytes(buf)
+}
 
 // --- Metrics registrars (lazy singletons) ---
 fn NODES_CREATED() -> &'static IntCounter {
@@ -61,19 +85,13 @@ pub struct MarketState {
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
-struct TTEntry {
-    mean: f64,
-    m2: f64, // Welford variance accumulator
-    n: u64,
-}
+#[derive(Clone, Copy)]
+struct TTEntry { mean: f64, m2: f64, n: u64, epoch: u64 }
 
-type TTKey = (u64, u8);
+// === [IMPROVED⁴: PIECE B7] widen action-shard in the transposition key
+type TTKey = (u64, u16);
 
-struct EvalCache {
-    map: IndexMap<TTKey, TTEntry, RandomState>,
-    cap: usize,
-}
+struct EvalCache { map: IndexMap<TTKey, TTEntry, RandomState>, cap: usize }
 
 impl EvalCache {
     fn new(cap: usize) -> Self {
@@ -86,7 +104,7 @@ impl EvalCache {
     fn get(&mut self, k: TTKey) -> Option<f64> {
         if let Some((idx, v)) = self.map.get_full(&k) {
             // touch to mark as recently used: remove and reinsert at end
-            let entry = TTEntry { mean: v.mean, m2: v.m2, n: v.n };
+            let entry = TTEntry { mean: v.mean, m2: v.m2, n: v.n, epoch: v.epoch };
             self.map.shift_remove_index(idx);
             self.map.insert(k, entry);
             Some(v.mean)
@@ -101,8 +119,25 @@ impl EvalCache {
             return;
         }
         if self.map.len() >= self.cap { let _ = self.map.shift_remove_index(0); }
-        self.map.insert(k, TTEntry { mean: x, m2: 0.0, n: 1 });
+        self.map.insert(k, TTEntry { mean: x, m2: 0.0, n: 1, epoch: 0 });
     }
+
+    #[inline(always)]
+    fn update_epoch(&mut self, k: TTKey, x: f64, epoch: u64) {
+        if let Some(v) = self.map.get_mut(&k) {
+            v.n = v.n.saturating_add(1);
+            let delta = x - v.mean;
+            v.mean += delta / v.n as f64;
+            v.m2 += delta * (x - v.mean);
+            v.epoch = epoch;
+            return;
+        }
+        if self.map.len() >= self.cap { let _ = self.map.shift_remove_index(0); }
+        self.map.insert(k, TTEntry { mean: x, m2: 0.0, n: 1, epoch });
+    }
+
+    #[inline(always)]
+    fn peek_entry(&self, k: &TTKey) -> Option<TTEntry> { self.map.get(k).copied() }
 }
 
 #[cfg(test)]
@@ -163,34 +198,65 @@ mod prop {
     }
 }
 
-#[inline]
+// === [IMPROVED⁴: PIECE B8] Quantized Zobrist to stabilize TT keys
+const Q_PRICE_LG2: u32   = 8;   // bucket = 256 price units
+const Q_LIQ_LG2: u32     = 12;  // bucket = 4096 liquidity units
+const Q_VOL_STEP: u32     = 2;   // bucket volatility in steps of 2
+const Q_SPREAD_STEP: u16  = 2;   // bucket spread in steps of 2 bps
+const Q_MOM_STEP: i32     = 2;   // bucket momentum in steps of 2
+const TT_QUANTize: bool   = true; // on by default
+
+#[inline(always)]
 fn zobrist_market_state(s: &MarketState) -> u64 {
-    let mut h = AHasher::default();
-    s.token_mint.as_ref().hash(&mut h);
-    s.price.hash(&mut h);
-    s.volume_24h.hash(&mut h);
-    s.liquidity.hash(&mut h);
-    s.momentum.hash(&mut h);
-    s.volatility.hash(&mut h);
-    s.spread_bps.hash(&mut h);
-    s.block_height.hash(&mut h);
-    s.timestamp.hash(&mut h);
-    h.finish()
+    let b = s.token_mint.as_ref();
+    debug_assert_eq!(b.len(), 32);
+
+    let (price_q, liq_q, vol_q, spr_q, mom_q) = if TT_QUANTize {
+        (
+            s.price >> Q_PRICE_LG2,
+            s.liquidity >> Q_LIQ_LG2,
+            (s.volatility / Q_VOL_STEP) * Q_VOL_STEP,
+            ((s.spread_bps / Q_SPREAD_STEP) * Q_SPREAD_STEP) as u16,
+            ((s.momentum / Q_MOM_STEP) * Q_MOM_STEP) as i32,
+        )
+    } else {
+        (s.price, s.liquidity, s.volatility, s.spread_bps, s.momentum)
+    };
+
+    let mut z = ZOBRIST_BASE;
+
+    // Mix 32B mint into 4 lanes
+    z ^= smix64(load_u64_le(&b[0..8])   ^ ZOBRIST_K0);
+    z ^= smix64(load_u64_le(&b[8..16])  ^ ZOBRIST_K1);
+    z ^= smix64(load_u64_le(&b[16..24]) ^ ZOBRIST_K0.rotate_left(17));
+    z ^= smix64(load_u64_le(&b[24..32]) ^ ZOBRIST_K1.rotate_left(29));
+
+    // Mix quantized fields
+    z ^= smix64(price_q.wrapping_mul(0x9E37_79B9));
+    z ^= smix64((s.volume_24h >> 10).rotate_left(13));
+    z ^= smix64(liq_q.rotate_left(7));
+    z ^= smix64((mom_q as u64).wrapping_mul(0xC2B2_AE3D));
+    z ^= smix64((vol_q as u64).wrapping_mul(0x1656_67B1));
+    z ^= smix64((spr_q as u64).rotate_left(11));
+    z ^= smix64(s.block_height ^ ZOBRIST_K0);
+    z ^= smix64(s.timestamp    ^ ZOBRIST_K1);
+
+    smix64(z ^ ZOBRIST_BASE)
 }
 
-#[inline]
-fn action_id(a: &TradingAction) -> u8 {
-    match a {
-        TradingAction::Buy { amount, slippage_bps } => {
-            1 ^ ((*amount & 0xFF) as u8) ^ ((*slippage_bps & 0xFF) as u8)
-        }
-        TradingAction::Sell { amount, slippage_bps } => {
-            2 ^ ((*amount & 0xFF) as u8) ^ ((*slippage_bps & 0xFF) as u8)
-        }
-        TradingAction::Hold => 3,
-        TradingAction::AddLiquidity { amount } => 4 ^ ((*amount & 0xFF) as u8),
-        TradingAction::RemoveLiquidity { amount } => 5 ^ ((*amount & 0xFF) as u8),
-    }
+#[inline(always)]
+fn action_id(a: &TradingAction) -> u16 {
+    // Tag the variant and mix parameters via splitmix; fold to 16 bits
+    let (tag, x, y): (u64, u64, u64) = match a {
+        TradingAction::Buy { amount, slippage_bps }  => (0xB1, *amount, *slippage_bps as u64),
+        TradingAction::Sell { amount, slippage_bps } => (0xB2, *amount, *slippage_bps as u64),
+        TradingAction::Hold                           => (0xB3, 0, 0),
+        TradingAction::AddLiquidity { amount }        => (0xB4, *amount, 0),
+        TradingAction::RemoveLiquidity { amount }     => (0xB5, *amount, 0),
+    };
+    let mix = smix64(tag ^ x.rotate_left(17) ^ y.rotate_left(29));
+    let h = mix ^ (mix >> 16) ^ (mix >> 32) ^ (mix >> 48);
+    (h & 0xFFFF) as u16
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -213,6 +279,7 @@ pub struct MCTSNode {
     m2: f64, // second moment accumulator for variance
     untried_actions: Vec<TradingAction>,
     is_terminal: bool,
+    zkey: u64,
 }
 
 pub struct MCTSConfig {
@@ -259,6 +326,16 @@ pub struct MCTSConfig {
     pub tip_penalty_scale: f64,
     // Slot safety
     pub slot_safety_ms: u64,
+    // === [IMPROVED¹⁵: M0] ===
+    pub actionset_cache_capacity: usize,
+    // === [IMPROVED¹⁵: M2] ===
+    pub tt_evidence_halflife_slots: u32,
+    // === [IMPROVED¹⁵: M4] ===
+    pub c_puct_taper: f64,
+    // === [IMPROVED¹⁵: M5] ===
+    pub warm_snapshot_topk: usize,
+    // === [IMPROVED¹⁵: M3] ===
+    pub iter_guard_ms: u64,
 }
 
 impl Default for MCTSConfig {
@@ -300,6 +377,11 @@ impl Default for MCTSConfig {
             inclusion_leader_weight: 0.6,
             tip_penalty_scale: 1.0,
             slot_safety_ms: 120,
+            actionset_cache_capacity: 16_384,
+            tt_evidence_halflife_slots: 128,
+            c_puct_taper: 0.3,
+            warm_snapshot_topk: 8,
+            iter_guard_ms: 1,
         }
     }
 }
@@ -346,6 +428,21 @@ pub struct MonteCarloTreeSearcher {
     time: TimeProfile,
     rollout_counter: u64,
     runtime: RuntimeContext,
+    // === [IMPROVED⁹: PIECE G3] optional deterministic root focus ===
+    root_focus: Option<Focus>,
+    // === [IMPROVED¹⁵: M0] ===
+    actionset_cache: ActionSetCache,
+    // === [IMPROVED¹⁵: M1] ===
+    priors_lru: PriorsLRU,
+    // === [IMPROVED¹⁵: M3] iteration stats ===
+    it_n: u64,
+    it_mean_ms: f64,
+    it_m2_ms: f64,
+    // === [IMPROVED¹⁵: M4] loop rails ===
+    start_time_loop: Instant,
+    budget_ms_loop: u64,
+    // === [IMPROVED¹⁵: M6] scratch buffers ===
+    scratch: Scratch,
 }
 
 impl MonteCarloTreeSearcher {
@@ -358,6 +455,13 @@ impl MonteCarloTreeSearcher {
             time: TimeProfile::default(),
             rollout_counter: 0,
             runtime: RuntimeContext::default(),
+            root_focus: None,
+            actionset_cache: ActionSetCache::new(config.actionset_cache_capacity),
+            priors_lru: PriorsLRU::new(16_384),
+            it_n: 0, it_mean_ms: 0.0, it_m2_ms: 0.0,
+            start_time_loop: Instant::now(),
+            budget_ms_loop: 0,
+            scratch: Scratch::new(),
         }
     }
 
@@ -370,20 +474,52 @@ impl MonteCarloTreeSearcher {
             time,
             rollout_counter: 0,
             runtime: RuntimeContext::default(),
+            root_focus: None,
+            actionset_cache: ActionSetCache::new(config.actionset_cache_capacity),
+            priors_lru: PriorsLRU::new(16_384),
+            it_n: 0, it_mean_ms: 0.0, it_m2_ms: 0.0,
+            start_time_loop: Instant::now(),
+            budget_ms_loop: 0,
         }
     }
 
-    pub fn set_seed(&mut self, seed: u64) {
-        self.rng = StdRng::seed_from_u64(seed);
-    }
+    // ...
 
-    pub fn set_runtime_context(&mut self, ctx: RuntimeContext) { self.runtime = ctx; }
+    fn expand(&mut self, node_idx: usize) -> usize {
+        let untried = &self.nodes[node_idx].untried_actions;
+        let action = if untried.len() == 1 { untried[0].clone() } else {
+            let priors_all = self.priors_untried_cached(node_idx);
+            let idx = self.weighted_sample_index(&priors_all);
+            untried[idx].clone()
+        };
+        if let Some(pos) = self.nodes[node_idx].untried_actions.iter().position(|a| a == &action) {
+            self.nodes[node_idx].untried_actions.swap_remove(pos);
+        }
+
+        let new_state = self.apply_action(&self.nodes[node_idx].state, &action);
+        let new_node = MCTSNode {
+            state: new_state.clone(),
+            action: Some(action),
+            parent: Some(node_idx),
+            children: Vec::new(),
+            visits: 0,
+            total_reward: 0.0,
+            m2: 0.0,
+            untried_actions: self.legal_actions_cached(&new_state).into_vec(),
+            is_terminal: self.is_terminal_state(&new_state),
+            zkey: zobrist_market_state_cfg(&new_state, &self.config),
+        };
+
+        self.nodes.push(new_node);
+        self.nodes.len() - 1
+    }
 
     #[instrument(name = "mcts.search", skip_all, fields(iterations = 0))]
     pub fn search(&mut self, initial_state: MarketState) -> TradingAction {
         self.nodes.clear();
         self.tt.clear();
 
+        let zkey0 = zobrist_market_state_cfg(&initial_state, &self.config);
         let root_node = MCTSNode {
             state: initial_state.clone(),
             action: None,
@@ -392,18 +528,24 @@ impl MonteCarloTreeSearcher {
             visits: 0,
             total_reward: 0.0,
             m2: 0.0,
-            untried_actions: self.get_legal_actions(&initial_state),
+            untried_actions: self.legal_actions_cached(&initial_state).into_vec(),
             is_terminal: false,
+            zkey: zkey0,
         };
-
         self.nodes.push(root_node);
+
         let start_time = Instant::now();
         let mut iterations = 0;
         let budget_ms = self.compute_time_budget_ms();
+        self.start_time_loop = start_time;
+        self.budget_ms_loop = budget_ms;
+        self.iter_stats_reset();
 
-        while iterations < self.config.max_iterations
-            && start_time.elapsed().as_millis() < budget_ms as u128
-        {
+        while iterations < self.config.max_iterations {
+            let left = Self::time_left_ms(start_time, budget_ms) as f64;
+            if left <= (self.config.iter_guard_ms as f64) + self.iter_expected_budget() { break; }
+            let t_iter = Instant::now();
+
             let _span_sel = span!(Level::TRACE, "selection").entered();
             let leaf_idx = self.tree_policy(0);
             drop(_span_sel);
@@ -419,8 +561,9 @@ impl MonteCarloTreeSearcher {
             self.backpropagate(leaf_idx, reward);
             drop(_span_bp);
 
-            iterations += 1;
-            // Per-iteration root EV/confidence log
+            let iter_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
+            self.iter_stats_obs(iter_ms);
+            iterations = iterations.saturating_add(1);
             if !self.nodes[0].children.is_empty() {
                 let (best_ev, best_visits) = self.nodes[0].children.iter().map(|&ci| {
                     let c = &self.nodes[ci];
@@ -445,7 +588,12 @@ impl MonteCarloTreeSearcher {
             } else if !self.nodes[current_idx].children.is_empty() {
                 let priors = self.compute_priors_for_children(current_idx);
                 let priors = if current_idx == 0 { ROOT_DIR_NOISE().inc(); self.apply_dirichlet_noise(priors) } else { priors };
-                let next = self.best_child_puct(current_idx, self.config.c_puct, &priors);
+                // === [IMPROVED⁹: PIECE G3] deterministic root focus, no bias in priors/scores ===
+                let next = if current_idx == 0 {
+                    self.pick_root_child_det(current_idx, &priors)
+                } else {
+                    self.best_child_puct(current_idx, &priors)
+                };
                 if self.config.virtual_loss > 0.0 {
                     if let Some(child) = self.nodes.get_mut(next) {
                         child.total_reward -= self.config.virtual_loss;
@@ -461,39 +609,18 @@ impl MonteCarloTreeSearcher {
         current_idx
     }
 
-    #[instrument(name = "mcts.expand", skip_all)]
-    fn expand(&mut self, node_idx: usize) -> usize {
-        let untried = &self.nodes[node_idx].untried_actions;
-        let action = if untried.len() == 1 {
-            untried[0].clone()
-        } else {
-            let priors_all = self.compute_priors(&self.nodes[node_idx].state, untried);
-            let idx = self.weighted_sample_index(&priors_all);
-            untried[idx].clone()
-        };
-        if let Some(pos) = self.nodes[node_idx].untried_actions.iter().position(|a| a == &action) {
-            self.nodes[node_idx].untried_actions.swap_remove(pos);
+    // === [IMPROVED⁹: PIECE G3] helper: deterministically choose the focused root child if active ===
+    #[inline(always)]
+    fn pick_root_child_det(&mut self, root_idx: usize, priors: &[f64]) -> usize {
+        if let Some(mut f) = self.root_focus {
+            if f.ticks_left > 0 && self.nodes[root_idx].children.contains(&f.child_idx) {
+                f.ticks_left -= 1;
+                self.root_focus = if f.ticks_left == 0 { None } else { Some(f) };
+                return f.child_idx;
+            }
         }
-
-        let new_state = self.apply_action(&self.nodes[node_idx].state, &action);
-        let new_node = MCTSNode {
-            state: new_state.clone(),
-            action: Some(action),
-            parent: Some(node_idx),
-            children: Vec::new(),
-            visits: 0,
-            total_reward: 0.0,
-            m2: 0.0,
-            untried_actions: self.get_legal_actions(&new_state),
-            is_terminal: self.is_terminal_state(&new_state),
-        };
-
-        let new_idx = self.nodes.len();
-        self.nodes.push(new_node);
-        NODES_CREATED().inc();
-        self.nodes[node_idx].children.push(new_idx);
-
-        new_idx
+        // fallback to unbiased PUCT
+        self.best_child_puct(root_idx, priors)
     }
 
     fn puct_score(q: f64, n_parent: f64, n_child: f64, prior: f64, c_puct: f64) -> f64 {
@@ -501,9 +628,12 @@ impl MonteCarloTreeSearcher {
         q + u
     }
 
-    fn best_child_puct(&self, node_idx: usize, c_puct: f64, priors: &[f64]) -> usize {
+    fn best_child_puct(&mut self, node_idx: usize, priors: &[f64]) -> usize {
         let node = &self.nodes[node_idx];
         let n_parent = node.visits.max(1) as f64;
+        let c_eff = self.effective_c_puct_tapered(node.visits, self.start_time_loop, self.budget_ms_loop);
+        self.scratch.puct_bonus.clear();
+        self.scratch.puct_bonus.reserve(node.children.len());
         node.children
             .iter()
             .enumerate()
@@ -516,7 +646,9 @@ impl MonteCarloTreeSearcher {
                 } else { 0.0 };
                 let q = mean - self.config.risk_lambda * std;
                 let prior = priors.get(i).copied().unwrap_or(1.0 / node.children.len().max(1) as f64);
-                (Self::puct_score(q, n_parent, child.visits as f64, prior, c_puct), child_idx)
+                let bonus = Self::puct_score(0.0, n_parent, child.visits as f64, prior, c_eff); // only the U term
+                self.scratch.puct_bonus.push(bonus);
+                (q + bonus, child_idx)
             })
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, idx)| idx)
@@ -563,8 +695,22 @@ impl MonteCarloTreeSearcher {
     }
 
     fn normalize(v: &[f64]) -> Vec<f64> {
-        let sum: f64 = v.iter().copied().sum();
-        if sum > 0.0 { v.iter().map(|x| x / sum).collect() } else { vec![1.0 / v.len().max(1) as f64; v.len()] }
+        let mut sum = 0.0;
+        let mut tmp: Vec<f64> = Vec::with_capacity(v.len());
+        for &x in v {
+            let y = if x.is_finite() && x > 0.0 { x } else { 0.0 };
+            sum += y;
+            tmp.push(y);
+        }
+        if sum <= 0.0 {
+            return vec![1.0 / (v.len().max(1) as f64); v.len()];
+        }
+        let eps = 1e-12f64;
+        let mut sum2 = 0.0;
+        for t in &mut tmp { *t = *t + eps; sum2 += *t; }
+        let inv = 1.0 / sum2;
+        for t in &mut tmp { *t *= inv; debug_assert!(t.is_finite()); }
+        tmp
     }
 
     fn weighted_sample_index(&mut self, weights: &[f64]) -> usize {
@@ -661,7 +807,7 @@ impl MonteCarloTreeSearcher {
                 break;
             }
 
-            let actions = self.get_legal_actions(&state);
+            let actions = self.legal_actions_cached(&state);
             if actions.is_empty() {
                 break;
             }
