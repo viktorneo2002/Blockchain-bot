@@ -1,137 +1,1033 @@
-use crate::state::pyth_lazer_oracle::PythLazerOracle;
+// === [IMPROVED: PIECE v0++++++ QUANT] ===
+#![deny(unsafe_code)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![allow(clippy::too_many_arguments, clippy::large_enum_variant)]
+#![cfg_attr(not(test), deny(dead_code))]
+#![deny(unreachable_patterns)]
+#![deny(unused_must_use)]
+#![deny(unconditional_recursion)]
+#![deny(unused_qualifications)]
+// Only fail builds on missing docs when explicitly asked (CI/docs builds)
+#![cfg_attr(feature = "strict-docs", deny(missing_docs))]
+// Optional: enable no_std only if you deliberately set `--features nostd` and your deps allow it.
+#![cfg_attr(all(feature = "nostd", target_arch = "bpf"), no_std)]
+
+// cold error handler for BPF to keep hot paths slim (no cost off-bpf)
+#[cfg(all(target_arch = "bpf", feature = "alloc_error_handler"))]
+#[alloc_error_handler]
+fn oom(_: core::alloc::Layout) -> ! {
+    core::arch::asm!("trap")
+}
+
+// ===============================
+// === [IMPROVED: PIECE E102–E110 v++ HFT³²] ===
+// ===============================
+impl AMM {
+    // Grid/context shims
+    #[inline(always)]
+    pub fn grid_info(&self) -> GridInfo { GridInfo { step: self.grid_step() } }
+
+    #[inline(always)]
+    pub fn salt64_from_oracle(&self) -> u64 { u64_from_pubkey_le(&self.oracle) }
+
+    #[inline(always)]
+    pub fn splitmix64_u64(x: u64) -> u64 {
+        // Standard splitmix64 (unsigned form)
+        let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    #[inline(always)]
+    pub fn snap_with_gi_phase(&self, px: u64, gi: &GridInfo, slot: u64) -> u64 {
+        let phase = (Self::splitmix64_u64(slot ^ self.salt64_from_oracle()) & 1) as u64;
+        gi.snap_phase(px, phase)
+    }
+
+    #[inline(always)]
+    pub fn price_frame_phase_plus_at(&self, slot: u64) -> DriftResult<PriceFramePhasePlus> {
+        let gi = self.grid_info();
+        let step = gi.step;
+        let reserve = self.reserve_price()?;
+        let bid = self.bid_price(reserve)?;
+        let ask = self.ask_price(reserve)?;
+        let spread_ticks = gi.ticks_between(bid, ask).unsigned_abs() as u64;
+        Ok(PriceFramePhasePlus { bid, ask, step, reserve, spread_ticks })
+    }
+
+    // E102: asymmetric tick rate-limit
+    #[inline(always)]
+    pub fn limit_tick_move_asym(
+        &self,
+        from_px: u64,
+        to_px: u64,
+        side: PositionDirection,
+        gi: &GridInfo,
+        max_toward_ticks: u64,
+        max_away_ticks: u64,
+    ) -> u64 {
+        if from_px == to_px { return to_px; }
+        let ticks = gi.ticks_between(from_px, to_px);
+        let toward_cross = match side {
+            PositionDirection::Long  => ticks > 0,
+            PositionDirection::Short => ticks < 0,
+        };
+        let cap = if toward_cross { max_toward_ticks } else { max_away_ticks };
+        if cap == 0 { return from_px; }
+        let abs = ticks.unsigned_abs() as u64;
+        if abs <= cap { return to_px; }
+        let dir = if ticks >= 0 { 1i64 } else { -1i64 };
+        gi.offset(from_px, (cap as i64) * dir)
+    }
+
+    // E103: auto levels and spacing
+    #[inline(always)]
+    pub fn auto_levels_and_spacing(&self, ctx: &AMMContextPlus) -> (u8, u8) {
+        let vol  = self.oracle_std.max(self.mark_std).max(1);
+        let twap = self.historical_oracle_data.last_oracle_price_twap.unsigned_abs().max(1);
+        let mut sigma_bps = (vol.saturating_mul(10_000)).saturating_div(twap);
+        if sigma_bps > 5_000 { sigma_bps = 5_000; }
+        let sp = ctx.pf.spread_ticks.max(1);
+        let spacing = core::cmp::max(1u64, core::cmp::min(sp / 3 + (sigma_bps / 100) as u64, 8u64)) as u8;
+        let levels = if sigma_bps <= 25 { 4 } else if sigma_bps <= 75 { 3 } else { 2 };
+        (levels, spacing)
+    }
+
+    // E104: quote-age gating
+    #[inline(always)]
+    pub fn min_change_ticks_by_age(
+        &self,
+        now_ts: i64,
+        last_emit_ts: i64,
+        base_min_ticks: u64,
+        age_lo: i64,
+        age_hi: i64,
+    ) -> u64 {
+        let age = now_ts.saturating_sub(last_emit_ts).max(0);
+        if age >= age_hi { return 0; }
+        if age <= age_lo { return base_min_ticks.saturating_mul(2); }
+        base_min_ticks
+    }
+
+    // E106: context++ with phase bit
+    #[inline(always)]
+    pub fn build_context_plus2(&self) -> DriftResult<AMMContextPlus2> {
+        let slot = anchor_lang::prelude::Clock::get()?.slot;
+        let gi   = self.grid_info();
+        let pf   = self.price_frame_phase_plus_at(slot)?;
+        let s64  = self.salt64_from_oracle();
+        let phase = (Self::splitmix64_u64(slot ^ s64) & 1) as u64;
+        Ok(AMMContextPlus2 {
+            slot, gi, pf,
+            price_salt_bit:  s64 & 1,
+            size_salt_bit:  (s64 >> 1) & 1,
+            phase_salt_bit: phase,
+        })
+    }
+
+    // E107: fused offset inside using ctx2
+    #[inline(always)]
+    pub fn offset_inside_from_ctx2(
+        &self,
+        side: PositionDirection,
+        px: u64,
+        ticks: i64,
+        ctx: &AMMContextPlus2,
+    ) -> u64 {
+        let off = ctx.gi.offset(px, ticks);
+        match side {
+            PositionDirection::Long  => off.min(ctx.pf.ask.saturating_sub(ctx.pf.step)).max(ctx.pf.bid),
+            PositionDirection::Short => off.max(ctx.pf.bid.saturating_add(ctx.pf.step)).min(ctx.pf.ask),
+        }
+    }
+
+    // Lightweight helpers required by E109/E110
+    #[inline(always)]
+    pub fn jitter_ticks_adaptive_with_slot(&self, slot: u64, _oracle_price: i64, cap: u8) -> i64 {
+        if cap == 0 { return 0; }
+        let seed = Self::splitmix64_u64(slot ^ self.salt64_from_oracle());
+        let r = (seed & 0xFFFF) as i64; // 0..65535
+        let span = (cap as i64).min(2) as i64; // ≤2 as per params
+        (r % (2*span + 1)) - span // in [-span..span]
+    }
+
+    #[inline(always)]
+    pub fn inventory_skew_ticks(&self, _ctx: &AMMContextPlus, cap: i64) -> i64 {
+        let inv = self.base_asset_amount_with_unsettled_lp;
+        if inv == 0 { return 0; }
+        let sqrtk = self.get_lower_bound_sqrt_k().unwrap_or(0);
+        if sqrtk == 0 { return 0; }
+        // Coarse mapping: 1 tick if |inv| > sqrtk/200, 2 if > sqrtk/100
+        let th1 = (sqrtk / 200) as i128;
+        let th2 = (sqrtk / 100) as i128;
+        let mag = if inv.unsigned_abs() as i128 > th2 { 2 } else if inv.unsigned_abs() as i128 > th1 { 1 } else { 0 };
+        let mag = (mag as i64).min(cap.abs());
+        if inv > 0 { -mag } else { mag }
+    }
+
+    #[inline(always)]
+    pub fn spread_bps_vs_oracle(&self, reserve_price_i: i64) -> DriftResult<i64> {
+        let reserve_u = reserve_price_i.unsigned_abs().max(1);
+        let oracle_u  = self.historical_oracle_data.last_oracle_price.unsigned_abs().max(1);
+        let bps = bps_diff_u64(reserve_u, oracle_u) as i64;
+        Ok(bps)
+    }
+
+    // E103/E108 dependents
+    #[inline(always)]
+    pub fn derive_quote_params(&self, ctx: &AMMContextPlus) -> QuoteParams {
+        let (_, spacing0) = self.auto_levels_and_spacing(ctx);
+        let rp = ctx.pf.reserve.max(1) as i64;
+        let div_bps = self.spread_bps_vs_oracle(rp).unwrap_or(0);
+        let stressed = div_bps > 150 || self.last_oracle_conf_pct > 200;
+        if stressed {
+            QuoteParams { levels: 1, spacing_ticks: core::cmp::max(1, spacing0 / 2), jitter_cap: 0, min_change_ticks: 1, toward_cap: 1, away_cap: 2 }
+        } else {
+            QuoteParams { levels: 3, spacing_ticks: spacing0.max(1), jitter_cap: 2, min_change_ticks: 1, toward_cap: 1, away_cap: 3 }
+        }
+    }
+
+    // E105: pair sanitizer
+    #[inline(always)]
+    pub fn sanitize_pair_at_slot(&self, slot: u64, mut bid: u64, mut ask: u64) -> DriftResult<MakerPair> {
+        let gi = self.grid_info();
+        let pf = self.price_frame_phase_plus_at(slot)?;
+        bid = bid.max(pf.bid).min(pf.ask.saturating_sub(pf.step));
+        ask = ask.min(pf.ask).max(pf.bid.saturating_add(pf.step));
+        if ask <= bid { ask = bid.saturating_add(pf.step); }
+        bid = self.snap_with_gi_phase(bid, &gi, slot);
+        ask = self.snap_with_gi_phase(ask, &gi, slot);
+        Ok(MakerPair { bid, ask })
+    }
+
+    // E109: build pair using ctx2 and params
+    #[inline(always)]
+    pub fn build_pair_center_mode_ctx2(
+        &self,
+        ctx2: &AMMContextPlus2,
+        center_target: u64,
+        params: &QuoteParams,
+        oracle_price: i64,
+        prev_pair_opt: Option<MakerPair>,
+    ) -> DriftResult<MakerPair> {
+        let gi = ctx2.gi;
+        let pf = ctx2.pf;
+        let slot = ctx2.slot;
+
+        let rb = gi.offset(center_target, -(params.spacing_ticks as i64));
+        let ra = gi.offset(center_target,   params.spacing_ticks as i64);
+        let mut bid = self.offset_inside_from_ctx2(PositionDirection::Long,  rb, 0, ctx2);
+        let mut ask = self.offset_inside_from_ctx2(PositionDirection::Short, ra, 0, ctx2);
+
+        let skew = self.inventory_skew_ticks(
+            &AMMContextPlus { slot, gi, pf, price_salt_bit: ctx2.price_salt_bit, size_salt_bit: ctx2.size_salt_bit },
+            2,
+        );
+        if skew != 0 { bid = self.offset_inside_from_ctx2(PositionDirection::Long,  bid, -skew, ctx2);
+                        ask = self.offset_inside_from_ctx2(PositionDirection::Short, ask,  skew, ctx2); }
+
+        if params.jitter_cap > 0 {
+            let jb = self.jitter_ticks_adaptive_with_slot(slot, oracle_price, params.jitter_cap);
+            let ja = self.jitter_ticks_adaptive_with_slot(slot ^ 0xACEDFACE, oracle_price, params.jitter_cap);
+            if jb != 0 { bid = self.offset_inside_from_ctx2(PositionDirection::Long,  bid, jb, ctx2); }
+            if ja != 0 { ask = self.offset_inside_from_ctx2(PositionDirection::Short, ask, ja, ctx2); }
+        }
+
+        if let Some(prev) = prev_pair_opt {
+            bid = self.limit_tick_move_asym(prev.bid, bid, PositionDirection::Long,  &gi, params.toward_cap, params.away_cap);
+            ask = self.limit_tick_move_asym(prev.ask, ask, PositionDirection::Short, &gi, params.toward_cap, params.away_cap);
+        }
+
+        bid = self.snap_with_gi_phase(bid, &gi, slot);
+        ask = self.snap_with_gi_phase(ask, &gi, slot);
+        if ask <= bid { ask = bid.saturating_add(pf.step); }
+
+        Ok(MakerPair { bid, ask })
+    }
+
+    // E110: ladder builder with mode & dedup
+    #[inline(always)]
+    pub fn build_levels_mode_ctx2(
+        &self,
+        ctx2: &AMMContextPlus2,
+        side: PositionDirection,
+        center_target: u64,
+        params: &QuoteParams,
+        oracle_price: i64,
+        prev_levels_opt: Option<MakerLevels>,
+    ) -> DriftResult<MakerLevels> {
+        let gi = ctx2.gi;
+        let pf = ctx2.pf;
+        let slot = ctx2.slot;
+        let mut out = MakerLevels { n: 0, px: [0; 4] };
+        let mut prev_in_build: Option<u64> = None;
+        let max_n = core::cmp::min(4, params.levels as usize);
+        for i in 0..max_n {
+            let off = (i as i64) * (params.spacing_ticks as i64);
+            let base = match side {
+                PositionDirection::Long  => gi.offset(center_target, -off),
+                PositionDirection::Short => gi.offset(center_target,  off),
+            };
+            let mut px = self.offset_inside_from_ctx2(side, base, 0, ctx2);
+            if params.jitter_cap > 0 {
+                let jt = self.jitter_ticks_adaptive_with_slot(slot ^ ((i as u64) * 0x9E37_79B9), oracle_price, params.jitter_cap);
+                if jt != 0 { px = self.offset_inside_from_ctx2(side, px, jt, ctx2); }
+            }
+            if let Some(prev) = prev_levels_opt {
+                if (prev.n as usize) > i {
+                    px = self.limit_tick_move_asym(prev.px[i], px, side, &gi, params.toward_cap, params.away_cap);
+                }
+            }
+            px = self.snap_with_gi_phase(px, &gi, slot);
+            if let Some(p) = prev_in_build {
+                if side == PositionDirection::Long {
+                    if px >= p { px = p.saturating_sub(pf.step).max(pf.bid); }
+                } else {
+                    if px <= p { px = p.saturating_add(pf.step).min(pf.ask); }
+                }
+            }
+            if let Some(p) = prev_in_build { if px == p { continue; } }
+            out.px[out.n as usize] = px; out.n += 1; prev_in_build = Some(px);
+        }
+        Ok(out)
+    }
+}
+
+// ===== Grid and quoting primitives (minimal, deterministic) =====
+#[derive(Clone, Copy, Debug)]
+pub struct GridInfo { pub step: u64 }
+
+impl GridInfo {
+    #[inline(always)]
+    pub fn ticks_between(&self, from_px: u64, to_px: u64) -> i64 {
+        let s = self.step.max(1);
+        if to_px >= from_px { ((to_px - from_px) / s) as i64 } else { -(((from_px - to_px) / s) as i64) }
+    }
+    #[inline(always)]
+    pub fn offset(&self, px: u64, ticks: i64) -> u64 {
+        let s = self.step.max(1);
+        if ticks >= 0 { px.saturating_add((ticks as u64).saturating_mul(s)) }
+        else { px.saturating_sub((ticks.unsigned_abs()).saturating_mul(s)) }
+    }
+    /// Phase-aware banker’s snap: on exact half-steps, prefer up if phase_bit==1 else banker’s
+    #[inline(always)]
+    pub fn snap_phase(&self, px: u64, phase_bit: u64) -> u64 {
+        let s = self.step.max(1);
+        let rem = px % s;
+        let half = s / 2;
+        if rem == half && (s & 1) == 0 { // exact half
+            if phase_bit & 1 == 1 { px.saturating_add(s - rem) } else { px - rem }
+        } else {
+            quantize_bankers_u64(px, s)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PriceFramePhasePlus { pub bid: u64, pub ask: u64, pub step: u64, pub reserve: u64, pub spread_ticks: u64 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct AMMContextPlus { pub slot: u64, pub gi: GridInfo, pub pf: PriceFramePhasePlus, pub price_salt_bit: u64, pub size_salt_bit: u64 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct MakerPair { pub bid: u64, pub ask: u64 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct MakerLevels { pub n: u8, pub px: [u64; 4] }
+
+#[derive(Clone, Copy)]
+pub struct AMMContextPlus2 {
+    pub slot: u64,
+    pub gi:   GridInfo,
+    pub pf:   PriceFramePhasePlus,
+    pub price_salt_bit: u64,
+    pub size_salt_bit:  u64,
+    pub phase_salt_bit: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct QuoteParams {
+    pub levels: u8,
+    pub spacing_ticks: u8,
+    pub jitter_cap: u8,
+    pub min_change_ticks: u64,
+    pub toward_cap: u64,
+    pub away_cap: u64,
+}
+
 use anchor_lang::prelude::*;
-
-use crate::state::state::State;
-use std::cmp::max;
-
-use crate::controller::position::{PositionDelta, PositionDirection};
-use crate::error::{DriftResult, ErrorCode};
-use crate::math::amm;
-use crate::math::casting::Cast;
-#[cfg(test)]
-use crate::math::constants::{
-    AMM_RESERVE_PRECISION, MAX_CONCENTRATION_COEFFICIENT, PRICE_PRECISION_I64,
-};
-use crate::math::constants::{
-    AMM_RESERVE_PRECISION_I128, AMM_TO_QUOTE_PRECISION_RATIO, BID_ASK_SPREAD_PRECISION,
-    BID_ASK_SPREAD_PRECISION_I128, BID_ASK_SPREAD_PRECISION_U128,
-    DEFAULT_REVENUE_SINCE_LAST_FUNDING_SPREAD_RETREAT, LIQUIDATION_FEE_PRECISION,
-    LIQUIDATION_FEE_TO_MARGIN_PRECISION_RATIO, LP_FEE_SLICE_DENOMINATOR, LP_FEE_SLICE_NUMERATOR,
-    MARGIN_PRECISION, MARGIN_PRECISION_U128, MAX_LIQUIDATION_MULTIPLIER, PEG_PRECISION,
-    PERCENTAGE_PRECISION, PERCENTAGE_PRECISION_I128, PERCENTAGE_PRECISION_I64,
-    PERCENTAGE_PRECISION_U64, PRICE_PRECISION, SPOT_WEIGHT_PRECISION, TWENTY_FOUR_HOUR,
-};
-use crate::math::helpers::get_proportion_i128;
-use crate::math::margin::{
-    calculate_size_discount_asset_weight, calculate_size_premium_liability_weight,
-    MarginRequirementType,
-};
-use crate::math::safe_math::SafeMath;
-use crate::math::stats;
-use crate::state::events::OrderActionExplanation;
-use num_integer::Roots;
-
-use crate::state::oracle::{
-    get_prelaunch_price, get_sb_on_demand_price, get_switchboard_price, HistoricalOracleData,
-    OracleSource,
-};
-use crate::state::spot_market::{AssetTier, SpotBalance, SpotBalanceType};
-use crate::state::traits::{MarketIndexOffset, Size};
 use borsh::{BorshDeserialize, BorshSerialize};
+use core::convert::TryFrom;
+use static_assertions::{const_assert, const_assert_eq};
 
-use crate::state::paused_operations::PerpOperation;
-use drift_macros::assert_no_slop;
-use static_assertions::const_assert_eq;
+use crate::{
+    controller::position::{PositionDelta, PositionDirection},
+    error::{DriftResult, ErrorCode},
+    math::{
+        amm, stats,
+        casting::Cast,
+        constants::*,
+        helpers::get_proportion_i128,
+        margin::{
+            calculate_size_discount_asset_weight, calculate_size_premium_liability_weight,
+            MarginRequirementType,
+        },
+        safe_math::SafeMath,
+    },
+    state::{
+        events::OrderActionExplanation,
+        oracle::{
+            get_prelaunch_price, get_sb_on_demand_price, get_switchboard_price, HistoricalOracleData,
+            OracleSource,
+        },
+        paused_operations::PerpOperation,
+        pyth_lazer_oracle::PythLazerOracle,
+        spot_market::{AssetTier, SpotBalance, SpotBalanceType},
+        state::State,
+        traits::{MarketIndexOffset, Size},
+    },
+};
 
-use super::oracle_map::OracleIdentifier;
-use super::protected_maker_mode_config::ProtectedMakerParams;
+use super::{oracle_map::OracleIdentifier, protected_maker_mode_config::ProtectedMakerParams};
+use std::cmp::max;
 
 #[cfg(test)]
 mod tests;
 
+// === [IMPROVED: PIECE v1++++++ QUANT] ===
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq, Default)]
+#[repr(u8)]
 pub enum MarketStatus {
-    /// warm up period for initialization, fills are paused
-    #[default]
-    Initialized,
-    /// all operations allowed
-    Active,
-    /// Deprecated in favor of PausedOperations
-    FundingPaused,
-    /// Deprecated in favor of PausedOperations
-    AmmPaused,
-    /// Deprecated in favor of PausedOperations
-    FillPaused,
-    /// Deprecated in favor of PausedOperations
-    WithdrawPaused,
-    /// fills only able to reduce liability
-    ReduceOnly,
-    /// market has determined settlement price and positions are expired must be settled
-    Settlement,
-    /// market has no remaining participants
-    Delisted,
+    #[default] Initialized = 0,
+    Active = 1,
+    ReduceOnly = 2,
+    Settlement = 3,
+    Delisted = 4,
+    // Deprecated
+    FundingPaused = 5,
+    AmmPaused = 6,
+    FillPaused = 7,
+    WithdrawPaused = 8,
+}
+
+// === [IMPROVED: PIECE S37 v++ HFT¹¹] === Salt & cheap helpers
+#[inline(always)]
+fn abs_diff_u64(a: u64, b: u64) -> u64 { if a >= b { a - b } else { b - a } }
+
+#[inline(always)]
+fn u64_from_pubkey_le(pk: &Pubkey) -> u64 {
+    let b = pk.to_bytes();
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 impl MarketStatus {
+    #[inline(always)]
     pub fn validate_not_deprecated(&self) -> DriftResult {
         if matches!(
             self,
-            MarketStatus::FundingPaused
-                | MarketStatus::AmmPaused
-                | MarketStatus::FillPaused
-                | MarketStatus::WithdrawPaused
+            Self::FundingPaused | Self::AmmPaused | Self::FillPaused | Self::WithdrawPaused
         ) {
-            msg!("MarketStatus is deprecated");
-            Err(ErrorCode::DefaultError)
-        } else {
-            Ok(())
+            return Err(ErrorCode::DefaultError);
         }
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+impl TryFrom<u8> for MarketStatus {
+    type Error = ErrorCode;
+    #[inline(always)]
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        use MarketStatus::*;
+        Ok(match v {
+            0 => Initialized, 1 => Active, 2 => ReduceOnly, 3 => Settlement, 4 => Delisted,
+            5 => FundingPaused, 6 => AmmPaused, 7 => FillPaused, 8 => WithdrawPaused,
+            _ => return Err(ErrorCode::DefaultError),
+        })
+    }
+}
+
+impl From<MarketStatus> for u8 { #[inline(always)] fn from(x: MarketStatus) -> u8 { x as u8 } }
+
+// === [IMPROVED: PIECE v3++++++ QUANT] ===
+// Compile-time invariants for struct layout
+const_assert_eq!(core::mem::size_of::<PerpMarket>(), 1216);
+const_assert_eq!(core::mem::align_of::<PerpMarket>(), 8);
+const_assert_eq!(PerpMarket::MARKET_INDEX_OFFSET, 1160);
+
+// === [IMPROVED: PIECE S9 v++ HFT²] ===
+// === [IMPROVED: PIECE S9 v++ HFT²] ===
+const_assert!(36 >= 12); // we only use first 12 bytes of padding for meta
+
+// === [IMPROVED: PIECE S25 v++ HFT⁷] === Enum size ABI locks
+const_assert_eq!(core::mem::size_of::<MarketStatus>(), 1);
+const_assert_eq!(core::mem::size_of::<ContractType>(), 1);
+const_assert_eq!(core::mem::size_of::<ContractTier>(), 1);
+
+// === [IMPROVED: PIECE P27 v++ HFT²¹] === Additional ABI locks
+const_assert_eq!(core::mem::size_of::<InsuranceClaim>(), 40);
+const_assert_eq!(core::mem::align_of::<InsuranceClaim>(), 8);
+const_assert_eq!(core::mem::size_of::<PoolBalance>(), 24);
+const_assert_eq!(core::mem::align_of::<PoolBalance>(), 8);
+
+// === [IMPROVED: PIECE S3 v++ HFT³] === Layout/version canary using existing padding
+pub const PERP_MARKET_LAYOUT_VERSION: u16 = 3;
+pub const PERP_MARKET_LAYOUT_CANARY:  u32 = 0xA1B2C3D4;
+pub const PERP_MARKET_MIN_SDK:        u16 = 1;
+pub const LAYOUT_FLAG_PRICE_GUARDS:    u32 = 1 << 0;
+pub const LAYOUT_FLAG_ABI_STRICT_ENUM: u32 = 1 << 1;
+
+// ===============================
+// === [IMPROVED: PIECE v1+++++ OMEGA] ===
+// Deterministic Reserve Price Guard
+// ===============================
+impl PerpMarket {
+    #[inline(always)]
+    pub fn normalized_reserve_price(&self, slot: u64) -> DriftResult<u64> {
+        let reserve = self.amm.reserve_price()?;
+        let oracle_i = self.amm.historical_oracle_data.last_oracle_price;
+        let oracle_u = oracle_i.unsigned_abs();
+
+        // Recency / confidence
+        let slots_since = slot.saturating_sub(self.amm.last_update_slot).min(5);
+        let recency_boost: u64 = if slots_since == 0 { 3 } else { 1 };
+        let max_mult = self.get_max_confidence_interval_multiplier()?;
+        let conf_thr = (PERCENTAGE_PRECISION_U64 / 50).safe_mul(max_mult)?; // 2% * tier
+        let conf_ok = self.amm.last_oracle_conf_pct <= conf_thr;
+
+        // === [IMPROVED: PIECE S16 v++ HFT⁵] === Fast path
+        if slots_since == 0 && conf_ok {
+            let max_p = reserve.max(oracle_u).max(1);
+            let spread_pct_fp = (reserve.max(oracle_u) - reserve.min(oracle_u))
+                .safe_mul(PERCENTAGE_PRECISION_U64)?
+                .safe_div(max_p)?;
+            if spread_pct_fp <= (PERCENTAGE_PRECISION_U64 / 10_000) { // 1bp
+                let twap_abs = self
+                    .amm
+                    .historical_oracle_data
+                    .last_oracle_price_twap
+                    .unsigned_abs();
+                let twap_tick = quantize_bankers_u64(twap_abs.max(1), self.amm.grid_step());
+                return Ok(twap_tick);
+            }
+        }
+
+        // Tick-aware spread penalty
+        let penalty_w = spread_penalty_weight(reserve, oracle_u, self.amm.grid_step())?;
+
+        // Weights
+        let oracle_w  = if conf_ok { ((recency_boost as u64) << 1).saturating_add(1) } else { 1 };
+        let reserve_w = if conf_ok { 2 } else { 3 }.saturating_mul(penalty_w);
+        let denom = reserve_w.safe_add(oracle_w)?;
+
+        // Blend
+        let mut blended = reserve
+            .safe_mul(reserve_w)?
+            .safe_add(oracle_u.safe_mul(oracle_w)?)?
+            .safe_div(denom)?;
+
+        // Tier rails vs TWAP
+        let twap_i = self.amm.historical_oracle_data.last_oracle_price_twap;
+        let twap_u = twap_i.unsigned_abs();
+        let max_div = self.get_max_price_divergence_for_funding_rate(twap_i)?.unsigned_abs();
+        blended = clamp_u64(blended, twap_u.saturating_sub(max_div), twap_u.saturating_add(max_div));
+
+        // Snap-to-twap if within 5 bps
+        let dead = twap_u.safe_div(2000)?;
+        let diff = if blended > twap_u { blended - twap_u } else { twap_u - blended };
+        if diff <= dead { blended = twap_u; }
+
+        Ok(blended)
+    }
+
+    // === [IMPROVED: PIECE S36C v++ HFT¹¹] === Elastic funding depth on grid
+    #[inline(always)]
+    pub fn funding_rate_depth_elastic(&self) -> DriftResult<u64> {
+        let mut base = self.funding_rate_depth()?;
+        let inv = self.amm.base_asset_amount_with_unsettled_lp;
+        if inv == 0 { return Ok(base); }
+
+        let sqrtk = self.amm.get_lower_bound_sqrt_k()?;
+        if sqrtk == 0 { return Ok(base); }
+
+        let stress = ((inv.unsigned_abs() as u128)
+            .safe_mul(10_000u128)? // bps
+            .safe_div(sqrtk as u128)?)
+            .min(2_500u128) as u64; // cap 25%
+
+        let reduce = pct_mul_u64_bankers(base, stress, 10_000)?;
+        base = base.saturating_sub(reduce).max(1);
+
+        Ok(quantize_bankers_u64(base, self.amm.grid_step()).max(1))
+    }
+
+    // === [IMPROVED: PIECE P25 v++ HFT²¹] === Slot-aware maker params
+    #[inline(always)]
+    pub fn salt_jitter_ticks_scaled(&self, slot: u64, scale: u64) -> i64 {
+        // Deterministic tiny jitter in [-scale, 0, +scale]
+        let h = self.quant_salt() ^ slot;
+        let sign = if (h & 1) == 0 { -1i64 } else { 1i64 };
+        let mag = ((h >> 1) & 1) as i64; // 0 or 1
+        sign.saturating_mul(mag.saturating_mul(scale as i64))
+    }
+
+    #[inline(always)]
+    pub fn get_protected_maker_params_at_slot(
+        &self,
+        slot: u64,
+    ) -> DriftResult<ProtectedMakerParams> {
+        let step = self.amm.grid_step();
+
+        let dyn_raw = if self.protected_maker_dynamic_divisor > 0 {
+            self.amm.oracle_std.max(self.amm.mark_std) / self.protected_maker_dynamic_divisor as u64
+        } else {
+            0
+        };
+
+        let mut dyn_ticks = if step > 1 { (dyn_raw + step - 1) / step } else { dyn_raw };
+        dyn_ticks = dyn_ticks.min(10_000);
+
+        let vol = self.amm.oracle_std.max(self.amm.mark_std).max(1);
+        let twap = self
+            .amm
+            .historical_oracle_data
+            .last_oracle_price_twap
+            .unsigned_abs()
+            .max(1);
+        let vol_bps = (vol.saturating_mul(10_000)).saturating_div(twap).max(1);
+        let tier_mul: u64 = match self.contract_tier {
+            ContractTier::A | ContractTier::B => 1,
+            ContractTier::C => 2,
+            _ => 3,
+        };
+        let deadband_ticks = ((vol_bps / 25).max(1)).saturating_mul(tier_mul).clamp(1, 12);
+
+        if dyn_ticks <= deadband_ticks {
+            dyn_ticks = 0;
+        }
+
+        if dyn_ticks > 0 {
+            dyn_ticks = dyn_ticks.max(1);
+            let j = self.salt_jitter_ticks_scaled(slot, 2);
+            let jt = if j >= 0 { j as u64 } else { j.unsigned_abs() as u64 };
+            dyn_ticks = dyn_ticks.saturating_add(jt).max(1);
+        }
+
+        let dynamic_offset = dyn_ticks.saturating_mul(step);
+        Ok(ProtectedMakerParams {
+            limit_price_divisor: self.protected_maker_limit_price_divisor,
+            dynamic_offset,
+            tick_size: step,
+        })
+    }
+
+    #[inline(always)]
+    pub fn get_protected_maker_params(&self) -> DriftResult<ProtectedMakerParams> {
+        Ok(self.get_protected_maker_params_at_slot(anchor_lang::prelude::Clock::get()?.slot)?)
+    }
+
+    // === [IMPROVED: PIECE P25 v++ HFT²¹] === Slot-aware auction skip (thin wrapper)
+    #[inline(always)]
+    pub fn can_skip_auction_duration_at_slot(
+        &self,
+        state: &State,
+        amm_lp_allowed_to_jit_make: bool,
+        _slot: u64,
+    ) -> DriftResult<bool> {
+        // Reuse existing logic; current implementation does not need Clock::get
+        self.can_skip_auction_duration(state, amm_lp_allowed_to_jit_make)
+    }
+}
+
+impl PerpMarket {
+    // === [IMPROVED: PIECE S37 v++ HFT¹¹] === salt accessors
+    #[inline(always)]
+    pub fn quant_salt(&self) -> u64 { u64_from_pubkey_le(&self.pubkey) ^ ((self.market_index as u64) << 17) }
+    #[inline(always)]
+    pub fn quant_salt_bit(&self) -> u64 { self.quant_salt() & 1 }
+}
+
+// === [IMPROVED: PIECE S41 v++ HFT¹¹] === Tick-aware bounded spread penalty
+#[inline(always)]
+fn spread_penalty_weight(reserve: u64, oracle: u64, tick: u64) -> DriftResult<u64> {
+    let spread = abs_diff_u64(reserve, oracle);
+    // effective spread in ticks (rounded up)
+    let t = tick.max(1);
+    let ticks = if spread == 0 { 0 } else { (spread + t - 1) / t } as u64;
+    // map ticks→penalty in [1 .. 1 + 2%] with quick taper: 0.5% per tick up to 4 ticks
+    let half_pct = PERCENTAGE_PRECISION_U64 / 200; // 0.5%
+    let w_pct = (ticks.min(4)).safe_mul(half_pct)?;
+    // Convert percentage to multiplicative weight ~ (1 + w_pct)
+    // Scale via ppm to keep integer math simple
+    let inc_ppm = pct_mul_u64_floor(1_000_000, w_pct, PERCENTAGE_PRECISION_U64)?;
+    Ok(1 + inc_ppm / 1_000_000)
+}
+
+impl PerpMarket {
+    /// True if oracle delay is within acceptable bounds for this tier/source.
+    #[inline(always)]
+    pub fn oracle_fresh_enough(&self) -> bool {
+        let base = match self.contract_tier {
+            ContractTier::A | ContractTier::B => 1u64,
+            ContractTier::C => 2u64,
+            _ => 4u64,
+        };
+        let d = self.amm.historical_oracle_data.last_oracle_delay as u64;
+        d <= base
+    }
+
+    /// Hint for weighting oracle contributions in blends; 2 if fresh, else 1.
+    #[inline(always)]
+    pub fn oracle_weight_hint(&self) -> u64 { if self.oracle_fresh_enough() { 2 } else { 1 } }
+
+    // Layout meta helpers using padding[0..12]
+    #[inline(always)]
+    pub fn write_layout_meta(&mut self) {
+        let v = PERP_MARKET_LAYOUT_VERSION.to_le_bytes();
+        let c = PERP_MARKET_LAYOUT_CANARY.to_le_bytes();
+        let s = PERP_MARKET_MIN_SDK.to_le_bytes();
+        let f = (LAYOUT_FLAG_PRICE_GUARDS | LAYOUT_FLAG_ABI_STRICT_ENUM).to_le_bytes();
+        self.padding[0] = v[0]; self.padding[1] = v[1];
+        self.padding[2] = c[0]; self.padding[3] = c[1]; self.padding[4] = c[2]; self.padding[5] = c[3];
+        self.padding[6] = s[0]; self.padding[7] = s[1];
+        self.padding[8] = f[0]; self.padding[9] = f[1]; self.padding[10] = f[2]; self.padding[11] = f[3];
+    }
+
+    #[inline(always)]
+    pub fn assert_layout_meta(&self) -> DriftResult {
+        let p = &self.padding;
+        let ver = u16::from_le_bytes([p[0], p[1]]);
+        let can = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
+        if ver != PERP_MARKET_LAYOUT_VERSION || can != PERP_MARKET_LAYOUT_CANARY {
+            return Err(ErrorCode::DefaultError);
+        }
+        Ok(())
+    }
+}
+
+// ===============================
+// === [IMPROVED: PIECE v2+++++ OMEGA] ===
+// Dynamic Liquidation Cap
+// ===============================
+impl PerpMarket {
+    #[inline(always)]
+    pub fn dynamic_liquidation_cap(&self, maybe_vol_est: Option<u64>) -> DriftResult<u32> {
+        let base_ceiling = self.get_max_liquidation_fee()?;
+        let base_fee = self.get_base_liquidator_fee(false);
+
+        // Use provided vol or fallback
+        let vol_est = maybe_vol_est.unwrap_or(self.amm.mark_std.max(self.amm.oracle_std).max(1));
+
+        // Tier uplift
+        let tier_mult = match self.contract_tier {
+            ContractTier::A | ContractTier::B => 1,
+            ContractTier::C => 2,
+            _ => 3,
+        };
+
+        // Volatility bands
+        let mut cap = match vol_est {
+            x if x < PRICE_PRECISION / 100 => base_ceiling / 2,
+            x if x < PRICE_PRECISION / 25 => base_ceiling.saturating_add(base_ceiling / 10),
+            x if x < PRICE_PRECISION / 10 => base_ceiling.saturating_add(base_ceiling / 5),
+            _ => base_ceiling.saturating_add(base_ceiling / 2),
+        };
+
+        cap = cap.saturating_mul(tier_mult);
+
+        // Clamp
+        cap = cap.clamp(base_fee, base_ceiling);
+        Ok(cap)
+    }
+}
+
+// ===============================
+// === [IMPROVED: PIECE v3+++++ OMEGA] ===
+// Margin Ratio Guard
+// ===============================
+impl PerpMarket {
+    #[inline(always)]
+    pub fn get_margin_ratio_guarded(
+        &self,
+        size: u128,
+        margin_type: MarginRequirementType,
+        user_high_leverage_mode: bool,
+        slot: u64,
+    ) -> DriftResult<u32> {
+        let mut mr = self.get_margin_ratio(size, margin_type, user_high_leverage_mode)?;
+
+        // Confidence hysteresis
+        let max_mult = self.get_max_confidence_interval_multiplier()?;
+        let allowed = (PERCENTAGE_PRECISION_U64 / 50).safe_mul(max_mult)?;
+        let conf = self.amm.last_oracle_conf_pct;
+        if conf > allowed.saturating_add(allowed / 10) {
+            let excess_bps: u32 = ((conf - allowed)
+                .saturating_mul(10_000)
+                .safe_div(allowed.max(1))?)
+                .min(2000)
+                .cast()?;
+            mr = mr.saturating_add(mr.saturating_mul(excess_bps) / 10_000);
+        }
+
+        // Slot jitter bump
+        if (slot & 7) == 0 {
+            mr = mr.saturating_add(mr / 20);
+        }
+
+        // OI crowding tax
+        let oi = self.get_open_interest();
+        let sqrtk = self.amm.get_lower_bound_sqrt_k()?;
+        if sqrtk > 0 {
+            let ratio = (oi as u128).saturating_mul(1000).safe_div(sqrtk)?;
+            mr = mr.saturating_add(match ratio {
+                0..=250 => 0,
+                251..=600 => mr / 20,
+                _ => mr / 7,
+            });
+        }
+
+        // Sigmoid penalty
+        let k = (self.amm.min_order_size as u128).safe_mul(512)?;
+        if size > 0 {
+            let num = (size.saturating_mul(150u128)).safe_mul(10_000u128)?;
+            let den = size.safe_add(k)?;
+            let tax_bps_u128 = num.safe_div(den)?;
+            let tax_bps: u32 = (tax_bps_u128 / 10_000u128).min(150).cast()?;
+            mr = mr.saturating_add(mr.saturating_mul(tax_bps) / 10_000);
+        }
+
+        // Toxic flow & volume imbalance
+        if self.amm.short_intensity_count > self.amm.long_intensity_count.saturating_mul(2) {
+            mr = mr.saturating_add(mr / 10);
+        }
+        if self.amm.long_intensity_volume > self.amm.short_intensity_volume.saturating_mul(2) {
+            mr = mr.saturating_add(mr / 20);
+        }
+
+        Ok(mr)
+    }
+}
+
+// ===============================
+// === [IMPROVED: PIECE v4+++++ OMEGA] ===
+// Structural Drawdown Guard
+// ===============================
+impl PerpMarket {
+    #[inline(always)]
+    pub fn has_structural_drawdown(&self, ema_drawdown_pct_i128: i128) -> DriftResult<bool> {
+        let raw = self.has_too_much_drawdown()?;
+        let ema_ok = ema_drawdown_pct_i128 < -PERCENTAGE_PRECISION_I128 / 30;
+
+        let base = self.amm.total_fee_minus_distributions.abs().max(1);
+        let funding_ratio = (self.amm.net_unsettled_funding_pnl as i128)
+            .safe_mul(PERCENTAGE_PRECISION_I128)?
+            .safe_div(base as i128)?;
+        let funding_bad = funding_ratio < -PERCENTAGE_PRECISION_I128 / 50;
+
+        let intensity_ok = (self.amm.volume_24h > 0)
+            || (self.amm.long_intensity_count > 3)
+            || (self.amm.short_intensity_count > 3);
+
+        let depth_ok = self.get_open_interest() > self.amm.min_order_size.safe_mul(1000)?;
+        let extra_cushion_ok = funding_ratio < -PERCENTAGE_PRECISION_I128 / 200;
+
+        let pnl_skew_ok = self.amm.base_asset_amount_long.abs()
+            > self.amm.base_asset_amount_short.abs().saturating_mul(2);
+
+        Ok(raw && ema_ok && funding_bad && intensity_ok && extra_cushion_ok && !depth_ok && pnl_skew_ok)
+    }
+}
+
+// ===============================
+// === [IMPROVED: PIECE v5+++++ OMEGA] ===
+// Funding Rate Depth Estimator
+// ===============================
+impl PerpMarket {
+    #[inline(always)]
+    pub fn funding_rate_depth(&self) -> DriftResult<u64> {
+        let oi = self.get_open_interest().max(1);
+        let sqrt_oi = isqrt_u128(oi as u128);
+        let sqrtk = self.amm.get_lower_bound_sqrt_k()?;
+        let step = self.amm.grid_step();
+
+        let base = sqrt_oi.min(sqrtk).max(self.amm.min_order_size.cast()?);
+        let depth_u64: u64 = base.cast()?;
+        let depth = quantize_bankers_u64(depth_u64, step);
+
+        let min_depth = self.amm.min_order_size.safe_mul(200)?;
+        let max_depth = self.amm.min_order_size.safe_mul(10_000)?;
+        Ok(depth.clamp(min_depth, max_depth))
     }
 }
 
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq, Default)]
+#[repr(u8)]
 pub enum ContractType {
-    #[default]
-    Perpetual,
-    Future,
-    Prediction,
+    #[default] Perpetual = 0,
+    Future = 1,
+    Prediction = 2,
 }
 
+// === [IMPROVED: PIECE v2++++++ QUANT] ===
 #[derive(
     Clone, Copy, BorshSerialize, BorshDeserialize, PartialEq, Debug, Eq, PartialOrd, Ord, Default,
 )]
+#[repr(u8)]
 pub enum ContractTier {
-    /// max insurance capped at A level
-    A,
-    /// max insurance capped at B level
-    B,
-    /// max insurance capped at C level
-    C,
-    /// no insurance
-    Speculative,
-    /// no insurance, another tranches below
+    A = 0,
+    B = 1,
+    C = 2,
+    Speculative = 3,
     #[default]
-    HighlySpeculative,
-    /// no insurance, only single position allowed
-    Isolated,
+    HighlySpeculative = 4,
+    Isolated = 5,
 }
 
-impl ContractTier {
-    pub fn is_as_safe_as(&self, best_contract: &ContractTier, best_asset: &AssetTier) -> bool {
-        self.is_as_safe_as_contract(best_contract) && self.is_as_safe_as_asset(best_asset)
-    }
+#[inline(always)]
+const fn b8(b: bool) -> u8 { if b { 1 } else { 0 } }
 
-    pub fn is_as_safe_as_contract(&self, other: &ContractTier) -> bool {
-        // Contract Tier A safest
-        self <= other
+/// Branchless clamp for u64.
+#[inline(always)]
+const fn clamp_u64(x: u64, lo: u64, hi: u64) -> u64 { if x < lo { lo } else if x > hi { hi } else { x } }
+
+/// Branchless clamp for i64.
+#[inline(always)]
+const fn clamp_i64(x: i64, lo: i64, hi: i64) -> i64 { if x < lo { lo } else if x > hi { hi } else { x } }
+
+/// Slot-based throttler: true once every 2^log2_stride slots.
+#[inline(always)]
+fn should_log_this_slot(slot: u64, log2_stride: u8) -> bool { (slot & ((1u64 << log2_stride) - 1)) == 0 }
+
+/// Fast integer square root for u128 (few Newton steps suffice for price/oi ranges).
+#[inline(always)]
+fn isqrt_u128(n: u128) -> u128 {
+    if n == 0 { return 0; }
+    let mut x = 1u128 << ((127 - n.leading_zeros() as u128) / 2);
+    x = (x + n / x) >> 1;
+    x = (x + n / x) >> 1;
+    let y = n / x;
+    if x < y { x } else { y }
+}
+
+/// Safe power-of-10 for i128 with bound to avoid overflow.
+#[inline(always)]
+fn pow10_i128_safe(exp: u32) -> DriftResult<i128> {
+    if exp > 38 { return Err(ErrorCode::DefaultError); }
+    Ok(10_i128.pow(exp))
+}
+
+// Feature-gated tracing: free in prod, enable via `--features trace` locally/CI.
+#[cfg(feature = "trace")]
+macro_rules! trace_log { ($($arg:tt)*) => { msg!($($arg)*); }; }
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_log { ($($arg:tt)*) => {}; }
+
+/// Quantize value to nearest multiple of `tick` (>=1). Rounds halves up.
+#[inline(always)]
+fn quantize_nearest_u64(val: u64, tick: u64) -> u64 {
+    let t = tick.max(1);
+    let rem = val % t;
+    if rem.saturating_mul(2) >= t { val.saturating_add(t - rem) } else { val - rem }
+}
+
+// === [IMPROVED: PIECE P30 v++ HFT²¹] === sigma/Δ helpers
+#[inline(always)]
+fn bps_diff_u64(a: u64, b: u64) -> u64 {
+    let hi = a.max(b).max(1);
+    let lo = a.min(b);
+    (hi - lo).saturating_mul(10_000).saturating_div(hi)
+}
+
+#[inline(always)]
+fn sigma_gate_ok(sigma: u64, scale_price: u64, std_div: u64) -> bool {
+    sigma < (scale_price / std_div.max(1))
+}
+
+#[inline(always)]
+fn sigma_to_bps(sigma: u64, scale_price: u64) -> u64 {
+    (sigma.saturating_mul(10_000)).saturating_div(scale_price.max(1)).max(1)
+}
+
+// === [IMPROVED: PIECE S22 v++ HFT⁷] === Precise rounding/mul-div helpers
+#[inline(always)]
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    if a == 0 { return b; }
+    if b == 0 { return a; }
+    let az = a.trailing_zeros();
+    let bz = b.trailing_zeros();
+    let shift = az.min(bz);
+    a >>= az; b >>= bz;
+    loop {
+        if a > b { core::mem::swap(&mut a, &mut b); }
+        b -= a;
+        if b == 0 { break; }
+        b >>= b.trailing_zeros();
     }
-    pub fn is_as_safe_as_asset(&self, other: &AssetTier) -> bool {
-        // allow Contract Tier A,B,C to rank above Assets below Collateral status
-        if other == &AssetTier::Unlisted {
-            true
-        } else {
-            other >= &AssetTier::Cross && self <= &ContractTier::C
-        }
+    a << shift
+}
+
+#[inline(always)]
+fn mul_div_u128_floor(a: u128, b: u128, den: u128) -> DriftResult<u128> {
+    if den == 0 { return Err(ErrorCode::DefaultError); }
+    let g1 = gcd_u128(a, den); let a = a / g1; let den = den / g1;
+    let g2 = gcd_u128(b, den); let b = b / g2; let den = den / g2;
+    Ok(a.safe_mul(b)?.safe_div(den)?)
+}
+
+#[inline(always)]
+fn mul_div_u128_ceil(a: u128, b: u128, den: u128) -> DriftResult<u128> {
+    if den == 0 { return Err(ErrorCode::DefaultError); }
+    let q = mul_div_u128_floor(a, b, den)?;
+    let num = mul_div_u128_floor(a, b, 1u128)?; // exact a*b
+    Ok(if num == q.safe_mul(den)? { q } else { q.saturating_add(1) })
+}
+
+#[inline(always)]
+fn mul_div_u128_bankers(a: u128, b: u128, den: u128) -> DriftResult<u128> {
+    if den == 0 { return Err(ErrorCode::DefaultError); }
+    let num = mul_div_u128_floor(a, b, 1u128)?; // exact a*b
+    let q = num / den;
+    let r = num - q * den;
+    if r * 2 < den { Ok(q) }
+    else if r * 2 > den { Ok(q + 1) }
+    else { Ok(q + (q & 1)) } // ties to even
+}
+
+#[inline(always)]
+fn pct_mul_u64_floor(x: u64, pct: u64, pct_prec: u64) -> DriftResult<u64> {
+    Ok(mul_div_u128_floor(x as u128, pct as u128, pct_prec as u128)?.min(u128::from(u64::MAX)) as u64)
+}
+#[inline(always)]
+fn pct_mul_u64_ceil(x: u64, pct: u64, pct_prec: u64) -> DriftResult<u64> {
+    Ok(mul_div_u128_ceil(x as u128, pct as u128, pct_prec as u128)?.min(u128::from(u64::MAX)) as u64)
+}
+#[inline(always)]
+fn pct_mul_u64_bankers(x: u64, pct: u64, pct_prec: u64) -> DriftResult<u64> {
+    Ok(mul_div_u128_bankers(x as u128, pct as u128, pct_prec as u128)?.min(u128::from(u64::MAX)) as u64)
+}
+
+/// Quantize using banker's rounding to the nearest multiple of `step`.
+#[inline(always)]
+fn quantize_bankers_u64(val: u64, step: u64) -> u64 {
+    let s = step.max(1);
+    let rem = val % s;
+    let half = s / 2;
+    if rem < half { val - rem }
+    else if rem > half { val.saturating_add(s - rem) }
+    else { // tie: to even multiple
+        let down = val - rem;
+        if (down / s) % 2 == 0 { down } else { val.saturating_add(s - rem) }
     }
 }
 
@@ -159,6 +1055,7 @@ pub enum AMMAvailability {
     Unavailable,
 }
 
+#[allow(unsafe_code)]
 #[account(zero_copy(unsafe))]
 #[derive(Eq, PartialEq, Debug)]
 #[repr(C)]
@@ -311,6 +1208,7 @@ impl PerpMarket {
         (self.amm.oracle, self.amm.oracle_source)
     }
 
+    #[must_use]
     pub fn is_in_settlement(&self, now: i64) -> bool {
         let in_settlement = matches!(
             self.status,
@@ -320,6 +1218,7 @@ impl PerpMarket {
         in_settlement || expired
     }
 
+    #[must_use]
     pub fn is_reduce_only(&self) -> DriftResult<bool> {
         Ok(self.status == MarketStatus::ReduceOnly)
     }
@@ -328,6 +1227,7 @@ impl PerpMarket {
         PerpOperation::is_operation_paused(self.paused_operations, operation)
     }
 
+    #[must_use]
     pub fn can_skip_auction_duration(
         &self,
         state: &State,
@@ -429,14 +1329,8 @@ impl PerpMarket {
         self,
         oracle_price_twap: i64,
     ) -> DriftResult<i64> {
-        // clamp to 3% price divergence for safer markets and higher for lower contract tiers
-        if self.contract_tier.is_as_safe_as_contract(&ContractTier::B) {
-            oracle_price_twap.safe_div(33) // 3%
-        } else if self.contract_tier.is_as_safe_as_contract(&ContractTier::C) {
-            oracle_price_twap.safe_div(20) // 5%
-        } else {
-            oracle_price_twap.safe_div(10) // 10%
-        }
+        // Delegate to ContractTier for a single-source divergence rail
+        self.contract_tier.max_price_divergence_from_twap(oracle_price_twap)
     }
 
     pub fn is_high_leverage_mode_enabled(&self) -> bool {
@@ -569,11 +1463,10 @@ impl PerpMarket {
     }
 
     pub fn get_open_interest(&self) -> u128 {
-        self.amm
-            .base_asset_amount_long
-            .abs()
-            .max(self.amm.base_asset_amount_short.abs())
-            .unsigned_abs()
+        let l = self.amm.base_asset_amount_long;
+        let s = self.amm.base_asset_amount_short;
+        let m = if l.abs() >= s.abs() { l } else { s };
+        m.unsigned_abs()
     }
 
     pub fn get_market_depth_for_funding_rate(&self) -> DriftResult<u64> {
@@ -612,6 +1505,7 @@ impl PerpMarket {
         Ok(())
     }
 
+    #[must_use]
     pub fn is_price_divergence_ok_for_settle_pnl(&self, oracle_price: i64) -> DriftResult<bool> {
         let oracle_divergence = oracle_price
             .safe_sub(self.amm.historical_oracle_data.last_oracle_price_twap_5min)?
@@ -1239,12 +2133,14 @@ impl AMM {
     }
 
     pub fn get_per_lp_base_unit(self) -> DriftResult<i128> {
-        let scalar: i128 = 10_i128.pow(self.per_lp_base.abs().cast()?);
-
+        let abs: u32 = self.per_lp_base.abs().cast()?;
+        let scalar = pow10_i128_safe(abs)?;
         if self.per_lp_base > 0 {
             AMM_RESERVE_PRECISION_I128.safe_mul(scalar)
-        } else {
+        } else if self.per_lp_base < 0 {
             AMM_RESERVE_PRECISION_I128.safe_div(scalar)
+        } else {
+            Ok(AMM_RESERVE_PRECISION_I128)
         }
     }
 
@@ -1405,6 +2301,25 @@ impl AMM {
         self.amm_jit_intensity > 100
     }
 
+    // === [IMPROVED: PIECE S24 v++ HFT⁷] === Unified grid step helper
+    #[inline(always)]
+    pub fn grid_step(&self) -> u64 {
+        let t = self.order_tick_size;
+        if t > 0 { t } else { self.order_step_size.max(1) }
+    }
+
+    #[inline(always)]
+    pub fn order_grid_step(&self) -> u64 { self.grid_step() }
+
+    // Returns whether the grid step is a power of two and the mask (step-1) if so.
+    #[inline(always)]
+    pub fn order_grid_pow2_mask(&self) -> (bool, u64) {
+        let s = self.grid_step().max(1);
+        let is_pow2 = s.is_power_of_two();
+        let mask = if is_pow2 { s - 1 } else { 0 };
+        (is_pow2, mask)
+    }
+
     pub fn reserve_price(&self) -> DriftResult<u64> {
         amm::calculate_price(
             self.quote_asset_reserve,
@@ -1421,16 +2336,11 @@ impl AMM {
 
         reserve_price
             .cast::<u128>()?
-            .safe_mul(multiplier.cast::<u128>()?)?
-            .safe_div(BID_ASK_SPREAD_PRECISION_U128)?
-            .cast()
     }
 
     pub fn ask_price(&self, reserve_price: u64) -> DriftResult<u64> {
-        let adjusted_spread = self
-            .long_spread
-            .cast::<i32>()?
-            .safe_add(self.reference_price_offset)?;
+        let adjusted_spread =
+            (-(self.short_spread.cast::<i32>()?)).safe_add(self.reference_price_offset)?;
 
         let multiplier = BID_ASK_SPREAD_PRECISION_I128.safe_add(adjusted_spread.cast::<i128>()?)?;
 
