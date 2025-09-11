@@ -1,28 +1,86 @@
 #![deny(unsafe_code)]
 #![deny(warnings)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::instruction::Instruction;
+use std::{
+    collections::{VecDeque, HashSet},
+    hash::BuildHasherDefault,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use smallvec::SmallVec;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use rustc_hash::FxHasher;
+
+use solana_sdk::{
+    pubkey,
+    pubkey::Pubkey,
+    instruction::Instruction,
+};
+
+use tokio::task::yield_now;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
-// Real Solana DEX Program IDs
-pub const JUPITER_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
-pub const RAYDIUM_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-pub const ORCA_PROGRAM_ID: &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
+// ----- Optional low-latency allocator (enable with `--features mimalloc`) -----
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc;
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
-// Common stablecoin mints
-pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-pub const BUSD_MINT: &str = "AJ1W9A9N9dEMdVyoDiam2rV44gnBm2csrPDP7xqcapgX";
+// ======= Hasher/type aliases =======
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
+type FxHashSet<T>    = HashSet<T, FxBuildHasher>;
+
+// ======= Tunables (measured + bounded) =======
+const MAX_RECENT_SWAPS: usize = 512;        // ring cap to prevent bloat
+const MIRROR_WINDOW_SECS: u64 = 5;          // timing mirror window
+const COORD_WINDOW_SECS: u64 = 60;          // coordination timing window
+const HISTORY_WINDOW_SECS: u64 = 24 * 3600; // 24h rolling
+const COORD_WINDOW_SLOTS: u64 = 2;          // slot-based timing window for coordination
+const MAX_PATTERN_TS: usize = 256;          // hard cap per PatternKey
+const MAX_PEERS_PER_WALLET: usize = 128;    // hard cap per wallet
+const MAX_COORD_CACHE: usize = 8192;        // cache size cap for coord scores
+const COORD_CACHE_TTL_SECS: u64 = 2;        // TTL for coord cache reuse
+
+// ======= Zero-cost const Pubkeys (no runtime parsing) =======
+pub const JUPITER_PROGRAM_ID: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
+pub const RAYDIUM_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+pub const ORCA_PROGRAM_ID:    Pubkey = pubkey!("9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP");
+
+pub const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+pub const USDT_MINT: Pubkey = pubkey!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+pub const BUSD_MINT: Pubkey = pubkey!("AJ1W9A9N9dEMdVyoDiam2rV44gnBm2csrPDP7xqcapgX");
+
+// Hot-path stable set (O(1) contains)
+static STABLE_MINTS: Lazy<[Pubkey; 3]> = Lazy::new(|| [USDC_MINT, USDT_MINT, BUSD_MINT]);
+
+#[inline(always)]
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
+}
+
+#[inline(always)]
+fn read_u64_le(data: &[u8], start: usize) -> u64 {
+    let end = start.saturating_add(8);
+    data.get(start..end)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
+}
+
+// IMPROVED: branchless stable-mint check (no slice traversal)
+#[inline(always)]
+fn is_stable(pk: &Pubkey) -> bool {
+    *pk == USDC_MINT || *pk == USDT_MINT || *pk == BUSD_MINT
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapData {
-    pub timestamp: u64,
+    pub timestamp: u64, // wall-clock seconds; 0 if unknown
+    pub slot: u64,      // Solana slot; 0 if unknown
     pub dex: DexType,
     pub token_in: Pubkey,
     pub token_out: Pubkey,
@@ -32,11 +90,15 @@ pub struct SwapData {
     pub transaction_signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DexType {
-    Jupiter,
-    Raydium,
-    Orca,
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DexType { Jupiter = 0, Raydium = 1, Orca = 2 }
+
+// Typed pattern key (no heap allocs, fast hash)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PatternKey {
+    pub dex: DexType,
+    pub token_in: Pubkey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +110,88 @@ pub struct LiquidityAction {
     pub amount_b: u64,
 }
 
+// Running stats for O(1) exact updates
+#[derive(Debug, Clone)]
+struct ProfileStats {
+    swaps: usize,
+    sum_ln_amount: f64,
+    slippage_sum_bps: u64,
+    total_amount_in: u128,
+    stable_trade_vol: u128,
+    stable_inflow: u128,
+    stable_outflow: u128,
+    token_counts: FxHashMap<Pubkey, u32>,
+}
+
+impl Default for ProfileStats {
+    fn default() -> Self {
+        Self {
+            swaps: 0,
+            sum_ln_amount: 0.0,
+            slippage_sum_bps: 0,
+            total_amount_in: 0,
+            stable_trade_vol: 0,
+            stable_inflow: 0,
+            stable_outflow: 0,
+            token_counts: FxHashMap::default(),
+        }
+    }
+}
+
+impl ProfileStats {
+    #[inline(always)]
+    fn apply(&mut self, s: &SwapData) {
+        self.swaps = self.swaps.saturating_add(1);
+        if s.amount_in > 0 {
+            self.sum_ln_amount += (s.amount_in as f64).ln();
+            self.total_amount_in = self.total_amount_in.saturating_add(s.amount_in as u128);
+        }
+        self.slippage_sum_bps = self.slippage_sum_bps.saturating_add(s.slippage_bps as u64);
+
+        let is_stable_trade = STABLE_MINTS.contains(&s.token_in) || STABLE_MINTS.contains(&s.token_out);
+        if is_stable_trade {
+            self.stable_trade_vol = self.stable_trade_vol.saturating_add(s.amount_in as u128);
+        }
+        if STABLE_MINTS.contains(&s.token_in) {
+            self.stable_outflow = self.stable_outflow.saturating_add(s.amount_in as u128);
+        }
+        if STABLE_MINTS.contains(&s.token_out) {
+            self.stable_inflow = self.stable_inflow.saturating_add(s.amount_out as u128);
+        }
+
+        *self.token_counts.entry(s.token_in).or_insert(0) += 1;
+        *self.token_counts.entry(s.token_out).or_insert(0) += 1;
+    }
+
+    #[inline(always)]
+    fn revert(&mut self, s: &SwapData) {
+        if self.swaps > 0 { self.swaps -= 1; }
+        if s.amount_in > 0 {
+            self.sum_ln_amount -= (s.amount_in as f64).ln();
+            self.total_amount_in = self.total_amount_in.saturating_sub(s.amount_in as u128);
+        }
+        self.slippage_sum_bps = self.slippage_sum_bps.saturating_sub(s.slippage_bps as u64);
+
+        let is_stable_trade = STABLE_MINTS.contains(&s.token_in) || STABLE_MINTS.contains(&s.token_out);
+        if is_stable_trade {
+            self.stable_trade_vol = self.stable_trade_vol.saturating_sub(s.amount_in as u128);
+        }
+        if STABLE_MINTS.contains(&s.token_in) {
+            self.stable_outflow = self.stable_outflow.saturating_sub(s.amount_in as u128);
+        }
+        if STABLE_MINTS.contains(&s.token_out) {
+            self.stable_inflow = self.stable_inflow.saturating_sub(s.amount_out as u128);
+        }
+
+        if let Some(c) = self.token_counts.get_mut(&s.token_in) {
+            *c -= 1; if *c == 0 { self.token_counts.remove(&s.token_in); }
+        }
+        if let Some(c) = self.token_counts.get_mut(&s.token_out) {
+            *c -= 1; if *c == 0 { self.token_counts.remove(&s.token_out); }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LiquidityActionType {
     AddLiquidity,
@@ -57,11 +201,12 @@ pub enum LiquidityActionType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletProfile {
     pub wallet: Pubkey,
-    pub recent_swaps: Vec<SwapData>,
-    pub liquidity_actions: Vec<LiquidityAction>,
+    pub recent_swaps: VecDeque<SwapData>,                 // bounded ring
+    pub liquidity_actions: SmallVec<[LiquidityAction; 8]>, // tiny allocs
     pub first_seen: u64,
     pub last_activity: u64,
     pub total_volume: u64,
+    // live metrics
     pub aggression_index: f64,
     pub token_rotation_entropy: f64,
     pub risk_preference: f64,
@@ -71,19 +216,20 @@ pub struct WalletProfile {
     pub stablecoin_inflow_ratio: f64,
     pub avg_slippage_tolerance: f64,
     pub swap_frequency_score: f64,
+    // O(1) running stats (exact)
+    stats: ProfileStats,
+    // EMA for mirror intent
+    mirror_ema: f64,
 }
 
 impl WalletProfile {
+    #[inline(always)]
     pub fn new(wallet: Pubkey) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs();
-        
+        let now = now_unix();
         Self {
             wallet,
-            recent_swaps: Vec::new(),
-            liquidity_actions: Vec::new(),
+            recent_swaps: VecDeque::with_capacity(128),
+            liquidity_actions: SmallVec::new(),
             first_seen: now,
             last_activity: now,
             total_volume: 0,
@@ -96,568 +242,542 @@ impl WalletProfile {
             stablecoin_inflow_ratio: 0.0,
             avg_slippage_tolerance: 0.0,
             swap_frequency_score: 0.0,
+            stats: ProfileStats::default(),
+            mirror_ema: 0.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn maintain_bounds(&mut self, now: u64) {
+        let cutoff = now.saturating_sub(HISTORY_WINDOW_SECS);
+        while let Some(front) = self.recent_swaps.front() {
+            if front.timestamp <= cutoff { self.recent_swaps.pop_front(); } else { break; }
+        }
+        while self.recent_swaps.len() > MAX_RECENT_SWAPS {
+            self.recent_swaps.pop_front();
         }
     }
 }
 
 pub struct WhaleWalletBehavioralFingerprinter {
-    profiles: Arc<RwLock<HashMap<Pubkey, WalletProfile>>>,
-    mempool_patterns: Arc<RwLock<HashMap<String, Vec<u64>>>>,
-    coordination_graph: Arc<RwLock<HashMap<Pubkey, Vec<Pubkey>>>>,
+    profiles: DashMap<Pubkey, WalletProfile, FxBuildHasher>,
+    mempool_patterns: DashMap<PatternKey, SmallVec<[u64; 64]>, FxBuildHasher>,
+    coordination_graph: DashMap<Pubkey, SmallVec<[Pubkey; 8]>, FxBuildHasher>,
+    coord_score_cache: DashMap<(Pubkey, u64), (f64, u64), FxBuildHasher>,
 }
 
 impl WhaleWalletBehavioralFingerprinter {
     pub fn new() -> Self {
         Self {
-            profiles: Arc::new(RwLock::new(HashMap::new())),
-            mempool_patterns: Arc::new(RwLock::new(HashMap::new())),
-            coordination_graph: Arc::new(RwLock::new(HashMap::new())),
+            profiles: DashMap::with_hasher(FxBuildHasher::default()),
+            mempool_patterns: DashMap::with_hasher(FxBuildHasher::default()),
+            coordination_graph: DashMap::with_hasher(FxBuildHasher::default()),
+            coord_score_cache: DashMap::with_hasher(FxBuildHasher::default()),
         }
     }
 
-    pub async fn process_transaction(&self, wallet: Pubkey, instruction: &Instruction) -> Result<()> {
-        if let Some(swap_data) = self.parse_swap_instruction(instruction).await? {
-            self.update_wallet_profile(wallet, swap_data).await?;
+    /// Legacy entry (uses wall clock + slot=0). Prefer `process_transaction_at`.
+    #[inline(always)]
+    pub async fn process_transaction(&self, wallet: Pubkey, ix: &Instruction) -> Result<()> {
+        self.process_transaction_at(wallet, ix, now_unix(), 0).await
+    }
+
+    /// Hot-path entry: caller provides timestamp & slot (no syscalls).
+    #[inline(always)]
+    pub async fn process_transaction_at(&self, wallet: Pubkey, ix: &Instruction, ts: u64, slot: u64) -> Result<()> {
+        if let Some(mut swap) = self.parse_swap_instruction(ix).await? {
+            swap.timestamp = ts;
+            swap.slot = slot;
+            self.update_wallet_profile(wallet, swap).await?;
         }
         Ok(())
     }
 
-    async fn parse_swap_instruction(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
-        let program_id = instruction.program_id.to_string();
-        
-        match program_id.as_str() {
-            JUPITER_PROGRAM_ID => self.parse_jupiter_swap(instruction).await,
-            RAYDIUM_PROGRAM_ID => self.parse_raydium_swap(instruction).await,
-            ORCA_PROGRAM_ID => self.parse_orca_swap(instruction).await,
-            _ => Ok(None),
-        }
+    #[inline(always)]
+    async fn parse_swap_instruction(&self, ix: &Instruction) -> Result<Option<SwapData>> {
+        let pid = ix.program_id;
+        if pid == JUPITER_PROGRAM_ID { return self.parse_jupiter_swap(ix).await; }
+        if pid == RAYDIUM_PROGRAM_ID { return self.parse_raydium_swap(ix).await; }
+        if pid == ORCA_PROGRAM_ID    { return self.parse_orca_swap(ix).await; }
+        Ok(None)
     }
 
-    async fn parse_jupiter_swap(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
-        if instruction.data.len() < 24 {
-            return Ok(None);
-        }
+    #[inline(always)]
+    async fn parse_jupiter_swap(&self, ix: &Instruction) -> Result<Option<SwapData>> {
+        // format (common): [disc:8][amount_in:8][min_out:8]...
+        if ix.data.len() < 24 || ix.accounts.len() < 3 { return Ok(None); }
+        let amount_in = read_u64_le(&ix.data, 8);
+        let min_out   = read_u64_le(&ix.data, 16);
 
-        // Jupiter instruction format: [discriminator:8][amount_in:8][min_amount_out:8][...]
-        let amount_in = u64::from_le_bytes(
-            instruction.data[8..16].try_into().unwrap_or([0; 8])
-        );
-        let min_amount_out = u64::from_le_bytes(
-            instruction.data[16..24].try_into().unwrap_or([0; 8])
-        );
+        let token_in  = ix.accounts.get(1).map(|a| a.pubkey).unwrap_or(Pubkey::default());
+        let token_out = ix.accounts.get(2).map(|a| a.pubkey).unwrap_or(Pubkey::default());
 
-        if instruction.accounts.len() < 4 {
-            return Ok(None);
-        }
-
-        let token_in = instruction.accounts.get(1).map(|acc| acc.pubkey).unwrap_or_default();
-        let token_out = instruction.accounts.get(2).map(|acc| acc.pubkey).unwrap_or_default();
-
-        let slippage_bps = if amount_in > 0 {
-            let expected_out = (amount_in * 995) / 1000; // Assume 0.5% expected slippage
-            if expected_out > min_amount_out {
-                (((expected_out - min_amount_out) * 10000) / expected_out) as u16
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let expected_out = amount_in.saturating_mul(995) / 1000; // ~0.5%
+        let slip = if expected_out > 0 && expected_out > min_out {
+            (((expected_out - min_out) * 10_000) / expected_out) as u16
+        } else { 0 };
 
         Ok(Some(SwapData {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0))
-                .as_secs(),
+            timestamp: 0, slot: 0,
             dex: DexType::Jupiter,
-            token_in,
-            token_out,
-            amount_in,
-            amount_out: min_amount_out,
-            slippage_bps,
-            transaction_signature: "".to_string(),
+            token_in, token_out,
+            amount_in, amount_out: min_out,
+            slippage_bps: slip,
+            transaction_signature: String::new(),
         }))
     }
 
-    async fn parse_raydium_swap(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
-        if instruction.data.len() < 17 {
-            return Ok(None);
-        }
+    #[inline(always)]
+    async fn parse_raydium_swap(&self, ix: &Instruction) -> Result<Option<SwapData>> {
+        if ix.data.len() < 17 || ix.accounts.len() < 10 { return Ok(None); }
+        // [disc:1][amount_in:8][min_out:8]
+        let amount_in = read_u64_le(&ix.data, 1);
+        let min_out   = read_u64_le(&ix.data, 9);
 
-        // Raydium instruction format: [discriminator:1][amount_in:8][min_amount_out:8][...]
-        let amount_in = u64::from_le_bytes(
-            instruction.data[1..9].try_into().unwrap_or([0; 8])
-        );
-        let min_amount_out = u64::from_le_bytes(
-            instruction.data[9..17].try_into().unwrap_or([0; 8])
-        );
+        // heuristic positions seen commonly
+        let token_in  = ix.accounts.get(8).map(|a| a.pubkey).unwrap_or(Pubkey::default());
+        let token_out = ix.accounts.get(9).map(|a| a.pubkey).unwrap_or(Pubkey::default());
 
-        if instruction.accounts.len() < 16 {
-            return Ok(None);
-        }
-
-        let token_in = instruction.accounts.get(8).map(|acc| acc.pubkey).unwrap_or_default();
-        let token_out = instruction.accounts.get(9).map(|acc| acc.pubkey).unwrap_or_default();
-
-        let slippage_bps = if amount_in > 0 {
-            let expected_out = (amount_in * 997) / 1000; // Assume 0.3% expected slippage
-            if expected_out > min_amount_out {
-                (((expected_out - min_amount_out) * 10000) / expected_out) as u16
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let expected_out = amount_in.saturating_mul(997) / 1000; // ~0.3%
+        let slip = if expected_out > 0 && expected_out > min_out {
+            (((expected_out - min_out) * 10_000) / expected_out) as u16
+        } else { 0 };
 
         Ok(Some(SwapData {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0))
-                .as_secs(),
+            timestamp: 0, slot: 0,
             dex: DexType::Raydium,
-            token_in,
-            token_out,
-            amount_in,
-            amount_out: min_amount_out,
-            slippage_bps,
-            transaction_signature: "".to_string(),
+            token_in, token_out,
+            amount_in, amount_out: min_out,
+            slippage_bps: slip,
+            transaction_signature: String::new(),
         }))
     }
 
-    async fn parse_orca_swap(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
-        if instruction.data.len() < 16 {
-            return Ok(None);
-        }
+    #[inline(always)]
+    async fn parse_orca_swap(&self, ix: &Instruction) -> Result<Option<SwapData>> {
+        if ix.data.len() < 16 || ix.accounts.len() < 4 { return Ok(None); }
+        // [amount:8][other_amount_threshold:8]
+        let amount_in = read_u64_le(&ix.data, 0);
+        let min_out   = read_u64_le(&ix.data, 8);
 
-        // Orca instruction format: [amount:8][other_amount_threshold:8][...]
-        let amount_in = u64::from_le_bytes(
-            instruction.data[0..8].try_into().unwrap_or([0; 8])
-        );
-        let min_amount_out = u64::from_le_bytes(
-            instruction.data[8..16].try_into().unwrap_or([0; 8])
-        );
+        let token_in  = ix.accounts.get(2).map(|a| a.pubkey).unwrap_or(Pubkey::default());
+        let token_out = ix.accounts.get(3).map(|a| a.pubkey).unwrap_or(Pubkey::default());
 
-        if instruction.accounts.len() < 10 {
-            return Ok(None);
-        }
-
-        let token_in = instruction.accounts.get(2).map(|acc| acc.pubkey).unwrap_or_default();
-        let token_out = instruction.accounts.get(3).map(|acc| acc.pubkey).unwrap_or_default();
-
-        let slippage_bps = if amount_in > 0 {
-            let expected_out = (amount_in * 999) / 1000; // Assume 0.1% expected slippage
-            if expected_out > min_amount_out {
-                (((expected_out - min_amount_out) * 10000) / expected_out) as u16
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let expected_out = amount_in.saturating_mul(999) / 1000; // ~0.1%
+        let slip = if expected_out > 0 && expected_out > min_out {
+            (((expected_out - min_out) * 10_000) / expected_out) as u16
+        } else { 0 };
 
         Ok(Some(SwapData {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0))
-                .as_secs(),
+            timestamp: 0, slot: 0,
             dex: DexType::Orca,
-            token_in,
-            token_out,
-            amount_in,
-            amount_out: min_amount_out,
-            slippage_bps,
-            transaction_signature: "".to_string(),
+            token_in, token_out,
+            amount_in, amount_out: min_out,
+            slippage_bps: slip,
+            transaction_signature: String::new(),
         }))
     }
 
-    async fn update_wallet_profile(&self, wallet: Pubkey, swap_data: SwapData) -> Result<()> {
-        let mut profiles = self.profiles.write().await;
-        let profile = profiles.entry(wallet).or_insert_with(|| WalletProfile::new(wallet));
-        
-        profile.recent_swaps.push(swap_data.clone());
-        profile.last_activity = swap_data.timestamp;
-        profile.total_volume += swap_data.amount_in;
-        
-        // Keep only recent swaps (last 24 hours)
-        let cutoff_time = swap_data.timestamp.saturating_sub(86400);
-        profile.recent_swaps.retain(|swap| swap.timestamp > cutoff_time);
-        
-        // Recalculate behavioral metrics
-        profile.aggression_index = self.calculate_aggression_index(&profile.recent_swaps);
-        profile.token_rotation_entropy = self.calculate_token_rotation_entropy(&profile.recent_swaps);
-        profile.risk_preference = self.calculate_risk_preference(&profile.recent_swaps);
-        profile.liquidity_behavior_score = self.calculate_liquidity_behavior_score(&profile.liquidity_actions);
-        profile.mirror_intent_score = self.calculate_mirror_intent_score(&profile.recent_swaps).await;
-        profile.coordination_score = self.calculate_coordination_score(wallet).await;
-        profile.stablecoin_inflow_ratio = self.calculate_stablecoin_inflow_ratio(&profile.recent_swaps);
-        profile.avg_slippage_tolerance = self.calculate_avg_slippage_tolerance(&profile.recent_swaps);
-        profile.swap_frequency_score = self.calculate_swap_frequency_score(&profile.recent_swaps);
-        
+    #[inline(always)]
+    async fn update_wallet_profile(&self, wallet: Pubkey, swap: SwapData) -> Result<()> {
+        let now = if swap.timestamp > 0 { swap.timestamp } else { now_unix() };
+        // get-or-create (guard scope limited)
+        let mut entry = self.profiles.entry(wallet).or_insert_with(|| WalletProfile::new(wallet));
+        {
+            let prof = entry.value_mut();
+
+            // time window eviction
+            let cutoff = now.saturating_sub(HISTORY_WINDOW_SECS);
+            while let Some(front) = prof.recent_swaps.front() {
+                if front.timestamp > 0 && front.timestamp <= cutoff {
+                    let old = prof.recent_swaps.pop_front().expect("front existed");
+                    prof.stats.revert(&old);
+                } else { break; }
+            }
+            // cap eviction
+            while prof.recent_swaps.len() >= MAX_RECENT_SWAPS {
+                if let Some(old) = prof.recent_swaps.pop_front() { prof.stats.revert(&old); } else { break; }
+            }
+
+            // apply new swap
+            prof.recent_swaps.push_back(swap.clone());
+            prof.stats.apply(&swap);
+            prof.last_activity = now;
+            prof.total_volume = prof.total_volume.saturating_add(swap.amount_in);
+
+            // mirror EMA update (O(1))
+            let inst_corr = self.instant_mirror_corr(&swap);
+            let n = prof.stats.swaps.max(1) as f64;
+            let alpha = (0.20f64).max(1.0 / n.min(20.0));
+            prof.mirror_ema = prof.mirror_ema * (1.0 - alpha) + inst_corr * alpha;
+
+            // recompute metrics from O(1) stats
+            prof.aggression_index         = self.metric_aggression(&prof.stats, &prof.recent_swaps);
+            prof.token_rotation_entropy   = self.metric_entropy(&prof.stats);
+            prof.risk_preference          = self.metric_risk_pref(&prof.stats);
+            prof.liquidity_behavior_score = self.calculate_liquidity_behavior_score(&prof.liquidity_actions);
+            prof.mirror_intent_score      = prof.mirror_ema.clamp(0.0, 1.0);
+            prof.coordination_score       = self.calculate_coordination_score_cached(wallet, swap.slot, now);
+            prof.stablecoin_inflow_ratio  = self.metric_stable_inflow_ratio(&prof.stats);
+            prof.avg_slippage_tolerance   = self.metric_avg_slippage(&prof.stats);
+            prof.swap_frequency_score     = self.metric_swap_freq(&prof.recent_swaps);
+        }
+        drop(entry);
+        yield_now().await;
         Ok(())
     }
 
-    fn calculate_aggression_index(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.is_empty() {
-            return 0.0;
-        }
+    // ===== Metrics from running stats =====
+    #[inline(always)]
+    fn metric_aggression(&self, st: &ProfileStats, swaps: &VecDeque<SwapData>) -> f64 {
+        if st.swaps == 0 { return 0.0; }
+        let avg_ln_amt = st.sum_ln_amount / (st.swaps as f64);
+        let avg_slip   = (st.slippage_sum_bps as f64) / (st.swaps as f64) / 10_000.0;
+        let base = (avg_ln_amt / 20.0) + 2.0 * avg_slip;
 
-        let mut aggression_sum = 0.0;
-        let mut count = 0;
-
-        for swap in swaps {
-            let size_factor = (swap.amount_in as f64).ln() / 20.0; // Logarithmic scaling
-            let slippage_factor = (swap.slippage_bps as f64) / 10000.0;
-            let aggression = size_factor + slippage_factor * 2.0; // Weight slippage higher
-            aggression_sum += aggression;
-            count += 1;
-        }
-
-        let base_aggression = aggression_sum / count as f64;
-        
-        // Frequency multiplier
-        let time_span = if swaps.len() > 1 {
-            swaps.last().unwrap().timestamp - swaps.first().unwrap().timestamp
-        } else {
-            1
+        let (first, last) = match (swaps.front(), swaps.back()) {
+            (Some(a), Some(b)) if a.timestamp > 0 && b.timestamp >= a.timestamp => (a.timestamp, b.timestamp),
+            _ => (0, 0),
         };
-        
-        let frequency_multiplier = if time_span > 0 {
-            (swaps.len() as f64 * 3600.0) / time_span as f64 // swaps per hour
-        } else {
-            1.0
-        };
-
-        (base_aggression * frequency_multiplier).min(10.0) // Cap at 10.0
+        let span = last.saturating_sub(first);
+        let freq_mult = if span > 0 { (swaps.len() as f64 * 3600.0) / (span as f64) } else { 1.0 };
+        (base * freq_mult).min(10.0)
     }
 
-    fn calculate_token_rotation_entropy(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.is_empty() {
-            return 0.0;
+    #[inline(always)]
+    fn metric_entropy(&self, st: &ProfileStats) -> f64 {
+        let total: u64 = st.token_counts.values().map(|&c| c as u64).sum();
+        if total == 0 { return 0.0; }
+        let t = total as f64;
+        let mut h = 0.0;
+        for &c in st.token_counts.values() {
+            let p = (c as f64) / t;
+            if p > 0.0 { h -= p * p.ln(); }
         }
+        h
+    }
 
-        let mut token_counts: HashMap<Pubkey, usize> = HashMap::new();
-        let mut total_tokens = 0;
+    #[inline(always)]
+    fn metric_risk_pref(&self, st: &ProfileStats) -> f64 {
+        if st.total_amount_in == 0 { return 0.5; }
+        1.0 - (st.stable_trade_vol as f64 / st.total_amount_in as f64)
+    }
 
-        for swap in swaps {
-            *token_counts.entry(swap.token_in).or_insert(0) += 1;
-            *token_counts.entry(swap.token_out).or_insert(0) += 1;
-            total_tokens += 2;
+    #[inline(always)]
+    fn metric_stable_inflow_ratio(&self, st: &ProfileStats) -> f64 {
+        let denom = st.stable_inflow.saturating_add(st.stable_outflow);
+        if denom == 0 { 0.0 } else { (st.stable_inflow as f64) / (denom as f64) }
+    }
+
+    #[inline(always)]
+    fn metric_avg_slippage(&self, st: &ProfileStats) -> f64 {
+        if st.swaps == 0 { 0.0 } else { (st.slippage_sum_bps as f64) / (st.swaps as f64) }
+    }
+
+    #[inline(always)]
+    fn metric_swap_freq(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.len() < 2 { return 0.0; }
+        let first = match swaps.front() { Some(s) => s.timestamp, None => return 0.0 };
+        let last  = match swaps.back()  { Some(s) => s.timestamp, None => return 0.0 };
+        let span  = last.saturating_sub(first);
+        if span == 0 { 10.0 } else { ((swaps.len() as f64 * 3600.0) / (span as f64)).min(10.0) }
+    }
+
+    // ===== Mirror intent (EMA on instantaneous correlation) =====
+    #[inline(always)]
+    fn instant_mirror_corr(&self, s: &SwapData) -> f64 {
+        let key = PatternKey { dex: s.dex, token_in: s.token_in };
+        if let Some(ts) = self.mempool_patterns.get(&key) { self.timing_correlation_rev(s.timestamp, &ts) } else { 0.0 }
+    }
+
+    #[inline(always)]
+    fn calculate_aggression_index(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.is_empty() { return 0.0; }
+        // size term uses ln(amount) (scaled), slippage weighted heavier; freq multiplier per hour
+        let mut sum = 0.0;
+        for s in swaps.iter() {
+            let size = if s.amount_in > 0 { (s.amount_in as f64).ln() / 20.0 } else { 0.0 };
+            let slip = (s.slippage_bps as f64) / 10_000.0;
+            sum += size + 2.0 * slip;
         }
+        let base = sum / (swaps.len() as f64);
 
-        let mut entropy = 0.0;
-        for count in token_counts.values() {
-            let probability = *count as f64 / total_tokens as f64;
-            if probability > 0.0 {
-                entropy -= probability * probability.ln();
+        let first = swaps.front().map(|s| s.timestamp).unwrap_or(0);
+        let last  = swaps.back().map(|s| s.timestamp).unwrap_or(first);
+        let span  = last.saturating_sub(first);
+        let freq_mult = if span > 0 { (swaps.len() as f64 * 3600.0) / (span as f64) } else { 1.0 };
+
+        (base * freq_mult).min(10.0)
+    }
+
+    #[inline(always)]
+    fn calculate_token_rotation_entropy(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.is_empty() { return 0.0; }
+        let mut counts: FxHashMap<Pubkey, u32> = FxHashMap::default();
+        let mut total: u32 = 0;
+        for s in swaps.iter() {
+            *counts.entry(s.token_in).or_insert(0) += 1; total += 1;
+            *counts.entry(s.token_out).or_insert(0) += 1; total += 1;
+        }
+        let tot = total as f64;
+        let mut h = 0.0;
+        for &c in counts.values() {
+            let p = (c as f64) / tot;
+            if p > 0.0 { h -= p * p.ln(); }
+        }
+        h
+    }
+
+    #[inline(always)]
+    fn calculate_risk_preference(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.is_empty() { return 0.5; }
+        let mut stable_vol = 0u128;
+        let mut vol = 0u128;
+        for s in swaps.iter() {
+            vol += s.amount_in as u128;
+            if STABLE_MINTS.contains(&s.token_in) || STABLE_MINTS.contains(&s.token_out) {
+                stable_vol += s.amount_in as u128;
             }
         }
-
-        entropy
+        if vol == 0 { return 0.5; }
+        1.0 - (stable_vol as f64 / vol as f64)
     }
 
-    fn calculate_risk_preference(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.is_empty() {
-            return 0.5;
-        }
-
-        let stablecoin_mints = [
-            USDC_MINT.parse::<Pubkey>().unwrap_or_default(),
-            USDT_MINT.parse::<Pubkey>().unwrap_or_default(),
-            BUSD_MINT.parse::<Pubkey>().unwrap_or_default(),
-        ];
-
-        let mut stablecoin_volume = 0u64;
-        let mut total_volume = 0u64;
-
-        for swap in swaps {
-            total_volume += swap.amount_in;
-            if stablecoin_mints.contains(&swap.token_in) || stablecoin_mints.contains(&swap.token_out) {
-                stablecoin_volume += swap.amount_in;
+    #[inline(always)]
+    fn calculate_liquidity_behavior_score(&self, acts: &SmallVec<[LiquidityAction; 8]>) -> f64 {
+        if acts.is_empty() { return 0.0; }
+        let mut add = 0u32; let mut rem = 0u32;
+        for a in acts.iter() {
+            match a.action_type {
+                LiquidityActionType::AddLiquidity    => add += 1,
+                LiquidityActionType::RemoveLiquidity => rem += 1,
             }
         }
-
-        if total_volume == 0 {
-            return 0.5;
+        let mut timing_sum = 0.0; let mut timing_cnt = 0.0;
+        for w in acts.windows(2) {
+            let dt = w[1].timestamp.saturating_sub(w[0].timestamp);
+            let eff = if dt < 300 { 1.0 } else { 300.0 / (dt as f64) };
+            timing_sum += eff; timing_cnt += 1.0;
         }
-
-        let stablecoin_ratio = stablecoin_volume as f64 / total_volume as f64;
-        1.0 - stablecoin_ratio // Higher risk preference means less stablecoin usage
+        let timing_avg = if timing_cnt > 0.0 { timing_sum / timing_cnt } else { 0.0 };
+        let total = (add + rem) as f64;
+        let balance = if total > 0.0 { 1.0 - ((add as f64 - rem as f64).abs() / total) } else { 0.0 };
+        ((timing_avg + balance) * 0.5).clamp(0.0, 1.0)
     }
 
-    fn calculate_liquidity_behavior_score(&self, actions: &[LiquidityAction]) -> f64 {
-        if actions.is_empty() {
-            return 0.0;
-        }
-
-        let mut add_count = 0;
-        let mut remove_count = 0;
-        let mut timing_scores = Vec::new();
-
-        for action in actions {
-            match action.action_type {
-                LiquidityActionType::AddLiquidity => add_count += 1,
-                LiquidityActionType::RemoveLiquidity => remove_count += 1,
+    #[inline(always)]
+    async fn calculate_mirror_intent_score(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.is_empty() { return 0.0; }
+        let mut sum = 0.0; let mut n = 0.0;
+        for s in swaps.iter() {
+            let key = PatternKey { dex: s.dex, token_in: s.token_in };
+            if let Some(ts) = self.mempool_patterns.get(&key) {
+                sum += self.timing_correlation(s.timestamp, &ts);
+                n += 1.0;
             }
         }
-
-        // Calculate timing efficiency (how quickly they add/remove around events)
-        for window in actions.windows(2) {
-            let time_diff = window[1].timestamp - window[0].timestamp;
-            let efficiency = if time_diff < 300 { 1.0 } else { 1.0 / (time_diff as f64 / 300.0) };
-            timing_scores.push(efficiency);
-        }
-
-        let timing_avg = if timing_scores.is_empty() {
-            0.0
-        } else {
-            timing_scores.iter().sum::<f64>() / timing_scores.len() as f64
-        };
-
-        let balance_score = if add_count + remove_count == 0 {
-            0.0
-        } else {
-            1.0 - (add_count as f64 - remove_count as f64).abs() / (add_count + remove_count) as f64
-        };
-
-        (timing_avg + balance_score) / 2.0
+        if n == 0.0 { 0.0 } else { (sum / n).clamp(0.0, 1.0) }
     }
 
-    async fn calculate_mirror_intent_score(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.is_empty() {
-            return 0.0;
-        }
-
-        let patterns = self.mempool_patterns.read().await;
-        let mut correlation_sum = 0.0;
-        let mut count = 0;
-
-        for swap in swaps {
-            let pattern_key = format!("{:?}_{}", swap.dex, swap.token_in);
-            if let Some(timestamps) = patterns.get(&pattern_key) {
-                let correlation = self.calculate_timing_correlation(swap.timestamp, timestamps);
-                correlation_sum += correlation;
-                count += 1;
+    #[inline(always)]
+    fn timing_correlation_rev(&self, t: u64, pattern_ts: &SmallVec<[u64; 64]>) -> f64 {
+        // reverse-scan newest first, early exit once window exceeded
+        let mut best = 0.0;
+        for &p in pattern_ts.iter().rev() {
+            if p + MIRROR_WINDOW_SECS < t { break; }
+            let d = t.max(p) - t.min(p);
+            if d <= MIRROR_WINDOW_SECS {
+                let c = 1.0 - (d as f64 / MIRROR_WINDOW_SECS as f64);
+                if c > best { best = c; if best == 1.0 { break; } }
             }
         }
-
-        if count == 0 {
-            return 0.0;
-        }
-
-        correlation_sum / count as f64
+        best
     }
 
-    fn calculate_timing_correlation(&self, timestamp: u64, pattern_timestamps: &[u64]) -> f64 {
-        let mut max_correlation = 0.0;
-        
-        for &pattern_ts in pattern_timestamps {
-            let time_diff = (timestamp as i64 - pattern_ts as i64).abs();
-            let correlation = if time_diff <= 5 {
-                1.0 - (time_diff as f64 / 5.0)
-            } else {
-                0.0
-            };
-            max_correlation = max_correlation.max(correlation);
-        }
-
-        max_correlation
-    }
-
-    async fn calculate_coordination_score(&self, wallet: Pubkey) -> f64 {
-        let graph = self.coordination_graph.read().await;
-        let profiles = self.profiles.read().await;
-        
-        let connected_wallets = graph.get(&wallet).cloned().unwrap_or_default();
-        if connected_wallets.is_empty() {
-            return 0.0;
-        }
-
-        let wallet_profile = match profiles.get(&wallet) {
-            Some(profile) => profile,
-            None => return 0.0,
-        };
-
-        let mut correlation_sum = 0.0;
-        let mut count = 0;
-
-        for connected_wallet in connected_wallets {
-            if let Some(connected_profile) = profiles.get(&connected_wallet) {
-                let correlation = self.calculate_profile_correlation(wallet_profile, connected_profile);
-                correlation_sum += correlation;
-                count += 1;
+    #[inline(always)]
+    fn calculate_coordination_score_cached(&self, wallet: Pubkey, slot: u64, now: u64) -> f64 {
+        if slot > 0 {
+            if let Some(cached) = self.coord_score_cache.get(&(wallet, slot)) {
+                let (score, ts) = *cached;
+                if now.saturating_sub(ts) <= COORD_CACHE_TTL_SECS { return score; }
             }
         }
-
-        if count == 0 {
-            return 0.0;
+        let score = self.calculate_coordination_score(wallet);
+        if slot > 0 {
+            if self.coord_score_cache.len() > MAX_COORD_CACHE { self.coord_score_cache.clear(); }
+            self.coord_score_cache.insert((wallet, slot), (score, now));
         }
+        score
+    }
 
-        correlation_sum / count as f64
+    #[inline(always)]
+    fn calculate_coordination_score(&self, wallet: Pubkey) -> f64 {
+        let peers = self.coordination_graph.get(&wallet).map(|v| v.clone()).unwrap_or_default();
+        if peers.is_empty() { return 0.0; }
+
+        let me = match self.profiles.get(&wallet) { Some(p) => p, None => return 0.0 };
+        let me_swaps: &VecDeque<SwapData> = &me.recent_swaps;
+
+        let mut sum = 0.0; let mut cnt = 0.0;
+        for peer in peers.iter() {
+            if let Some(other) = self.profiles.get(peer) {
+                let tc = self.swap_timing_corr_twoptr(me_swaps, &other.recent_swaps, COORD_WINDOW_SECS);
+                let kc = self.token_preference_jaccard(me_swaps, &other.recent_swaps);
+                let bc = self.behavior_corr(&me, &other);
+                sum += (tc + kc + bc) / 3.0;
+                cnt += 1.0;
+            }
+        }
+        if cnt == 0.0 { 0.0 } else { (sum / cnt).clamp(0.0, 1.0) }
     }
 
     fn calculate_profile_correlation(&self, profile1: &WalletProfile, profile2: &WalletProfile) -> f64 {
-        let timing_correlation = self.calculate_swap_timing_correlation(&profile1.recent_swaps, &profile2.recent_swaps);
-        let token_correlation = self.calculate_token_preference_correlation(&profile1.recent_swaps, &profile2.recent_swaps);
-        let behavior_correlation = self.calculate_behavior_correlation(profile1, profile2);
-
+        let timing_correlation = self.swap_timing_corr_twoptr(&profile1.recent_swaps, &profile2.recent_swaps, COORD_WINDOW_SECS);
+        let token_correlation = self.token_preference_jaccard(&profile1.recent_swaps, &profile2.recent_swaps);
+        let behavior_correlation = self.behavior_corr(profile1, profile2);
         (timing_correlation + token_correlation + behavior_correlation) / 3.0
     }
 
-    fn calculate_swap_timing_correlation(&self, swaps1: &[SwapData], swaps2: &[SwapData]) -> f64 {
-        if swaps1.is_empty() || swaps2.is_empty() {
-            return 0.0;
-        }
-
-        let mut correlation_sum = 0.0;
-        let mut count = 0;
-
-        for swap1 in swaps1 {
-            for swap2 in swaps2 {
-                let time_diff = (swap1.timestamp as i64 - swap2.timestamp as i64).abs();
-                if time_diff <= 60 { // Within 1 minute
-                    let correlation = 1.0 - (time_diff as f64 / 60.0);
-                    correlation_sum += correlation;
-                    count += 1;
-                }
+    #[inline(always)]
+    fn swap_timing_corr_twoptr(&self, a: &VecDeque<SwapData>, b: &VecDeque<SwapData>, win: u64) -> f64 {
+        if a.is_empty() || b.is_empty() { return 0.0; }
+        // two-pointer sweep on sorted timestamps
+        let (mut i, mut j) = (0usize, 0usize);
+        let (mut acc, mut cnt) = (0.0, 0.0);
+        while i < a.len() && j < b.len() {
+            let ta = a[i].timestamp; let tb = b[j].timestamp;
+            let (min, max) = (ta.min(tb), ta.max(tb));
+            let d = max - min;
+            if d <= win {
+                acc += 1.0 - (d as f64 / win as f64);
+                cnt += 1.0;
+                // advance the earlier one to look for next match
+                if ta <= tb { i += 1; } else { j += 1; }
+            } else {
+                if ta < tb { i += 1; } else { j += 1; }
             }
         }
-
-        if count == 0 {
-            return 0.0;
-        }
-
-        correlation_sum / count as f64
+        if cnt == 0.0 { 0.0 } else { (acc / cnt).clamp(0.0, 1.0) }
     }
 
-    fn calculate_token_preference_correlation(&self, swaps1: &[SwapData], swaps2: &[SwapData]) -> f64 {
-        if swaps1.is_empty() || swaps2.is_empty() {
-            return 0.0;
-        }
-
-        let mut tokens1 = std::collections::HashSet::new();
-        let mut tokens2 = std::collections::HashSet::new();
-
-        for swap in swaps1 {
-            tokens1.insert(swap.token_in);
-            tokens1.insert(swap.token_out);
-        }
-
-        for swap in swaps2 {
-            tokens2.insert(swap.token_in);
-            tokens2.insert(swap.token_out);
-        }
-
-        let intersection = tokens1.intersection(&tokens2).count();
-        let union = tokens1.union(&tokens2).count();
-
-        if union == 0 {
-            return 0.0;
-        }
-
-        intersection as f64 / union as f64
+    #[inline(always)]
+    fn token_preference_jaccard(&self, a: &VecDeque<SwapData>, b: &VecDeque<SwapData>) -> f64 {
+        use std::collections::hash_set::HashSet;
+        if a.is_empty() || b.is_empty() { return 0.0; }
+        let mut sa: HashSet<Pubkey> = HashSet::with_capacity(a.len()*2);
+        let mut sb: HashSet<Pubkey> = HashSet::with_capacity(b.len()*2);
+        for s in a.iter() { sa.insert(s.token_in); sa.insert(s.token_out); }
+        for s in b.iter() { sb.insert(s.token_in); sb.insert(s.token_out); }
+        let inter = sa.intersection(&sb).count() as f64;
+        let uni   = sa.union(&sb).count() as f64;
+        if uni == 0.0 { 0.0 } else { inter / uni }
     }
 
-    fn calculate_behavior_correlation(&self, profile1: &WalletProfile, profile2: &WalletProfile) -> f64 {
-        let aggression_diff = (profile1.aggression_index - profile2.aggression_index).abs();
-        let risk_diff = (profile1.risk_preference - profile2.risk_preference).abs();
-        let entropy_diff = (profile1.token_rotation_entropy - profile2.token_rotation_entropy).abs();
+    #[inline(always)]
+    fn behavior_corr(&self, p1: &WalletProfile, p2: &WalletProfile) -> f64 {
+        let ad = (p1.aggression_index - p2.aggression_index).abs();
+        let rd = (p1.risk_preference   - p2.risk_preference).abs();
+        let ed = (p1.token_rotation_entropy - p2.token_rotation_entropy).abs();
 
-        let aggression_correlation = 1.0 - (aggression_diff / 10.0).min(1.0);
-        let risk_correlation = 1.0 - risk_diff;
-        let entropy_correlation = 1.0 - (entropy_diff / 5.0).min(1.0);
+        let ac = 1.0 - (ad / 10.0).min(1.0);
+        let rc = 1.0 - rd.clamp(0.0, 1.0);
+        let ec = 1.0 - (ed / 5.0).min(1.0);
 
-        (aggression_correlation + risk_correlation + entropy_correlation) / 3.0
+        ((ac + rc + ec) / 3.0).clamp(0.0, 1.0)
     }
 
-    fn calculate_stablecoin_inflow_ratio(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.is_empty() {
-            return 0.0;
+    #[inline(always)]
+    fn calculate_stablecoin_inflow_ratio(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.is_empty() { return 0.0; }
+        let mut inflow: u128 = 0;
+        let mut outflow: u128 = 0;
+        for s in swaps.iter() {
+            if STABLE_MINTS.contains(&s.token_in)  { outflow += s.amount_in as u128; }
+            if STABLE_MINTS.contains(&s.token_out) { inflow  += s.amount_out as u128; }
         }
-
-        let stablecoin_mints = [
-            USDC_MINT.parse::<Pubkey>().unwrap_or_default(),
-            USDT_MINT.parse::<Pubkey>().unwrap_or_default(),
-            BUSD_MINT.parse::<Pubkey>().unwrap_or_default(),
-        ];
-
-        let mut stablecoin_inflow = 0u64;
-        let mut stablecoin_outflow = 0u64;
-
-        for swap in swaps {
-            if stablecoin_mints.contains(&swap.token_in) {
-                stablecoin_outflow += swap.amount_in;
-            }
-            if stablecoin_mints.contains(&swap.token_out) {
-                stablecoin_inflow += swap.amount_out;
-            }
-        }
-
-        if stablecoin_inflow + stablecoin_outflow == 0 {
-            return 0.0;
-        }
-
-        stablecoin_inflow as f64 / (stablecoin_inflow + stablecoin_outflow) as f64
+        let denom = inflow + outflow;
+        if denom == 0 { 0.0 } else { (inflow as f64) / (denom as f64) }
     }
 
-    fn calculate_avg_slippage_tolerance(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.is_empty() {
-            return 0.0;
-        }
-
-        let total_slippage: u32 = swaps.iter().map(|swap| swap.slippage_bps as u32).sum();
-        total_slippage as f64 / swaps.len() as f64
+    #[inline(always)]
+    fn calculate_avg_slippage_tolerance(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.is_empty() { return 0.0; }
+        let sum: u64 = swaps.iter().map(|s| s.slippage_bps as u64).sum();
+        (sum as f64) / (swaps.len() as f64)
     }
 
-    fn calculate_swap_frequency_score(&self, swaps: &[SwapData]) -> f64 {
-        if swaps.len() < 2 {
-            return 0.0;
-        }
-
-        let time_span = swaps.last().unwrap().timestamp - swaps.first().unwrap().timestamp;
-        if time_span == 0 {
-            return 10.0; // Maximum frequency
-        }
-
-        let swaps_per_hour = (swaps.len() as f64 * 3600.0) / time_span as f64;
-        swaps_per_hour.min(10.0) // Cap at 10.0
+    #[inline(always)]
+    fn calculate_swap_frequency_score(&self, swaps: &VecDeque<SwapData>) -> f64 {
+        if swaps.len() < 2 { return 0.0; }
+        let first = swaps.front().unwrap().timestamp;
+        let last  = swaps.back().unwrap().timestamp;
+        let span  = last.saturating_sub(first);
+        if span == 0 { 10.0 } else { ((swaps.len() as f64 * 3600.0) / span as f64).min(10.0) }
     }
 
+    #[inline(always)]
     pub async fn get_wallet_profile(&self, wallet: &Pubkey) -> Option<WalletProfile> {
-        let profiles = self.profiles.read().await;
-        profiles.get(wallet).cloned()
+        self.profiles.get(wallet).map(|e| e.value().clone())
     }
 
+    #[inline(always)]
     pub async fn detect_mirror_intent(&self, wallet: &Pubkey) -> Result<bool> {
-        let profiles = self.profiles.read().await;
-        let profile = profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
-        
-        Ok(profile.mirror_intent_score > 0.7)
+        let p = self.profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
+        Ok(p.mirror_intent_score > 0.7)
     }
 
+    #[inline(always)]
     pub async fn analyze_liquidity_behavior(&self, wallet: &Pubkey) -> Result<f64> {
-        let profiles = self.profiles.read().await;
-        let profile = profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
-        
-        Ok(profile.liquidity_behavior_score)
+        let p = self.profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
+        Ok(p.liquidity_behavior_score)
     }
 
-    pub async fn update_mempool_pattern(&self, pattern: String, timestamp: u64) -> Result<()> {
-        let mut patterns = self.mempool_patterns.write().await;
-        let timestamps = patterns.entry(pattern).or_insert_with(Vec::new);
-        timestamps.push(timestamp);
-        
-        // Keep only recent patterns (last hour)
-        let cutoff = timestamp.saturating_sub(3600);
-        timestamps.retain(|&ts| ts > cutoff);
-        
+    #[inline(always)]
+    pub async fn update_mempool_pattern_key(&self, key: PatternKey, ts: u64) -> Result<()> {
+        let mut entry = self.mempool_patterns.entry(key).or_insert_with(|| SmallVec::<[u64; 64]>::new());
+        let v = entry.value_mut();
+        if let Some(&last) = v.last() {
+            if ts >= last { v.push(ts); }
+            else {
+                let pos = v.iter().position(|&x| x > ts).unwrap_or(v.len());
+                v.insert(pos, ts);
+            }
+        } else {
+            v.push(ts);
+        }
+        // retain last hour and cap to newest MAX_PATTERN_TS
+        let cutoff = ts.saturating_sub(3600);
+        v.retain(|&x| x > cutoff);
+        if v.len() > MAX_PATTERN_TS { let drop_n = v.len() - MAX_PATTERN_TS; v.drain(0..drop_n); }
         Ok(())
     }
 
-    pub async fn add_coordination_edge(&self, wallet1: Pubkey, wallet2: Pubkey) -> Result<()> {
-        let mut graph = self.coordination_graph.write().await;
-        graph.entry(wallet1).or_insert_with(Vec::new).push(wallet2);
-        graph.entry(wallet2).or_insert_with(Vec::new).push(wallet1);
+    // Compatibility: legacy "Dex_token" string → typed key (non-hot)
+    pub async fn update_mempool_pattern(&self, pattern: String, ts: u64) -> Result<()> {
+        use std::str::FromStr;
+        let (dex_s, pk_s) = match pattern.split_once('_') { Some(x) => x, None => return Ok(()) };
+        let dex = match dex_s {
+            "Jupiter" => DexType::Jupiter,
+            "Raydium" => DexType::Raydium,
+            "Orca"    => DexType::Orca,
+            _ => return Ok(()),
+        };
+        let token_in = Pubkey::from_str(pk_s).unwrap_or(Pubkey::default());
+        self.update_mempool_pattern_key(PatternKey { dex, token_in }, ts).await
+    }
+
+    #[inline(always)]
+    pub async fn add_coordination_edge(&self, a: Pubkey, b: Pubkey) -> Result<()> {
+        let mut e1 = self.coordination_graph.entry(a).or_insert_with(|| SmallVec::<[Pubkey; 8]>::new());
+        if !e1.value().contains(&b) {
+            if e1.value().len() >= MAX_PEERS_PER_WALLET { e1.value_mut().remove(0); }
+            e1.value_mut().push(b);
+        }
+        let mut e2 = self.coordination_graph.entry(b).or_insert_with(|| SmallVec::<[Pubkey; 8]>::new());
+        if !e2.value().contains(&a) {
+            if e2.value().len() >= MAX_PEERS_PER_WALLET { e2.value_mut().remove(0); }
+            e2.value_mut().push(a);
+        }
         Ok(())
     }
 }
@@ -665,7 +785,6 @@ impl WhaleWalletBehavioralFingerprinter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
 
     #[tokio::test]
@@ -677,31 +796,33 @@ mod tests {
         let conservative_whale = Pubkey::from_str("22222222222222222222222222222222").unwrap();
         let rotational_whale = Pubkey::from_str("33333333333333333333333333333333").unwrap();
         
-        let usdc_mint = Pubkey::from_str(USDC_MINT).unwrap();
-        let usdt_mint = Pubkey::from_str(USDT_MINT).unwrap();
+        let usdc_mint = USDC_MINT;
+        let usdt_mint = USDT_MINT;
         let random_token = Pubkey::from_str("44444444444444444444444444444444").unwrap();
         
         // Simulate aggressive whale behavior
         let aggressive_swaps = vec![
             SwapData {
                 timestamp: 1000,
+                slot: 0,
                 dex: DexType::Jupiter,
                 token_in: usdc_mint,
                 token_out: random_token,
                 amount_in: 1000000000000, // Large amount
                 amount_out: 950000000000,
                 slippage_bps: 500, // 5% slippage tolerance
-                transaction_signature: "aggressive1".to_string(),
+                transaction_signature: SmallVec::from_slice(b"aggressive1"),
             },
             SwapData {
                 timestamp: 1010,
+                slot: 0,
                 dex: DexType::Raydium,
                 token_in: random_token,
                 token_out: usdt_mint,
                 amount_in: 950000000000,
                 amount_out: 940000000000,
                 slippage_bps: 600, // 6% slippage tolerance
-                transaction_signature: "aggressive2".to_string(),
+                transaction_signature: SmallVec::from_slice(b"aggressive2"),
             },
         ];
         
@@ -709,13 +830,14 @@ mod tests {
         let conservative_swaps = vec![
             SwapData {
                 timestamp: 2000,
+                slot: 0,
                 dex: DexType::Orca,
                 token_in: usdc_mint,
                 token_out: usdt_mint,
                 amount_in: 100000000000, // Smaller amount
                 amount_out: 99000000000,
                 slippage_bps: 50, // 0.5% slippage tolerance
-                transaction_signature: "conservative1".to_string(),
+                transaction_signature: SmallVec::from_slice(b"conservative1"),
             },
         ];
         
@@ -723,33 +845,36 @@ mod tests {
         let rotational_swaps = vec![
             SwapData {
                 timestamp: 3000,
+                slot: 0,
                 dex: DexType::Jupiter,
                 token_in: usdc_mint,
                 token_out: random_token,
                 amount_in: 500000000000,
                 amount_out: 480000000000,
                 slippage_bps: 200, // 2% slippage tolerance
-                transaction_signature: "rotational1".to_string(),
+                transaction_signature: SmallVec::from_slice(b"rotational1"),
             },
             SwapData {
                 timestamp: 3300,
+                slot: 0,
                 dex: DexType::Raydium,
                 token_in: random_token,
                 token_out: Pubkey::from_str("55555555555555555555555555555555").unwrap(),
                 amount_in: 480000000000,
                 amount_out: 470000000000,
                 slippage_bps: 250, // 2.5% slippage tolerance
-                transaction_signature: "rotational2".to_string(),
+                transaction_signature: SmallVec::from_slice(b"rotational2"),
             },
             SwapData {
                 timestamp: 3600,
+                slot: 0,
                 dex: DexType::Orca,
                 token_in: Pubkey::from_str("55555555555555555555555555555555").unwrap(),
                 token_out: usdt_mint,
                 amount_in: 470000000000,
                 amount_out: 460000000000,
                 slippage_bps: 300, // 3% slippage tolerance
-                transaction_signature: "rotational3".to_string(),
+                transaction_signature: SmallVec::from_slice(b"rotational3"),
             },
         ];
         
@@ -803,13 +928,14 @@ mod tests {
         // Add swap that mirrors the pattern
         let swap = SwapData {
             timestamp: 1003,
+            slot: 0,
             dex: DexType::Jupiter,
             token_in: Pubkey::from_str("44444444444444444444444444444444").unwrap(),
             token_out: Pubkey::from_str("55555555555555555555555555555555").unwrap(),
             amount_in: 1000000000000,
             amount_out: 950000000000,
             slippage_bps: 500,
-            transaction_signature: "mirror_test".to_string(),
+            transaction_signature: SmallVec::from_slice(b"mirror_test"),
         };
         
         fingerprinter.update_wallet_profile(wallet, swap).await.unwrap();
@@ -845,11 +971,8 @@ mod tests {
         let liquidity_score = fingerprinter.calculate_liquidity_behavior_score(&profile.liquidity_actions);
         assert!(liquidity_score > 0.0);
         
-        // Update profile in storage
-        {
-            let mut profiles = fingerprinter.profiles.write().await;
-            profiles.insert(wallet, profile);
-        }
+        // Update profile in storage (DashMap)
+        fingerprinter.profiles.insert(wallet, profile);
         
         let behavior_score = fingerprinter.analyze_liquidity_behavior(&wallet).await.unwrap();
         assert!(behavior_score > 0.0);
@@ -899,7 +1022,7 @@ mod tests {
     }
 }
 #[cfg(test)]
-mod tests {
+mod tests_v2 {
     use super::*;
     use solana_program::instruction::{AccountMeta, CompiledInstruction};
     use std::time::Duration;
