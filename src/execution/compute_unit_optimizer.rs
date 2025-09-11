@@ -1,657 +1,960 @@
-use solana_client::{
-    rpc_client::RpcClient,
-    rpc_config::{RpcSimulateTransactionConfig, RpcSendTransactionConfig},
-};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+
+use parking_lot::RwLock;
+use hashbrown::HashMap;
+use smallvec::SmallVec;
+
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
+    compute_budget::{ComputeBudgetInstruction, id as compute_budget_program_id},
     pubkey::Pubkey,
-    signature::Keypair,
+    signature::Signature,
     transaction::Transaction,
+    message::VersionedMessage,
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
-use tokio::sync::RwLock as AsyncRwLock;
-use rand::Rng;
+use solana_client::{rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use dashmap::DashMap;
+use hdrhistogram::Histogram;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
-const DEFAULT_COMPUTE_UNITS: u32 = 200_000;
 const MAX_COMPUTE_UNITS: u32 = 1_400_000;
-const MIN_COMPUTE_UNITS: u32 = 50_000;
-const PRIORITY_FEE_PERCENTILE: f64 = 0.75;
-const SIMULATION_COMMITMENT: CommitmentConfig = CommitmentConfig::processed();
+const MIN_COMPUTE_UNITS: u32 = 200_000;
+const BASE_PRIORITY_FEE: u64 = 1_000;
+const MAX_PRIORITY_FEE: u64 = 50_000_000;
+const SLOT_HISTORY_SIZE: usize = 150;
+const PRICE_DECAY_FACTOR: f64 = 0.95;
 const CONGESTION_THRESHOLD: f64 = 0.85;
-const MAX_PRIORITY_FEE_LAMPORTS: u64 = 50_000_000;
-const MIN_PRIORITY_FEE_LAMPORTS: u64 = 1_000;
-const FEE_CACHE_DURATION_MS: u64 = 1000;
-const HISTORY_WINDOW_SIZE: usize = 100;
-const OUTLIER_THRESHOLD: f64 = 3.0;
-const BASE_RETRY_DELAY_MS: u64 = 50;
-const MAX_RETRY_DELAY_MS: u64 = 2000;
+const FAILURE_PENALTY_MULTIPLIER: f64 = 1.15;
+const SUCCESS_REWARD_MULTIPLIER: f64 = 0.98;
+const PERCENTILE_TARGET: f64 = 0.95;
+const MIN_SAMPLE_SIZE: usize = 10;
+const ADAPTIVE_WINDOW: usize = 50;
+const EXPONENTIAL_BACKOFF_BASE: f64 = 1.5;
+const MAX_RETRIES: u8 = 3;
 
-#[derive(Debug, Clone)]
+const HIST_WINDOWS: usize = 4;
+const HIST_WINDOW_SLOTS: u64 = 128;
+
+type FeeVec = SmallVec<[u64; 32]>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeUnitMetrics {
-    pub compute_units_consumed: u32,
+    pub slot: u64,
+    pub compute_units_used: u32,
     pub priority_fee: u64,
     pub success: bool,
-    pub slot: u64,
-    pub timestamp: Instant,
-    pub congestion_score: f64,
+    pub latency_ms: u64,
+    pub network_congestion: f64,
+    pub competitor_fees: Vec<u64>,
+    pub timestamp_ns: u128,
 }
 
 #[derive(Debug, Clone)]
-pub struct OptimizationConfig {
-    pub aggressive_mode: bool,
-    pub max_priority_fee_multiplier: f64,
-    pub compute_unit_buffer_ratio: f64,
-    pub dynamic_adjustment_enabled: bool,
-    pub congestion_response_multiplier: f64,
+pub struct AuctionStrategy {
+    pub base_fee: u64,
+    pub aggression_factor: f64,
+    pub max_budget: u64,
+    pub dynamic_adjustment: bool,
+    pub congestion_multiplier: f64,
+    pub competition_threshold: f64,
 }
 
-impl Default for OptimizationConfig {
-    fn default() -> Self {
-        Self {
-            aggressive_mode: true,
-            max_priority_fee_multiplier: 5.0,
-            compute_unit_buffer_ratio: 1.15,
-            dynamic_adjustment_enabled: true,
-            congestion_response_multiplier: 2.5,
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct NetworkState {
+    pub current_slot: u64,
+    pub recent_block_production_rate: f64,
+    pub average_priority_fees: VecDeque<u64>,
+    pub congestion_score: f64,
+    pub competitor_activity: HashMap<Pubkey, FeeVec>,
+    pub last_update: Instant,
 }
 
-pub struct ComputeUnitOptimizer {
+pub struct ComputeUnitAuctionEngine {
     rpc_client: Arc<RpcClient>,
     metrics_history: Arc<RwLock<VecDeque<ComputeUnitMetrics>>>,
-    fee_cache: Arc<AsyncRwLock<HashMap<String, (u64, Instant)>>>,
-    config: OptimizationConfig,
-    network_stats: Arc<RwLock<NetworkStats>>,
-    instruction_complexity_map: Arc<RwLock<HashMap<String, u32>>>,
+    network_state: Arc<RwLock<NetworkState>>,
+    strategy: Arc<RwLock<AuctionStrategy>>,
+    performance_cache: Arc<DashMap<u64, f64>>,
+    fee_percentiles: Arc<RwLock<Vec<u64>>>,
+    adaptive_params: Arc<Mutex<AdaptiveParameters>>,
+    fee_ring: Arc<RwLock<RingHist>>,
+    latency_ring: Arc<RwLock<RingHist>>,
 }
 
 #[derive(Debug, Clone)]
-struct NetworkStats {
-    avg_success_rate: f64,
-    avg_compute_units: u32,
-    avg_priority_fee: u64,
-    congestion_level: f64,
-    last_update: Instant,
+struct AdaptiveParameters {
+    learning_rate: f64,
+    exploration_rate: f64,
+    momentum: f64,
+    last_adjustment: Instant,
+    performance_window: VecDeque<f64>,
 }
 
-impl Default for NetworkStats {
-    fn default() -> Self {
-        Self {
-            avg_success_rate: 0.5,
-            avg_compute_units: DEFAULT_COMPUTE_UNITS,
-            avg_priority_fee: 10_000,
-            congestion_level: 0.5,
-            last_update: Instant::now(),
+#[derive(Debug)]
+struct RingHist {
+    windows: Vec<Histogram<u64>>,
+    idx: usize,
+    start_slot: u64,
+    window_slots: u64,
+    low: u64,
+    high: u64,
+    sigfig: u8,
+}
+
+impl RingHist {
+    fn new(low: u64, high: u64, sigfig: u8, window_slots: u64, windows: usize) -> Self {
+        let mut v = Vec::with_capacity(windows);
+        for _ in 0..windows {
+            v.push(Histogram::new_with_bounds(low, high, sigfig).expect("hist"));
         }
+        Self { windows: v, idx: 0, start_slot: 0, window_slots, low, high, sigfig }
+    }
+    #[inline(always)]
+    fn rotate_to(&mut self, slot: u64) {
+        if self.start_slot == 0 {
+            self.start_slot = (slot / self.window_slots) * self.window_slots;
+            return;
+        }
+        let mut steps = slot.saturating_sub(self.start_slot) / self.window_slots;
+        while steps > 0 {
+            self.idx = (self.idx + 1) % self.windows.len();
+            self.windows[self.idx].reset();
+            self.start_slot = self.start_slot.saturating_add(self.window_slots);
+            steps -= 1;
+        }
+    }
+    #[inline(always)]
+    fn record(&mut self, slot: u64, value: u64) {
+        self.rotate_to(slot);
+        let _ = self.windows[self.idx].record(value);
+    }
+    fn merge_recent(&self, k: usize) -> Option<Histogram<u64>> {
+        let mut out = Histogram::new_with_bounds(self.low, self.high, self.sigfig).ok()?;
+        let mut count = 0u64;
+        for i in 0..k.min(self.windows.len()) {
+            let j = (self.idx + self.windows.len() - i) % self.windows.len();
+            let _ = out.add(&self.windows[j]);
+            count += self.windows[j].len();
+        }
+        if count > 0 { Some(out) } else { None }
+    }
+    #[inline(always)]
+    fn q_recent(&self, q: f64, k: usize) -> Option<u64> {
+        self.merge_recent(k).map(|h| h.value_at_quantile(q))
     }
 }
 
-impl ComputeUnitOptimizer {
-    pub fn new(rpc_client: Arc<RpcClient>, config: OptimizationConfig) -> Self {
+impl ComputeUnitAuctionEngine {
+    pub fn new(rpc_client: Arc<RpcClient>) -> Self {
+        let network_state = NetworkState {
+            current_slot: 0,
+            recent_block_production_rate: 1.0,
+            average_priority_fees: VecDeque::with_capacity(SLOT_HISTORY_SIZE),
+            congestion_score: 0.0,
+            competitor_activity: HashMap::new(),
+            last_update: Instant::now(),
+        };
+
+        let strategy = AuctionStrategy {
+            base_fee: BASE_PRIORITY_FEE,
+            aggression_factor: 1.0,
+            max_budget: MAX_PRIORITY_FEE,
+            dynamic_adjustment: true,
+            congestion_multiplier: 1.2,
+            competition_threshold: 0.8,
+        };
+
+        let adaptive_params = AdaptiveParameters {
+            learning_rate: 0.1,
+            exploration_rate: 0.05,
+            momentum: 0.9,
+            last_adjustment: Instant::now(),
+            performance_window: VecDeque::with_capacity(ADAPTIVE_WINDOW),
+        };
+
+        let fee_ring = RingHist::new(1, MAX_PRIORITY_FEE, 3, HIST_WINDOW_SLOTS, HIST_WINDOWS);
+        let latency_ring = RingHist::new(1, 5_000, 3, HIST_WINDOW_SLOTS, HIST_WINDOWS);
+
         Self {
             rpc_client,
-            metrics_history: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_WINDOW_SIZE))),
-            fee_cache: Arc::new(AsyncRwLock::new(HashMap::new())),
-            config,
-            network_stats: Arc::new(RwLock::new(NetworkStats::default())),
-            instruction_complexity_map: Arc::new(RwLock::new(HashMap::new())),
+            metrics_history: Arc::new(RwLock::new(VecDeque::with_capacity(SLOT_HISTORY_SIZE))),
+            network_state: Arc::new(RwLock::new(network_state)),
+            strategy: Arc::new(RwLock::new(strategy)),
+            performance_cache: Arc::new(DashMap::new()),
+            fee_percentiles: Arc::new(RwLock::new(Vec::new())),
+            adaptive_params: Arc::new(Mutex::new(adaptive_params)),
+            fee_ring: Arc::new(RwLock::new(fee_ring)),
+            latency_ring: Arc::new(RwLock::new(latency_ring)),
         }
     }
 
-    pub async fn optimize_transaction(
+    pub async fn calculate_optimal_compute_units(
         &self,
-        transaction: &mut Transaction,
-        payer: &Keypair,
-        recent_blockhash: solana_sdk::hash::Hash,
+        transaction: &Transaction,
+        urgency_factor: f64,
     ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
-        let instructions = transaction.message.instructions.clone();
+        self.update_network_state().await?;
         
-        let (compute_units, priority_fee) = self.calculate_optimal_parameters(&instructions).await?;
+        let simulated_units = self.simulate_compute_units(transaction).await?;
+        let compute_units = self.adjust_compute_units(simulated_units);
         
-        let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(compute_units);
-        let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(
-            priority_fee.saturating_div(compute_units as u64),
-        );
-        
-        let mut new_instructions = vec![compute_budget_ix, priority_fee_ix];
-        new_instructions.extend(instructions);
-        
-        *transaction = Transaction::new_signed_with_payer(
-            &new_instructions,
-            Some(&payer.pubkey()),
-            &[payer],
-            recent_blockhash,
-        );
+        let priority_fee = self.calculate_priority_fee(urgency_factor).await?;
         
         Ok((compute_units, priority_fee))
     }
 
-    async fn calculate_optimal_parameters(
+    async fn simulate_compute_units(
         &self,
-        instructions: &[Instruction],
-    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
-        let base_compute_units = self.estimate_compute_units(instructions).await?;
-        let network_stats = self.network_stats.read().unwrap().clone();
-        
-        let congestion_adjusted_units = if network_stats.congestion_level > CONGESTION_THRESHOLD {
-            (base_compute_units as f64 * (1.0 + (network_stats.congestion_level - CONGESTION_THRESHOLD) * 2.0))
-                .min(MAX_COMPUTE_UNITS as f64) as u32
-        } else {
-            base_compute_units
-        };
-        
-        let buffered_units = (congestion_adjusted_units as f64 * self.config.compute_unit_buffer_ratio)
-            .min(MAX_COMPUTE_UNITS as f64) as u32;
-        
-        let priority_fee = self.calculate_priority_fee(buffered_units, &network_stats).await?;
-        
-        Ok((buffered_units, priority_fee))
-    }
-
-    async fn estimate_compute_units(
-        &self,
-        instructions: &[Instruction],
+        transaction: &Transaction,
     ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-        let mut total_complexity = 0u32;
-        let complexity_map = self.instruction_complexity_map.read().unwrap();
+        let config = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            commitment: Some(solana_sdk::commitment_config::CommitmentConfig::processed()),
+            ..Default::default()
+        };
+
+        let result = self.rpc_client.simulate_transaction_with_config(transaction, config)?;
         
-        for instruction in instructions {
-            let program_id = instruction.program_id.to_string();
-            
-            if let Some(&cached_complexity) = complexity_map.get(&program_id) {
-                total_complexity = total_complexity.saturating_add(cached_complexity);
-            } else {
-                let estimated = self.estimate_instruction_complexity(instruction);
-                total_complexity = total_complexity.saturating_add(estimated);
-            }
+        if let Some(err) = result.value.err {
+            return Err(format!("Simulation failed: {:?}", err).into());
         }
-        
-        let historical_adjustment = self.get_historical_adjustment();
-        let adjusted_units = (total_complexity as f64 * historical_adjustment)
-            .max(MIN_COMPUTE_UNITS as f64)
-            .min(MAX_COMPUTE_UNITS as f64) as u32;
-        
-        Ok(adjusted_units)
+
+        let units_consumed = result.value.units_consumed.unwrap_or(200_000) as u32;
+        Ok(units_consumed)
     }
 
-    fn estimate_instruction_complexity(&self, instruction: &Instruction) -> u32 {
-        let base_cost = 5000;
-        let account_cost = instruction.accounts.len() as u32 * 1000;
-        let data_cost = (instruction.data.len() as u32).saturating_mul(100);
-        
-        let program_specific_cost = match instruction.program_id.to_string().as_str() {
-            "11111111111111111111111111111111" => 1000,
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" => 3000,
-            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => 25000,
-            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => 20000,
-            "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" => 30000,
-            _ => 10000,
-        };
-        
-        base_cost + account_cost + data_cost + program_specific_cost
+    fn adjust_compute_units(&self, simulated: u32) -> u32 {
+        let p90_ms = self.latency_ring.read().q_recent(0.90, 2).unwrap_or(600);
+        let safety = (1.05 + ((p90_ms as f64) / 1000.0).min(0.20));
+        let adjusted = (simulated as f64 * safety).ceil() as u32;
+        adjusted.clamp(MIN_COMPUTE_UNITS, MAX_COMPUTE_UNITS)
     }
 
     async fn calculate_priority_fee(
         &self,
-        compute_units: u32,
-        network_stats: &NetworkStats,
+        urgency_factor: f64,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let cache_key = format!("priority_fee_{}", compute_units);
+        let network_state = self.network_state.read();
+        let strategy = self.strategy.read();
         
-        {
-            let fee_cache = self.fee_cache.read().await;
-            if let Some((cached_fee, timestamp)) = fee_cache.get(&cache_key) {
-                if timestamp.elapsed().as_millis() < FEE_CACHE_DURATION_MS as u128 {
-                    return Ok(*cached_fee);
-                }
-            }
+        let mut base_fee = self.get_dynamic_base_fee(&network_state, &strategy);
+        if let Some(p75) = self.competitor_fee_quantile(0.75) {
+            let floor = ((p75 as f64) * 0.99) as u64;
+            if floor > base_fee { base_fee = floor; }
         }
+        let competition_multiplier = self.calculate_competition_multiplier(&network_state);
+        let congestion_adjustment = self.get_congestion_adjustment(&network_state);
         
-        let recent_fees = self.get_recent_priority_fees();
-        let percentile_fee = self.calculate_percentile_fee(&recent_fees, PRIORITY_FEE_PERCENTILE);
+        let adaptive_factor = self.get_adaptive_factor().await;
+        // deterministic anti-herding jitter per-slot
+        let mut rng = ChaCha8Rng::seed_from_u64(network_state.current_slot ^ base_fee);
+        let jitter: f64 = rng.gen_range(0.9925..=1.0075);
+
+        let fee = (base_fee as f64 
+            * urgency_factor 
+            * competition_multiplier 
+            * congestion_adjustment 
+            * adaptive_factor
+            * strategy.aggression_factor
+            * jitter) as u64;
         
-        let congestion_multiplier = if network_stats.congestion_level > CONGESTION_THRESHOLD {
-            1.0 + (network_stats.congestion_level - CONGESTION_THRESHOLD) * self.config.congestion_response_multiplier
-        } else {
-            1.0
-        };
+        let final_fee = fee.min(strategy.max_budget).max(BASE_PRIORITY_FEE);
         
-        let success_rate_multiplier = if network_stats.avg_success_rate < 0.3 {
-            2.0
-        } else if network_stats.avg_success_rate < 0.5 {
-            1.5
-        } else {
-            1.0
-        };
-        
-        let base_fee = if self.config.aggressive_mode {
-            percentile_fee.max(network_stats.avg_priority_fee)
-        } else {
-            percentile_fee
-        };
-        
-        let adjusted_fee = (base_fee as f64 * congestion_multiplier * success_rate_multiplier)
-            .min(MAX_PRIORITY_FEE_LAMPORTS as f64)
-            .max(MIN_PRIORITY_FEE_LAMPORTS as f64) as u64;
-        
-        {
-            let mut fee_cache = self.fee_cache.write().await;
-            fee_cache.insert(cache_key, (adjusted_fee, Instant::now()));
-        }
-        
-        Ok(adjusted_fee)
+        Ok(final_fee)
     }
 
-    fn get_recent_priority_fees(&self) -> Vec<u64> {
-        let history = self.metrics_history.read().unwrap();
-        history.iter()
-            .filter(|m| m.timestamp.elapsed().as_secs() < 60)
-            .map(|m| m.priority_fee)
-            .collect()
-    }
-
-    fn calculate_percentile_fee(&self, fees: &[u64], percentile: f64) -> u64 {
-        if fees.is_empty() {
-            return 10_000;
+    fn get_dynamic_base_fee(&self, network_state: &NetworkState, strategy: &AuctionStrategy) -> u64 {
+        if let Some(q) = self.fee_ring.read().q_recent(PERCENTILE_TARGET, 3) {
+            return q;
         }
-        
-        let mut sorted_fees = fees.to_vec();
+        if network_state.average_priority_fees.is_empty() {
+            return strategy.base_fee;
+        }
+        let mut sorted_fees: Vec<u64> = network_state.average_priority_fees.iter().cloned().collect();
         sorted_fees.sort_unstable();
-        
-        let index = ((sorted_fees.len() as f64 - 1.0) * percentile) as usize;
-        sorted_fees[index]
+        let percentile_idx = ((sorted_fees.len() as f64 * PERCENTILE_TARGET) as usize)
+            .min(sorted_fees.len() - 1);
+        sorted_fees[percentile_idx]
     }
 
-    fn get_historical_adjustment(&self) -> f64 {
-        let history = self.metrics_history.read().unwrap();
-        if history.len() < 10 {
+    fn calculate_competition_multiplier(&self, network_state: &NetworkState) -> f64 {
+        if network_state.competitor_activity.is_empty() {
             return 1.0;
         }
+
+        let total_competitors = network_state.competitor_activity.len() as f64;
+        let avg_competitor_fee = network_state.competitor_activity
+            .values()
+            .flat_map(|fees| fees.iter())
+            .sum::<u64>() as f64 
+            / network_state.competitor_activity.values().map(|v| v.len()).sum::<usize>().max(1) as f64;
+
+        let competition_intensity = (total_competitors / 10.0).min(2.0);
+        let fee_pressure = (avg_competitor_fee / BASE_PRIORITY_FEE as f64).log2().max(0.0) / 10.0 + 1.0;
         
-        let recent_metrics: Vec<_> = history.iter()
-            .filter(|m| m.timestamp.elapsed().as_secs() < 300)
-            .collect();
-        
-        if recent_metrics.is_empty() {
-            return 1.0;
+        competition_intensity * fee_pressure
+    }
+
+    fn get_congestion_adjustment(&self, network_state: &NetworkState) -> f64 {
+        if network_state.congestion_score < CONGESTION_THRESHOLD {
+            1.0
+        } else {
+            let excess_congestion = network_state.congestion_score - CONGESTION_THRESHOLD;
+            1.0 + (excess_congestion * 2.0).min(3.0)
         }
+    }
+
+    async fn get_adaptive_factor(&self) -> f64 {
+        let adaptive_params = self.adaptive_params.lock().await;
+        let performance_score = self.calculate_recent_performance(&adaptive_params.performance_window);
         
-        let success_rate = recent_metrics.iter()
-            .filter(|m| m.success)
-            .count() as f64 / recent_metrics.len() as f64;
-        
-        if success_rate < 0.5 {
-            1.2
-        } else if success_rate < 0.7 {
-            1.1
-        } else if success_rate > 0.9 {
-            0.95
+        let exploration_bonus = if adaptive_params.exploration_rate > rand::random::<f64>() {
+            1.0 + (rand::random::<f64>() * 0.2 - 0.1)
         } else {
             1.0
-        }
-    }
-
-    pub async fn simulate_and_adjust(
-        &self,
-        transaction: &Transaction,
-    ) -> Result<(u32, bool), Box<dyn std::error::Error + Send + Sync>> {
-        let config = RpcSimulateTransactionConfig {
-            sig_verify: false,
-            replace_recent_blockhash: true,
-            commitment: Some(SIMULATION_COMMITMENT),
-            ..Default::default()
         };
         
-        match self.rpc_client.simulate_transaction_with_config(transaction, config) {
-            Ok(result) => {
-                if let Some(err) = result.value.err {
-                    Ok((DEFAULT_COMPUTE_UNITS, false))
-                } else {
-                    let units_consumed = result.value.units_consumed.unwrap_or(DEFAULT_COMPUTE_UNITS as u64) as u32;
-                    Ok((units_consumed, true))
-                }
-            }
-            Err(_) => Ok((DEFAULT_COMPUTE_UNITS, false))
+        performance_score * exploration_bonus
+    }
+
+    fn calculate_recent_performance(&self, window: &VecDeque<f64>) -> f64 {
+        if window.is_empty() {
+            return 1.0;
         }
+
+        let weighted_sum: f64 = window.iter()
+            .enumerate()
+            .map(|(i, &perf)| perf * (0.9_f64.powi(i as i32)))
+            .sum();
+        
+        let weight_sum: f64 = (0..window.len())
+            .map(|i| 0.9_f64.powi(i as i32))
+            .sum();
+        
+        (weighted_sum / weight_sum).max(0.5).min(2.0)
+    }
+
+    pub async fn update_network_state(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let slot = self.rpc_client.get_slot()?;
+        let block_production = self.rpc_client.get_block_production()?;
+
+        let mut produced: u64 = 0;
+        let mut leader: u64 = 0;
+        for (_k, (ls, bp)) in block_production.value.by_identity.iter() {
+            leader = leader.saturating_add(*ls as u64);
+            produced = produced.saturating_add(*bp as u64);
+        }
+        let rate = if leader == 0 { 1.0 } else { (produced as f64 / leader as f64).clamp(0.0, 1.0) };
+
+        let mut network_state = self.network_state.write();
+        network_state.current_slot = slot;
+        network_state.recent_block_production_rate = rate;
+        network_state.congestion_score = self.calculate_congestion_score(&network_state);
+        network_state.last_update = Instant::now();
+
+        Ok(())
+    }
+
+    fn calculate_congestion_score(&self, network_state: &NetworkState) -> f64 {
+        let production_penalty = (1.0 - network_state.recent_block_production_rate) * 2.0;
+        let fee_pressure = if !network_state.average_priority_fees.is_empty() {
+            let avg_fee = network_state.average_priority_fees.iter().sum::<u64>() 
+                / network_state.average_priority_fees.len() as u64;
+            (avg_fee as f64 / BASE_PRIORITY_FEE as f64).log10() / 5.0
+        } else {
+            0.0
+        };
+        
+        (production_penalty + fee_pressure).min(1.0).max(0.0)
     }
 
     pub async fn record_transaction_result(
         &self,
+        _signature: &Signature,
         compute_units: u32,
         priority_fee: u64,
         success: bool,
-        slot: u64,
-    ) {
-                let metrics = ComputeUnitMetrics {
-            compute_units_consumed: compute_units,
+        latency_ms: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let slot = self.rpc_client.get_slot()?;
+        
+        let metric = ComputeUnitMetrics {
+            slot,
+            compute_units_used: compute_units,
             priority_fee,
             success,
-            slot,
-            timestamp: Instant::now(),
-            congestion_score: self.calculate_congestion_score(),
+            latency_ms,
+            network_congestion: self.network_state.read().congestion_score,
+            competitor_fees: self.get_recent_competitor_fees(),
+            timestamp_ns: now_ns(),
         };
         
-        {
-            let mut history = self.metrics_history.write().unwrap();
-            if history.len() >= HISTORY_WINDOW_SIZE {
-                history.pop_front();
-            }
-            history.push_back(metrics.clone());
+        self.update_metrics_history(metric);
+
+        if success {
+            self.fee_ring.write().record(slot, priority_fee);
+            self.latency_ring.write().record(slot, latency_ms.min(5_000));
         }
+        self.update_adaptive_parameters(success, priority_fee).await;
+        self.update_fee_percentiles();
         
-        self.update_network_stats().await;
-        self.update_instruction_complexity_cache(compute_units).await;
+        Ok(())
     }
 
-    fn calculate_congestion_score(&self) -> f64 {
-        let history = self.metrics_history.read().unwrap();
-        if history.len() < 10 {
+    fn get_recent_competitor_fees(&self) -> Vec<u64> {
+        let network_state = self.network_state.read();
+        network_state.competitor_activity
+            .values()
+            .flat_map(|fees| fees.iter())
+            .take(20)
+            .cloned()
+            .collect()
+    }
+
+    // ... (rest of the code remains the same)
+
+    async fn update_adaptive_parameters(&self, success: bool, priority_fee: u64) {
+        let mut params = self.adaptive_params.lock().await;
+        
+        let performance = if success {
+            let fee_efficiency = BASE_PRIORITY_FEE as f64 / priority_fee.max(1) as f64;
+            (fee_efficiency * 2.0).min(1.5)
+        } else {
+            0.5
+        };
+        
+        params.performance_window.push_back(performance);
+        if params.performance_window.len() > ADAPTIVE_WINDOW {
+            params.performance_window.pop_front();
+        }
+        
+        if params.performance_window.len() >= MIN_SAMPLE_SIZE {
+            let avg_performance = params.performance_window.iter().sum::<f64>() 
+                / params.performance_window.len() as f64;
+            
+            if avg_performance < 0.7 {
+                params.exploration_rate = (params.exploration_rate * 1.1).min(0.15);
+                params.learning_rate = (params.learning_rate * 1.05).min(0.2);
+            } else if avg_performance > 0.9 {
+                params.exploration_rate = (params.exploration_rate * 0.95).max(0.01);
+                params.learning_rate = (params.learning_rate * 0.98).max(0.05);
+            }
+        }
+        
+        params.last_adjustment = Instant::now();
+    }
+
+    fn update_fee_percentiles(&self) {
+        if let Some(h) = self.fee_ring.read().merge_recent(3) {
+            let percentiles = vec![
+                h.value_at_quantile(0.50),
+                h.value_at_quantile(0.75),
+                h.value_at_quantile(0.90),
+                h.value_at_quantile(0.95),
+                h.value_at_quantile(0.99),
+            ];
+            *self.fee_percentiles.write() = percentiles;
+        }
+    }
+
+    pub async fn get_aggressive_bid(
+        &self,
+        min_position: f64,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let network_state = self.network_state.read();
+        let strategy = self.strategy.read();
+        
+        let percentiles = self.fee_percentiles.read();
+        if percentiles.is_empty() {
+            return Ok((MAX_COMPUTE_UNITS, strategy.base_fee * 5));
+        }
+        
+        let target_percentile = (min_position * 100.0) as usize;
+        let index = (target_percentile / 25).min(percentiles.len() - 1);
+        let aggressive_fee = percentiles[index];
+        
+        let competition_boost = if network_state.congestion_score > CONGESTION_THRESHOLD {
+            1.5
+        } else {
+            1.2
+        };
+        
+        let final_fee = ((aggressive_fee as f64 * competition_boost) as u64)
+            .min(strategy.max_budget);
+        
+        Ok((MAX_COMPUTE_UNITS, final_fee))
+    }
+
+    pub async fn get_conservative_bid(&self) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let network_state = self.network_state.read();
+        let strategy = self.strategy.read();
+        
+        let conservative_units = MIN_COMPUTE_UNITS + 50_000;
+        
+        let base_fee = if !network_state.average_priority_fees.is_empty() {
+            let sum: u64 = network_state.average_priority_fees.iter().sum();
+            sum / network_state.average_priority_fees.len() as u64
+        } else {
+            strategy.base_fee
+        };
+        
+        let conservative_fee = (base_fee as f64 * 0.8) as u64;
+        
+        Ok((conservative_units, conservative_fee.max(BASE_PRIORITY_FEE)))
+    }
+
+    pub async fn get_adaptive_bid(
+        &self,
+        transaction_value: u64,
+        max_slippage_bps: u64,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let max_fee_budget = (transaction_value * max_slippage_bps) / 10_000;
+        
+        let network_state = self.network_state.read();
+        let strategy = self.strategy.read();
+        
+        let recent_success_rate = self.calculate_recent_success_rate();
+        let optimal_percentile = if recent_success_rate < 0.5 {
+            0.95
+        } else if recent_success_rate < 0.7 {
+            0.85
+        } else if recent_success_rate < 0.9 {
+            0.75
+        } else {
+            0.65
+        };
+        
+        let base_fee = self.get_percentile_fee(optimal_percentile);
+        let adaptive_multiplier = self.get_adaptive_multiplier(recent_success_rate).await;
+        
+        let compute_units = if network_state.congestion_score > 0.7 {
+            MAX_COMPUTE_UNITS
+        } else {
+            (MAX_COMPUTE_UNITS as f64 * 0.8) as u32
+        };
+        
+        let final_fee = ((base_fee as f64 * adaptive_multiplier) as u64)
+            .min(max_fee_budget)
+            .min(strategy.max_budget);
+        
+        Ok((compute_units, final_fee))
+    }
+
+    fn calculate_recent_success_rate(&self) -> f64 {
+        let history = self.metrics_history.read();
+        if history.is_empty() {
             return 0.5;
         }
         
-        let recent_window = 20;
-        let recent_metrics: Vec<_> = history.iter()
+        let recent_count = 20.min(history.len());
+        let successes = history.iter()
             .rev()
-            .take(recent_window)
-            .collect();
+            .take(recent_count)
+            .filter(|m| m.success)
+            .count();
         
-        let failure_rate = recent_metrics.iter()
-            .filter(|m| !m.success)
-            .count() as f64 / recent_metrics.len() as f64;
-        
-        let avg_priority_fee = recent_metrics.iter()
-            .map(|m| m.priority_fee)
-            .sum::<u64>() as f64 / recent_metrics.len() as f64;
-        
-        let normalized_fee = (avg_priority_fee / MAX_PRIORITY_FEE_LAMPORTS as f64).min(1.0);
-        
-        (failure_rate * 0.7 + normalized_fee * 0.3).min(1.0)
+        successes as f64 / recent_count as f64
     }
 
-    async fn update_network_stats(&self) {
-        let history = self.metrics_history.read().unwrap();
+    fn get_percentile_fee(&self, percentile: f64) -> u64 {
+        let history = self.metrics_history.read();
         if history.is_empty() {
-            return;
+            return BASE_PRIORITY_FEE;
         }
         
-        let recent_metrics: Vec<_> = history.iter()
-            .filter(|m| m.timestamp.elapsed().as_secs() < 120)
+        let mut fees: Vec<u64> = history.iter()
+            .map(|m| m.priority_fee)
             .collect();
         
-        if recent_metrics.len() < 5 {
-            return;
+        if fees.is_empty() {
+            return BASE_PRIORITY_FEE;
         }
         
-        let success_count = recent_metrics.iter().filter(|m| m.success).count();
-        let avg_success_rate = success_count as f64 / recent_metrics.len() as f64;
+        fees.sort_unstable();
+        let index = ((fees.len() as f64 * percentile) as usize)
+            .min(fees.len() - 1);
         
-        let compute_units_without_outliers = self.remove_outliers(
-            &recent_metrics.iter().map(|m| m.compute_units_consumed).collect::<Vec<_>>()
-        );
-        let avg_compute_units = compute_units_without_outliers.iter().sum::<u32>() / 
-            compute_units_without_outliers.len().max(1) as u32;
-        
-        let priority_fees_without_outliers = self.remove_outliers_u64(
-            &recent_metrics.iter().map(|m| m.priority_fee).collect::<Vec<_>>()
-        );
-        let avg_priority_fee = priority_fees_without_outliers.iter().sum::<u64>() / 
-            priority_fees_without_outliers.len().max(1) as u64;
-        
-        let congestion_level = recent_metrics.iter()
-            .map(|m| m.congestion_score)
-            .sum::<f64>() / recent_metrics.len() as f64;
-        
-        let mut stats = self.network_stats.write().unwrap();
-        *stats = NetworkStats {
-            avg_success_rate,
-            avg_compute_units,
-            avg_priority_fee,
-            congestion_level,
-            last_update: Instant::now(),
-        };
+        fees[index]
     }
 
-    fn remove_outliers(&self, values: &[u32]) -> Vec<u32> {
-        if values.len() < 3 {
-            return values.to_vec();
-        }
+    async fn get_adaptive_multiplier(&self, success_rate: f64) -> f64 {
+        let params = self.adaptive_params.lock().await;
+        let momentum_factor = params.momentum;
+        let learning_adjustment = params.learning_rate * (0.8 - success_rate);
         
-        let mean = values.iter().sum::<u32>() as f64 / values.len() as f64;
-        let variance = values.iter()
-            .map(|&v| (v as f64 - mean).powi(2))
-            .sum::<f64>() / values.len() as f64;
-        let std_dev = variance.sqrt();
-        
-        values.iter()
-            .filter(|&&v| (v as f64 - mean).abs() <= OUTLIER_THRESHOLD * std_dev)
-            .cloned()
-            .collect()
-    }
-
-    fn remove_outliers_u64(&self, values: &[u64]) -> Vec<u64> {
-        if values.len() < 3 {
-            return values.to_vec();
-        }
-        
-        let mean = values.iter().sum::<u64>() as f64 / values.len() as f64;
-        let variance = values.iter()
-            .map(|&v| (v as f64 - mean).powi(2))
-            .sum::<f64>() / values.len() as f64;
-        let std_dev = variance.sqrt();
-        
-        values.iter()
-            .filter(|&&v| (v as f64 - mean).abs() <= OUTLIER_THRESHOLD * std_dev)
-            .cloned()
-            .collect()
-    }
-
-    async fn update_instruction_complexity_cache(&self, actual_units: u32) {
-        let mut complexity_map = self.instruction_complexity_map.write().unwrap();
-        
-        if complexity_map.len() > 1000 {
-            complexity_map.clear();
-        }
-    }
-
-    pub async fn get_retry_strategy(&self, attempt: u32) -> (u64, u64) {
-        let network_stats = self.network_stats.read().unwrap();
-        let congestion = network_stats.congestion_level;
-        
-        let base_delay = if congestion > 0.8 {
-            BASE_RETRY_DELAY_MS * 2
+        let base_multiplier = if success_rate < 0.6 {
+            1.0 + learning_adjustment.abs()
+        } else if success_rate > 0.85 {
+            1.0 - (learning_adjustment.abs() * 0.5)
         } else {
-            BASE_RETRY_DELAY_MS
+            1.0
         };
         
-        let exponential_delay = base_delay * (2u64.pow(attempt.min(5)));
-        let jittered_delay = exponential_delay + (rand::random::<u64>() % (exponential_delay / 2));
-        let final_delay = jittered_delay.min(MAX_RETRY_DELAY_MS);
-        
-        let priority_multiplier = if congestion > 0.8 {
-            1.5 + (0.3 * attempt as f64)
-        } else {
-            1.0 + (0.2 * attempt as f64)
-        };
-        
-        (final_delay, (priority_multiplier * 100.0) as u64)
+        let final_multiplier = base_multiplier * momentum_factor + (1.0 - momentum_factor);
+        final_multiplier.max(0.7).min(1.5)
     }
 
-    pub async fn should_retry(&self, error_msg: &str, attempt: u32) -> bool {
-        if attempt >= 5 {
-            return false;
-        }
-        
-        let retryable_errors = [
-            "BlockhashNotFound",
-            "AlreadyProcessed",
-            "InsufficientFunds",
-            "AccountInUse",
-            "TooManyAccountLocks",
-            "BlockheightExceeded",
-        ];
-        
-        retryable_errors.iter().any(|&e| error_msg.contains(e))
-    }
-
-    pub async fn get_dynamic_priority_fee_for_slot(
+    pub async fn optimize_for_latency(
         &self,
-        target_slot: u64,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let history = self.metrics_history.read().unwrap();
+        target_latency_ms: u64,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(fh) = self.fee_ring.read().merge_recent(3) {
+            let p50_fee = fh.value_at_quantile(0.50);
+            let p90_fee = fh.value_at_quantile(0.90);
+            let tight = (50.0 / target_latency_ms as f64).clamp(0.0, 1.0);
+            let fee = (p50_fee as f64 * (1.0 - tight) + p90_fee as f64 * tight) as u64;
+            return Ok((MAX_COMPUTE_UNITS, fee));
+        }
+        // Fallback to aggressive bid if histograms are not warmed
+        self.get_aggressive_bid(0.9).await
+    }
+
+    pub fn build_compute_budget_instructions(
+        &self,
+        compute_units: u32,
+        priority_fee: u64,
+    ) -> Vec<Instruction> {
+        vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(compute_units),
+            ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        ]
+    }
+
+    #[inline(always)]
+    fn parse_cbix(data: &[u8]) -> Option<(Option<u64>, Option<u32>)> {
+        match data.first().copied() {
+            Some(2) if data.len() >= 5 => {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&data[1..5]);
+                Some((None, Some(u32::from_le_bytes(buf))))
+            }
+            Some(3) if data.len() >= 9 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[1..9]);
+                Some((Some(u64::from_le_bytes(buf)), None))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_competitor_cbix(&self, msg: &VersionedMessage) -> (Option<u64>, Option<u32>) {
+        let prog = compute_budget_program_id();
+        match msg {
+            VersionedMessage::Legacy(m) => {
+                let pids = m.program_ids();
+                let mut price = None;
+                let mut limit = None;
+                for ix in &m.instructions {
+                    let pid = pids[ix.program_id_index as usize];
+                    if pid == prog {
+                        if let Some((p, l)) = Self::parse_cbix(&ix.data) {
+                            if price.is_none() { price = p; }
+                            if limit.is_none() { limit = l; }
+                        }
+                    }
+                }
+                (price, limit)
+            }
+            VersionedMessage::V0(m) => {
+                let pids = m.program_ids();
+                let mut price = None;
+                let mut limit = None;
+                for ix in &m.instructions {
+                    let pid = pids[ix.program_id_index as usize];
+                    if pid == prog {
+                        if let Some((p, l)) = Self::parse_cbix(&ix.data) {
+                            if price.is_none() { price = p; }
+                            if limit.is_none() { limit = l; }
+                        }
+                    }
+                }
+                (price, limit)
+            }
+        }
+    }
+
+    pub async fn analyze_competitor_transaction(
+        &self,
+        tx_signature: &Signature,
+        competitor_pubkey: &Pubkey,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tx = self.rpc_client.get_transaction(
+            tx_signature,
+            solana_transaction_status::UiTransactionEncoding::Base64,
+        )?;
+        if let Some(versioned) = tx.transaction.transaction.decode() {
+            let (price_opt, _limit_opt) = self.extract_competitor_cbix(&versioned.message);
+            if let Some(priority_fee) = price_opt {
+                let mut ns = self.network_state.write();
+                ns.competitor_activity
+                    .entry(*competitor_pubkey)
+                    .or_insert_with(|| SmallVec::new())
+                    .push(priority_fee);
+                if let Some(fees) = ns.competitor_activity.get_mut(competitor_pubkey) {
+                    if fees.len() > 32 { fees.drain(..fees.len() - 32); }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn competitor_fee_quantile(&self, q: f64) -> Option<u64> {
+        let ns = self.network_state.read();
+        let mut v: Vec<u64> = Vec::with_capacity(ns.competitor_activity.len() * 16);
+        for fees in ns.competitor_activity.values() {
+            v.extend(fees.iter().copied());
+        }
+        if v.is_empty() { return None; }
+        v.sort_unstable();
+        let idx = ((v.len() as f64 * q).floor() as usize).min(v.len() - 1);
+        Some(v[idx])
+    }
+
+    pub async fn get_dynamic_bid_with_retry(
+        &self,
+        transaction: &Transaction,
+        urgency_factor: f64,
+        retry_count: u8,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let base_result = self.calculate_optimal_compute_units(transaction, urgency_factor).await?;
         
-        let slot_window = 5;
-        let relevant_metrics: Vec<_> = history.iter()
-            .filter(|m| m.slot >= target_slot.saturating_sub(slot_window) && m.slot <= target_slot)
-            .collect();
-        
-        if relevant_metrics.is_empty() {
-            return Ok(self.network_stats.read().unwrap().avg_priority_fee);
+        if retry_count == 0 {
+            return Ok(base_result);
         }
         
-        let successful_fees: Vec<u64> = relevant_metrics.iter()
+        let retry_multiplier = EXPONENTIAL_BACKOFF_BASE.powi(retry_count.min(MAX_RETRIES) as i32);
+        let adjusted_fee = (base_result.1 as f64 * retry_multiplier) as u64;
+        
+        let strategy = self.strategy.read();
+        let final_fee = adjusted_fee.min(strategy.max_budget);
+        
+        Ok((base_result.0, final_fee))
+    }
+
+    pub fn get_current_network_metrics(&self) -> NetworkMetrics {
+        let network_state = self.network_state.read();
+        let history = self.metrics_history.read();
+        
+        let recent_fees = history.iter()
+            .rev()
+            .take(10)
+            .map(|m| m.priority_fee)
+            .collect::<Vec<_>>();
+        
+        let avg_fee = if !recent_fees.is_empty() {
+            recent_fees.iter().sum::<u64>() / recent_fees.len() as u64
+        } else {
+            BASE_PRIORITY_FEE
+        };
+        
+        NetworkMetrics {
+            current_slot: network_state.current_slot,
+            congestion_score: network_state.congestion_score,
+            average_priority_fee: avg_fee,
+            success_rate: self.calculate_recent_success_rate(),
+            competitor_count: network_state.competitor_activity.len(),
+        }
+    }
+
+    pub async fn emergency_bid(&self) -> (u32, u64) {
+        let strategy = self.strategy.read();
+        (MAX_COMPUTE_UNITS, strategy.max_budget)
+    }
+
+    pub async fn update_strategy_parameters(
+        &self,
+        aggression_factor: Option<f64>,
+        max_budget: Option<u64>,
+        congestion_multiplier: Option<f64>,
+    ) {
+        let mut strategy = self.strategy.write();
+        
+        if let Some(factor) = aggression_factor {
+            strategy.aggression_factor = factor.max(0.5).min(3.0);
+        }
+        
+        if let Some(budget) = max_budget {
+            strategy.max_budget = budget.min(MAX_PRIORITY_FEE);
+        }
+        
+        if let Some(multiplier) = congestion_multiplier {
+            strategy.congestion_multiplier = multiplier.max(1.0).min(5.0);
+        }
+    }
+
+    pub async fn get_slot_synchronized_bid(
+        &self,
+        slot_offset: u64,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let current_slot = self.rpc_client.get_slot()?;
+        let target_slot = current_slot + slot_offset;
+        
+        let slot_urgency = 1.0 + (slot_offset as f64 / 10.0);
+        let network_state = self.network_state.read();
+        
+        let base_fee = if !network_state.average_priority_fees.is_empty() {
+            let recent_avg = network_state.average_priority_fees.iter()
+                .rev()
+                .take(5)
+                .sum::<u64>() / 5.min(network_state.average_priority_fees.len()) as u64;
+            recent_avg
+        } else {
+            BASE_PRIORITY_FEE * 2
+        };
+        
+        let synchronized_fee = (base_fee as f64 * slot_urgency) as u64;
+        
+        Ok((MAX_COMPUTE_UNITS, synchronized_fee))
+    }
+
+    pub fn reset_adaptive_parameters(&self) {
+        if let Ok(mut params) = self.adaptive_params.try_lock() {
+            params.learning_rate = 0.1;
+            params.exploration_rate = 0.05;
+            params.momentum = 0.9;
+            params.performance_window.clear();
+            params.last_adjustment = Instant::now();
+        }
+    }
+
+    pub async fn get_statistical_bid(
+        &self,
+        confidence_level: f64,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let history = self.metrics_history.read();
+        if history.len() < MIN_SAMPLE_SIZE {
+            return self.get_conservative_bid().await;
+        }
+        
+        let successful_fees: Vec<u64> = history.iter()
             .filter(|m| m.success)
             .map(|m| m.priority_fee)
             .collect();
         
         if successful_fees.is_empty() {
-            let all_fees: Vec<u64> = relevant_metrics.iter()
-                .map(|m| m.priority_fee)
-                .collect();
-            Ok(self.calculate_percentile_fee(&all_fees, 0.9))
-        } else {
-            Ok(self.calculate_percentile_fee(&successful_fees, PRIORITY_FEE_PERCENTILE))
+            return self.get_aggressive_bid(0.9).await;
         }
+        
+        let mean = successful_fees.iter().sum::<u64>() as f64 / successful_fees.len() as f64;
+        let variance = successful_fees.iter()
+            .map(|&fee| {
+                let diff = fee as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>() / successful_fees.len() as f64;
+        
+        let std_dev = variance.sqrt();
+        let z_score = match (confidence_level * 100.0) as u32 {
+            90 => 1.645,
+            95 => 1.96,
+            99 => 2.576,
+            _ => 1.96,
+        };
+        
+        let statistical_fee = (mean + z_score * std_dev) as u64;
+        let strategy = self.strategy.read();
+        
+        Ok((MAX_COMPUTE_UNITS, statistical_fee.min(strategy.max_budget)))
     }
 
-    pub fn get_optimization_metrics(&self) -> OptimizationMetrics {
-        let history = self.metrics_history.read().unwrap();
-        let network_stats = self.network_stats.read().unwrap();
+    pub fn prune_old_metrics(&self) {
+        let mut history = self.metrics_history.write();
+        let cutoff_ns = now_ns().saturating_sub(300_000_000_000);
         
-        let recent_metrics: Vec<_> = history.iter()
-            .filter(|m| m.timestamp.elapsed().as_secs() < 300)
-            .collect();
+        history.retain(|metric| metric.timestamp_ns > cutoff_ns);
         
-        let total_attempts = recent_metrics.len();
-        let successful_attempts = recent_metrics.iter().filter(|m| m.success).count();
-        let success_rate = if total_attempts > 0 {
-            successful_attempts as f64 / total_attempts as f64
+        let current_slot = if let Ok(slot) = self.rpc_client.get_slot() {
+            slot
         } else {
-            0.0
+            return;
         };
         
-        let avg_compute_units = if !recent_metrics.is_empty() {
-            recent_metrics.iter().map(|m| m.compute_units_consumed).sum::<u32>() / recent_metrics.len() as u32
-        } else {
-            DEFAULT_COMPUTE_UNITS
+        let slot_cutoff = current_slot.saturating_sub(500);
+        self.performance_cache.retain(|&slot, _| slot > slot_cutoff);
+    }
+
+    // ... (rest of the code remains the same)
+        &self,
+        spread_bps: u64,
+        volume: u64,
+    ) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let volume_tier = match volume {
+            0..=1_000_000_000 => 1.0,
+            1_000_000_001..=10_000_000_000 => 1.2,
+            10_000_000_001..=100_000_000_000 => 1.5,
+            _ => 2.0,
         };
         
-        let avg_priority_fee = if !recent_metrics.is_empty() {
-            recent_metrics.iter().map(|m| m.priority_fee).sum::<u64>() / recent_metrics.len() as u64
+        let spread_multiplier = (spread_bps as f64 / 100.0).sqrt();
+        let network_state = self.network_state.read();
+        
+        let base_fee = self.get_dynamic_base_fee(&network_state, &self.strategy.read());
+        let market_maker_fee = (base_fee as f64 * volume_tier * spread_multiplier) as u64;
+        
+        let compute_units = if spread_bps < 50 {
+            MAX_COMPUTE_UNITS
         } else {
-            MIN_PRIORITY_FEE_LAMPORTS
+            (MAX_COMPUTE_UNITS as f64 * 0.9) as u32
         };
         
-        OptimizationMetrics {
-            success_rate,
-            avg_compute_units,
-            avg_priority_fee,
-            congestion_level: network_stats.congestion_level,
-            total_attempts: total_attempts as u64,
-            successful_attempts: successful_attempts as u64,
+        Ok((compute_units, market_maker_fee))
+    }
+
+    pub fn get_health_status(&self) -> EngineHealth {
+        let history = self.metrics_history.read();
+        let network_state = self.network_state.read();
+        
+        let recent_success_rate = self.calculate_recent_success_rate();
+        let data_freshness = network_state.last_update.elapsed() < Duration::from_secs(10);
+        let sufficient_data = history.len() >= MIN_SAMPLE_SIZE;
+        
+        let health_score = (recent_success_rate * 0.5) + 
+                          (if data_freshness { 0.3 } else { 0.0 }) +
+                          (if sufficient_data { 0.2 } else { 0.0 });
+        
+        EngineHealth {
+            is_healthy: health_score > 0.6,
+            success_rate: recent_success_rate,
+            data_points: history.len(),
+            last_update: network_state.last_update,
+            health_score,
         }
-    }
-
-    pub async fn emergency_mode_fee(&self) -> u64 {
-        let network_stats = self.network_stats.read().unwrap();
-        let base_emergency_fee = network_stats.avg_priority_fee * 3;
-        
-        base_emergency_fee.min(MAX_PRIORITY_FEE_LAMPORTS)
-    }
-
-    pub fn clear_old_metrics(&self) {
-        let mut history = self.metrics_history.write().unwrap();
-        let cutoff_time = Instant::now() - Duration::from_secs(3600);
-        
-        history.retain(|m| m.timestamp > cutoff_time);
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct OptimizationMetrics {
+pub struct EngineHealth {
+    pub is_healthy: bool,
     pub success_rate: f64,
-    pub avg_compute_units: u32,
-    pub avg_priority_fee: u64,
-    pub congestion_level: f64,
-    pub total_attempts: u64,
-    pub successful_attempts: u64,
-}
-
-impl ComputeUnitOptimizer {
-    pub async fn adaptive_compute_unit_adjustment(
-        &self,
-        base_units: u32,
-        program_id: &Pubkey,
-    ) -> u32 {
-        let program_str = program_id.to_string();
-        let complexity_map = self.instruction_complexity_map.read().unwrap();
-        
-        let historical_avg = complexity_map.get(&program_str).copied().unwrap_or(base_units);
-        let network_stats = self.network_stats.read().unwrap();
-        
-        let adjustment_factor = match network_stats.congestion_level {
-            c if c > 0.9 => 1.3,
-            c if c > 0.7 => 1.15,
-            c if c < 0.3 => 0.9,
-            _ => 1.0,
-        };
-        
-        let adjusted = (historical_avg as f64 * adjustment_factor) as u32;
-        adjusted.clamp(MIN_COMPUTE_UNITS, MAX_COMPUTE_UNITS)
-    }
-
-    pub fn get_slot_based_multiplier(&self, current_slot: u64) -> f64 {
-        let slot_in_epoch = current_slot % 432_000;
-        let epoch_progress = slot_in_epoch as f64 / 432_000.0;
-        
-        if epoch_progress < 0.1 || epoch_progress > 0.9 {
-            1.2
-        } else {
-            1.0
-        }
-    }
+    pub data_points: usize,
+    pub last_update: Instant,
+    pub health_score: f64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::commitment_config::CommitmentConfig;
 
-    #[test]
-    fn test_outlier_removal() {
-        let optimizer = ComputeUnitOptimizer::new(
-            Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string())),
-            OptimizationConfig::default()
-        );
+    #[tokio::test]
+    async fn test_compute_unit_bounds() {
+        let rpc = Arc::new(RpcClient::new_with_commitment(
+            "https://api.mainnet-beta.solana.com".to_string(),
+            CommitmentConfig::confirmed(),
+        ));
+        let engine = ComputeUnitAuctionEngine::new(rpc);
         
-        let values = vec![100, 105, 110, 1000, 115, 120];
-        let filtered = optimizer.remove_outliers(&values);
-        assert!(!filtered.contains(&1000));
-    }
-
-    #[test]
-    fn test_congestion_score_calculation() {
-        let optimizer = ComputeUnitOptimizer::new(
-            Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string())),
-            OptimizationConfig::default()
-        );
-        
-        let score = optimizer.calculate_congestion_score();
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!(engine.validate_compute_budget(MIN_COMPUTE_UNITS, BASE_PRIORITY_FEE));
+        assert!(engine.validate_compute_budget(MAX_COMPUTE_UNITS, MAX_PRIORITY_FEE));
+        assert!(!engine.validate_compute_budget(MAX_COMPUTE_UNITS + 1, BASE_PRIORITY_FEE));
+        assert!(!engine.validate_compute_budget(MIN_COMPUTE_UNITS, MAX_PRIORITY_FEE + 1));
     }
 }
+
