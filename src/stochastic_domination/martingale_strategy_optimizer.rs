@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::{Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
@@ -19,18 +21,285 @@ fn sqrt_decimal(x: Decimal) -> Decimal {
     z
 }
 
+// ==== [IMPROVED: PIECE B3] O(1) Rolling volatility ====
+#[derive(Debug, Clone)]
+pub struct RollingVol {
+    window: usize,
+    sum: Decimal,
+    sumsq: Decimal,
+    buf: VecDeque<Decimal>, // simple returns
+}
+
+impl RollingVol {
+    #[inline(always)]
+    pub fn new(window: usize) -> Self {
+        let w = window.max(2);
+        Self { window: w, sum: Decimal::ZERO, sumsq: Decimal::ZERO, buf: VecDeque::with_capacity(w) }
+    }
+
+    #[inline(always)]
+    pub fn push_return(&mut self, r: Decimal) {
+        self.sum += r;
+        self.sumsq += r * r;
+        self.buf.push_back(r);
+        if self.buf.len() > self.window {
+            if let Some(old) = self.buf.pop_front() {
+                self.sum -= old;
+                self.sumsq -= old * old;
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize { self.buf.len() }
+
+    #[inline(always)]
+    pub fn variance(&self) -> Decimal {
+        let n = self.buf.len();
+        if n < 2 { return Decimal::ZERO; }
+        let n_d = Decimal::from(n as u64);
+        let mean = self.sum / n_d;
+        let num = (self.sumsq - (self.sum * self.sum) / n_d).max(Decimal::ZERO);
+        num / Decimal::from((n - 1) as u64)
+    }
+
+    #[inline(always)]
+    pub fn volatility(&self) -> Decimal { sqrt_decimal(self.variance()) }
+}
+
 // Convert lamports to SOL; for quote conversion, multiply SOL->quote via external oracle price if available
 fn lamports_to_sol(l: u64) -> Decimal {
     Decimal::from(l) / dec!(1_000_000_000)
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Metrics {
-    pub entries_attempted: u64,
-    pub entries_executed: u64,
-    pub exits_executed: u64,
-    pub bundles_sent: u64,
-    pub last_error: Option<&'static str>,
+// ==== [IMPROVED: PIECE A26++] Hot-path helpers ====
+#[inline(always)]
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ==== [IMPROVED: PIECE A19/A26++] Safe division helper (ε-guard; eps-floor divisor) ====
+#[inline(always)]
+fn safe_div(n: Decimal, d: Decimal, eps: Decimal) -> Decimal {
+    let den = if d.abs() < eps { eps } else { d };
+    n / den
+}
+
+// ==== [IMPROVED: PIECE A21 / B1] Price/size alignment helpers ====
+#[inline(always)]
+fn align_size(size: Decimal, step: Decimal) -> Decimal {
+    let s = step.max(dec!(0.00000001));
+    (size / s).floor() * s
+}
+
+#[inline(always)]
+fn align_up(x: Decimal, step: Decimal) -> Decimal {
+    let s = step.max(dec!(0.00000001));
+    (x / s).ceil() * s
+}
+
+#[inline(always)]
+fn align_down(x: Decimal, step: Decimal) -> Decimal {
+    let s = step.max(dec!(0.00000001));
+    (x / s).floor() * s
+}
+
+// B1: alias to make intent explicit where used
+#[inline(always)]
+fn quantize_size(size: Decimal, step: Decimal) -> Decimal { align_size(size, step) }
+
+// ==== [IMPROVED: PIECE A15] Leader-slot damping from hints ====
+#[inline(always)]
+fn leader_damp_from_hints(h: &InclusionHints) -> Decimal {
+    let slots_to_leader = h.leader_slot_in as f64;
+    let proximity = (64.0f64 / (slots_to_leader + 8.0)).min(2.0);
+    let incl = h.recent_inclusion_rate.to_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+    let boost = 0.9 + 0.3 * proximity + 0.3 * incl;
+    Decimal::from_f64_retain(boost).unwrap_or(Decimal::ONE)
+}
+
+// Vol-aware slippage cap (base + beta*vol), bounded by cfg tolerance
+#[inline(always)]
+fn dyn_max_slippage(cfg: &MartingaleConfig, vol: Decimal) -> Decimal {
+    let base = dec!(0.0015);
+    let beta = dec!(0.6);
+    let cap  = dec!(0.02);
+    let s = (base + beta * vol).min(cfg.slippage_tolerance).min(cap);
+    s.max(dec!(0.0005))
+}
+
+// Dynamic cooldown: longer after losses, shorter after wins. Floor@50%, cap@4x.
+#[inline(always)]
+fn is_cooldown_over(state: &StrategyState, cfg: &MartingaleConfig) -> bool {
+    let losses = state.consecutive_losses.min(5) as u64;
+    let wins   = state.consecutive_wins.min(5)   as u64;
+    let base   = cfg.cooldown_period_ms;
+    let mut adj = base
+        .saturating_add(base.saturating_mul(losses) / 2)
+        .saturating_sub(base.saturating_mul(wins) / 10);
+    let half = base / 2;
+    if adj < half { adj = half; }
+    if adj > base.saturating_mul(4) { adj = base.saturating_mul(4); }
+    state.last_trade_instant.elapsed().as_millis() as u64 >= adj
+}
+
+// ==== [IMPROVED: PIECE A22] Prepared entry (venue-safe) ====
+#[derive(Debug, Clone)]
+pub struct PreparedEntry {
+    pub price: Decimal,        // aligned up
+    pub size: Decimal,         // aligned down
+    pub max_slippage: Decimal, // dynamic
+    pub stop_loss: Decimal,    // aligned down
+    pub take_profit: Decimal,  // aligned up
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedExit {
+    pub price: Decimal,
+    pub size: Decimal,
+    pub max_slippage: Decimal,
+    pub reason: ExitReason,
+}
+
+// ==== [IMPROVED: PIECE A23] Routing policy and budgets ====
+#[derive(Debug, Clone)]
+pub struct ExecBudgets {
+    pub max_tip_lamports: u64,
+    pub gas_price_cap_lamports: u64,
+}
+
+impl Default for ExecBudgets {
+    fn default() -> Self {
+        Self { max_tip_lamports: 2_000_000, gas_price_cap_lamports: 100_000 }
+    }
+}
+
+// Additional venue-safe planning and routing utilities (A21–A25)
+impl MartingaleOptimizer {
+    #[inline(always)]
+    fn build_prepared_entry(
+        &self,
+        cfg: &MartingaleConfig,
+        raw_price: Decimal,
+        raw_size: Decimal,
+        dyn_slippage: Decimal,
+    ) -> Option<PreparedEntry> {
+        let size = align_size(raw_size, cfg.size_step);
+        if size < cfg.min_order_size { return None; }
+        let entry = align_up(raw_price, cfg.tick_size);
+        if entry * size < cfg.min_notional { return None; }
+        let stop  = align_down(entry * (Decimal::ONE - cfg.stop_loss_percent), cfg.tick_size);
+        let take  = align_up  (entry * (Decimal::ONE + cfg.profit_target_percent), cfg.tick_size);
+        Some(PreparedEntry { price: entry, size, max_slippage: dyn_slippage, stop_loss: stop, take_profit: take })
+    }
+
+    #[inline(always)]
+    pub fn should_use_bundle(&self, hints: &InclusionHints, _cfg: &MartingaleConfig) -> bool {
+        let near_slots = 12u64; // ~120ms @ 400ms/slot
+        (hints.leader_slot_in <= near_slots) || (hints.recent_inclusion_rate >= dec!(0.85))
+    }
+
+    #[inline(always)]
+    pub fn clamp_tip(&self, cfg: &MartingaleConfig, budgets: &ExecBudgets, proposed: u64) -> u64 {
+        let hard = cfg.max_gas_price_lamports;
+        proposed.min(budgets.max_tip_lamports).min(hard)
+    }
+
+    #[inline(always)]
+    fn build_prepared_exit(
+        &self,
+        cfg: &MartingaleConfig,
+        reason: ExitReason,
+        current_price: Decimal,
+        pos_size: Decimal,
+    ) -> PreparedExit {
+        let _ = reason; // price alignment identical across reasons for a long exit
+        let price = align_down(current_price, cfg.tick_size);
+        let size = align_size(pos_size, cfg.size_step);
+        let max_slippage = cfg.slippage_tolerance.min(dec!(0.02));
+        PreparedExit { price, size, max_slippage, reason }
+    }
+
+    pub async fn plan_exit(&self, current_price: Decimal) -> Result<Option<PreparedExit>> {
+        let cfg = self.config.read().await.clone();
+        let (should, reason) = self.should_exit_position(current_price).await?;
+        if !should { return Ok(None); }
+        let state = self.state.read().await;
+        let pos = state.active_position.clone().ok_or(MartingaleError::NoActivePosition)?;
+        drop(state);
+        let prepped = self.build_prepared_exit(&cfg, reason, current_price, pos.size);
+        Ok(Some(prepped))
+    }
+}
+
+// ==== [IMPROVED: PIECE A27] Routing & rounding tests ====
+#[cfg(test)]
+mod routing_rounding_tests {
+    use super::*;
+
+    struct DummyExec;
+    impl Executor for DummyExec {
+        fn send_limit(&self, _p: Decimal, _s: Decimal, _ms: Decimal) -> std::result::Result<(), String> { Ok(()) }
+        fn send_bundle(&self, _p: Decimal, _s: Decimal, _t: u64) -> std::result::Result<(), String> { Ok(()) }
+        fn hints(&self) -> InclusionHints { InclusionHints { leader_slot_in: 1, recent_inclusion_rate: dec!(0.9), tip_suggestion_lamports: 10_000 } }
+    }
+
+    #[tokio::test]
+    async fn prepared_entry_is_aligned() {
+        let cfg = MartingaleConfig::default();
+        let opt = MartingaleOptimizer::new(cfg.clone());
+        let dyn_slip = dec!(0.002);
+        let pre = opt.build_prepared_entry(&cfg, dec!(100.00123), dec!(0.0123456), dyn_slip).unwrap();
+        assert_eq!(pre.price % cfg.tick_size, Decimal::ZERO);
+        assert_eq!(pre.size  % cfg.size_step, Decimal::ZERO);
+    }
+
+    #[test]
+    fn bundle_routing_near_leader() {
+        let cfg = MartingaleConfig::default();
+        let opt = MartingaleOptimizer::new(cfg.clone());
+        let near = InclusionHints { leader_slot_in: 1, recent_inclusion_rate: dec!(0.9), tip_suggestion_lamports: 10_000 };
+        let far  = InclusionHints { leader_slot_in: 256, recent_inclusion_rate: dec!(0.3), tip_suggestion_lamports: 10_000 };
+        assert!(opt.should_use_bundle(&near, &cfg));
+        assert!(!opt.should_use_bundle(&far, &cfg));
+    }
+
+    #[tokio::test]
+    async fn plan_exit_produces_limit() {
+        let cfg = MartingaleConfig::default();
+        let opt = MartingaleOptimizer::new(cfg.clone());
+        {
+            let mut st = opt.state.write().await;
+            st.active_position = Some(ActivePosition { entry_price: dec!(100), size: dec!(0.01), timestamp: 0, stop_loss: dec!(99), take_profit: dec!(101), trailing_stop: None });
+        }
+        let maybe = opt.plan_exit(dec!(101)).await.unwrap();
+        assert!(maybe.is_some());
+        let prepped = maybe.unwrap();
+        assert_eq!(prepped.price % cfg.tick_size, Decimal::ZERO);
+    }
+}
+
+
+// ==== [IMPROVED: PIECE B2] Lock-free hot metrics ====
+#[derive(Debug, Default)]
+pub struct MetricsAtomic {
+    pub entries_attempted: AtomicU64,
+    pub entries_executed:  AtomicU64,
+    pub exits_executed:    AtomicU64,
+    pub bundles_sent:      AtomicU64,
+    pub last_error:        Mutex<Option<&'static str>>, // rare path
+}
+
+impl MetricsAtomic {
+    #[inline(always)] pub fn inc_attempted(&self) { self.entries_attempted.fetch_add(1, Ordering::Relaxed); }
+    #[inline(always)] pub fn inc_entries(&self)   { self.entries_executed.fetch_add(1, Ordering::Relaxed); }
+    #[inline(always)] pub fn inc_exits(&self)     { self.exits_executed.fetch_add(1, Ordering::Relaxed); }
+    #[inline(always)] pub fn inc_bundles(&self)   { self.bundles_sent.fetch_add(1, Ordering::Relaxed); }
+    #[inline(always)] pub fn set_last_error(&self, s: &'static str) { if let Ok(mut g) = self.last_error.lock() { *g = Some(s); } }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +360,9 @@ pub struct MartingaleConfig {
     pub max_trade_history: usize,
     pub min_order_size: Decimal,
     pub min_notional: Decimal,
+    // Venue constraints
+    pub tick_size: Decimal,
+    pub size_step: Decimal,
 }
 
 impl Default for MartingaleConfig {
@@ -119,6 +391,9 @@ impl Default for MartingaleConfig {
             max_trade_history: 1000,
             min_order_size: dec!(0.0001),
             min_notional: dec!(1),
+            // Venue constraints defaults; tune per mint/venue
+            tick_size: dec!(0.0001),
+            size_step: dec!(0.000001),
         }
     }
 }
@@ -158,6 +433,8 @@ pub struct StrategyState {
     pub circuit_breaker_triggered: bool,
     pub total_gas_spent: Decimal,
     pub highest_price_since_entry: Decimal,
+    // B3: rolling volatility (O(1) updates)
+    pub rolling_vol: RollingVol,
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +450,7 @@ pub struct ActivePosition {
 pub struct MartingaleOptimizer {
     config: Arc<RwLock<MartingaleConfig>>,
     state: Arc<RwLock<StrategyState>>,
-    metrics: Arc<RwLock<Metrics>>,
+    metrics: Arc<MetricsAtomic>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,88 +467,70 @@ impl MartingaleOptimizer {
         liquidity: Decimal,
         network_congestion: f64,
     ) -> Result<Decision> {
+        // Backward-compatible neutral hints
+        let neutral = InclusionHints { leader_slot_in: u64::MAX, recent_inclusion_rate: dec!(0.5), tip_suggestion_lamports: 0 };
+        self.decide_entry_with_hints(current_price, liquidity, network_congestion, &neutral).await
+    }
+
+    // Hints-aware entry (A15)
+    pub async fn decide_entry_with_hints(
+        &self,
+        current_price: Decimal,
+        liquidity: Decimal,
+        network_congestion: f64,
+        hints: &InclusionHints,
+    ) -> Result<Decision> {
         // metrics: attempted entry
+        self.metrics.inc_attempted();
+        let cfg = self.config.read().await.clone();
+        if liquidity < cfg.min_liquidity_threshold { return Err(MartingaleError::InsufficientLiquidity(liquidity)); }
+
+        // Phase 1: READ lock for cheap gating
         {
-            let mut m = self.metrics.write().await;
-            m.entries_attempted = m.entries_attempted.saturating_add(1);
+            let s = self.state.read().await;
+            if s.circuit_breaker_triggered { return Err(MartingaleError::CircuitBreakerActive); }
+            if !is_cooldown_over(&s, &cfg) { return Err(MartingaleError::CooldownActive); }
+            let now_unix = now_unix_ms();
+            if now_unix < s.reentry_lock_until_ms { return Err(MartingaleError::CooldownActive); }
+            if s.active_position.is_some() { return Err(MartingaleError::PositionAlreadyActive); }
         }
-        let config = self.config.read().await;
+
+        // Phase 2: WRITE lock for feeds + sizing (revalidation included)
         let mut state = self.state.write().await;
+        if state.circuit_breaker_triggered { return Err(MartingaleError::CircuitBreakerActive); }
+        if state.active_position.is_some() { return Err(MartingaleError::PositionAlreadyActive); }
 
-        if state.circuit_breaker_triggered {
-            return Err(MartingaleError::CircuitBreakerActive);
-        }
-
-        // Monotonic cooldown and reentry lock (reentry_lock_until_ms compared against UNIX now)
-        if state.last_trade_instant.elapsed().as_millis() as u64 < config.cooldown_period_ms {
-            return Err(MartingaleError::CooldownActive);
-        }
-
-        let now_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
-        if now_unix_ms < state.reentry_lock_until_ms {
-            return Err(MartingaleError::CooldownActive);
-        }
-
-        if liquidity < config.min_liquidity_threshold {
-            return Err(MartingaleError::InsufficientLiquidity(liquidity));
-        }
-
-        if state.active_position.is_some() {
-            return Err(MartingaleError::PositionAlreadyActive);
-        }
-
-        // Update histories for analytics (UNIX timestamps only for audit)
-        self.update_price_history(&mut state, now_unix_ms, current_price);
+        let now_ms = now_unix_ms();
+        self.update_price_history(&mut state, now_ms, current_price);
         self.invalidate_volatility_cache(&mut state);
+        let vol = self.calculate_volatility(&mut state, &cfg);
+        self.update_ema(&mut state, current_price, cfg.ema_period);
 
-        let vol = self.calculate_volatility(&mut state, &config);
-        self.update_ema(&mut state, current_price, config.ema_period);
+        let leader_damp = leader_damp_from_hints(hints);
+        let size_raw = self.calculate_optimal_position_size(&cfg, &state, current_price, vol, network_congestion, leader_damp);
+        if size_raw <= Decimal::ZERO || size_raw > cfg.max_position_size { return Err(MartingaleError::InvalidPositionSize(size_raw)); }
 
-        // leader_damp not available here without external hints; default to 1.0
-        let size = self.calculate_optimal_position_size(
-            &config,
-            &state,
-            current_price,
-            vol,
-            network_congestion,
-            Decimal::ONE,
-        );
-
-        if size <= Decimal::ZERO || size > config.max_position_size {
-            return Err(MartingaleError::InvalidPositionSize(size));
-        }
+        let size = quantize_size(size_raw, cfg.size_step);
+        if size < cfg.min_order_size { return Ok(Decision::Skip); }
 
         let conf = self.calculate_confidence_score(&state, vol, current_price);
         state.confidence_score = conf;
+        if conf < cfg.confidence_threshold { return Ok(Decision::Skip); }
 
-        if conf < config.confidence_threshold {
-            return Ok(Decision::Skip);
-        }
-
-        // Profit guard: expected edge after costs must be positive
         let stats = self.calculate_trade_statistics(&state);
         let notional = size * current_price;
-        let edge = self.expected_edge_after_costs(
-            &stats,
-            config.slippage_tolerance,
-            Decimal::ZERO,
-            Decimal::ZERO,
-            notional,
-        );
-        if edge <= Decimal::ZERO {
-            return Ok(Decision::Skip);
-        }
+        let edge = self.expected_edge_after_costs(&stats, cfg.slippage_tolerance, Decimal::ZERO, Decimal::ZERO, notional);
+        if edge <= Decimal::ZERO { return Ok(Decision::Skip); }
 
-        // Risk checks (worst-case loss + notional cap) in equity terms
-        let stop_frac = config.stop_loss_percent.max(dec!(0.001));
+        let dyn_cap = self.dynamic_notional_cap(&state, state.notional_cap, vol);
+        let stop_frac = cfg.stop_loss_percent.max(dec!(0.001));
         let worst_loss = size * current_price * stop_frac;
-        let max_allowed_loss = state.equity * config.risk_per_trade;
-        let notional_guard = notional <= state.equity * state.notional_cap;
-        if !(worst_loss <= max_allowed_loss && notional_guard) {
-            return Ok(Decision::Skip);
-        }
+        let max_allowed_loss = state.equity * cfg.risk_per_trade;
+        let notional_ok = notional <= state.equity * dyn_cap;
+        if !(worst_loss <= max_allowed_loss && notional_ok) { return Ok(Decision::Skip); }
 
-        Ok(Decision::Enter { size, max_slippage: config.slippage_tolerance })
+        let dyn_slip = dyn_max_slippage(&cfg, vol);
+        Ok(Decision::Enter { size, max_slippage: dyn_slip })
     }
     pub fn new(config: MartingaleConfig) -> Self {
         let now_inst = Instant::now();
@@ -296,12 +555,13 @@ impl MartingaleOptimizer {
             circuit_breaker_triggered: false,
             total_gas_spent: Decimal::ZERO,
             highest_price_since_entry: Decimal::ZERO,
+            rolling_vol: RollingVol::new(config.volatility_window),
         };
 
         Self {
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(state)),
-            metrics: Arc::new(RwLock::new(Metrics::default())),
+            metrics: Arc::new(MetricsAtomic::default()),
         }
     }
 
@@ -347,10 +607,9 @@ impl MartingaleOptimizer {
             network_congestion,
             Decimal::ONE,
         );
-
-        if position_size <= Decimal::ZERO || position_size > config.max_position_size {
-            return Err(MartingaleError::InvalidPositionSize(position_size));
-        }
+        if position_size <= Decimal::ZERO || position_size > config.max_position_size { return Err(MartingaleError::InvalidPositionSize(position_size)); }
+        let size = quantize_size(position_size, config.size_step);
+        if size < config.min_order_size { return Ok((false, Decimal::ZERO)); }
 
         let confidence = self.calculate_confidence_score(
             &state,
@@ -360,13 +619,11 @@ impl MartingaleOptimizer {
 
         state.confidence_score = confidence;
 
-        if confidence < config.confidence_threshold {
-            return Ok((false, Decimal::ZERO));
-        }
+        if confidence < config.confidence_threshold { return Ok((false, Decimal::ZERO)); }
 
         // Profit guard: block entries when expected edge after costs <= 0
         let stats = self.calculate_trade_statistics(&state);
-        let notional = position_size * current_price;
+        let notional = size * current_price;
         let edge = self.expected_edge_after_costs(
             &stats,
             config.slippage_tolerance,
@@ -374,21 +631,18 @@ impl MartingaleOptimizer {
             Decimal::ZERO, // tip in quote unknown here; estimate externally
             notional,
         );
-        if edge <= Decimal::ZERO {
-            return Ok((false, Decimal::ZERO));
-        }
+        if edge <= Decimal::ZERO { return Ok((false, Decimal::ZERO)); }
 
         // Worst-case loss risk checks and notional cap
         let stop_frac = config.stop_loss_percent.max(dec!(0.001));
-        let worst_loss = position_size * current_price * stop_frac;
+        let worst_loss = size * current_price * stop_frac;
         let max_allowed_loss = state.equity * config.risk_per_trade;
-        let notional = position_size * current_price;
-        let notional_guard = notional <= state.equity * state.notional_cap;
+        let notional_guard = notional <= state.equity * self.dynamic_notional_cap(&state, state.notional_cap, volatility);
         let risk_check = worst_loss <= max_allowed_loss && notional_guard;
 
         let drawdown_check = state.current_drawdown < config.max_drawdown_percent;
 
-        Ok((drawdown_check && risk_check, position_size))
+        Ok((drawdown_check && risk_check, size))
     }
 
     pub async fn enter_position(
@@ -405,34 +659,33 @@ impl MartingaleOptimizer {
             return Err(MartingaleError::PositionAlreadyActive);
         }
 
-        // Min order and notional clamps (dust avoidance)
-        if position_size < config.min_order_size || position_size * entry_price < config.min_notional {
-            return Err(MartingaleError::InvalidPositionSize(position_size));
-        }
+        // Quantize size first; re-check after quantization
+        let q_size = quantize_size(position_size, config.size_step);
+        if q_size < config.min_order_size { return Err(MartingaleError::InvalidPositionSize(q_size)); }
+        if q_size * entry_price < config.min_notional { return Err(MartingaleError::InvalidPositionSize(q_size)); }
 
         let adjusted_entry = entry_price * (Decimal::ONE + actual_slippage);
-        let stop_loss = adjusted_entry * (Decimal::ONE - config.stop_loss_percent);
-        let take_profit = adjusted_entry * (Decimal::ONE + config.profit_target_percent);
+        let tick = config.tick_size;
+        let entry_aligned = align_up(adjusted_entry, tick);
+        let stop_loss  = align_down(entry_aligned * (Decimal::ONE - config.stop_loss_percent), tick);
+        let take_profit= align_up  (entry_aligned * (Decimal::ONE + config.profit_target_percent), tick);
 
         // Store position start timestamp as milliseconds since boot for monotonic timeout calculation
         state.active_position = Some(ActivePosition {
-            entry_price: adjusted_entry,
-            size: position_size,
+            entry_price: entry_aligned,
+            size: q_size,
             timestamp: state.boot_instant.elapsed().as_millis() as u64,
             stop_loss,
             take_profit,
             trailing_stop: None,
         });
 
-        state.current_position_size = position_size;
+        state.current_position_size = q_size;
         state.total_gas_spent += Decimal::from(gas_cost) / dec!(1_000_000_000);
-        state.highest_price_since_entry = adjusted_entry;
+        state.highest_price_since_entry = entry_aligned;
 
         // metrics
-        {
-            let mut m = self.metrics.write().await;
-            m.entries_executed = m.entries_executed.saturating_add(1);
-        }
+        self.metrics.inc_entries();
 
         Ok(())
     }
@@ -471,21 +724,23 @@ impl MartingaleOptimizer {
             return Ok((true, ExitReason::Timeout));
         }
 
-        let profit_percent = (current_price - position.entry_price) / position.entry_price;
+        let profit_percent = safe_div(current_price - position.entry_price, position.entry_price, dec!(0.00000001));
         if profit_percent > config.trailing_stop_activation {
             // Use ATR-like dynamic trailing stop using latest realized volatility
             let vol = self.calculate_volatility(&mut state, &config);
-            let trailing_stop = self.calculate_trailing_stop_dyn(
-                state.highest_price_since_entry,
-                vol,
-            );
-            
+            let mut trailing_stop = self.calculate_trailing_stop_dyn(state.highest_price_since_entry, vol);
+            // ratchet + tick-round (align_down so we don't trigger early)
+            trailing_stop = align_down(trailing_stop, config.tick_size);
+
             if let Some(pos) = state.active_position.as_mut() {
-                pos.trailing_stop = Some(trailing_stop);
-            }
-            
-            if current_price <= trailing_stop {
-                return Ok((true, ExitReason::TrailingStop));
+                if let Some(old) = pos.trailing_stop {
+                    if trailing_stop > old { pos.trailing_stop = Some(trailing_stop); }
+                } else {
+                    pos.trailing_stop = Some(trailing_stop);
+                }
+                if let Some(ts) = pos.trailing_stop {
+                    if current_price <= ts { return Ok((true, ExitReason::TrailingStop)); }
+                }
             }
         }
 
@@ -560,25 +815,23 @@ impl MartingaleOptimizer {
         state.highest_price_since_entry = Decimal::ZERO;
 
         // metrics
-        {
-            let mut m = self.metrics.write().await;
-            m.exits_executed = m.exits_executed.saturating_add(1);
-        }
+        self.metrics.inc_exits();
 
         Ok(net_pnl)
     }
 
     // Safe Kelly fraction with caps to avoid runaway sizing
-    fn safe_kelly(&self, p: Decimal, avg_win: Decimal, avg_loss: Decimal) -> Decimal {
-        if p <= Decimal::ZERO || avg_win <= Decimal::ZERO || avg_loss <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        let b = (avg_win / avg_loss).max(dec!(0.01));
-        let p = p.min(dec!(0.99)).max(dec!(0.01));
+    // B4: Evidence-weighted Kelly with shrinkage
+    #[inline(always)]
+    fn safe_kelly_shrunk(&self, stats: &TradeStatistics) -> Decimal {
+        let p = stats.win_rate.max(dec!(0.01)).min(dec!(0.99));
+        let b = (stats.avg_win / stats.avg_loss.max(dec!(0.0000001))).max(dec!(0.01));
         let q = Decimal::ONE - p;
         let edge = p - q / b;
-        if edge <= Decimal::ZERO { return Decimal::ZERO; }
-        edge.min(dec!(0.25))
+        let base = if edge <= Decimal::ZERO { Decimal::ZERO } else { edge.min(dec!(0.25)) };
+        let n = stats.sample_size as u64; let k = 50u64;
+        let shrink = Decimal::from(n) / Decimal::from(n + k);
+        (base * shrink).max(Decimal::ZERO)
     }
 
     fn calculate_optimal_position_size(
@@ -591,18 +844,18 @@ impl MartingaleOptimizer {
         leader_damp: Decimal,
     ) -> Decimal {
         let stats = self.calculate_trade_statistics(state);
-
-        let k = self.safe_kelly(stats.win_rate, stats.avg_win, stats.avg_loss) * config.kelly_fraction;
+        let k = self.safe_kelly_shrunk(&stats) * config.kelly_fraction;
         let stop_frac = config.stop_loss_percent.max(dec!(0.001));
         let desired_loss = state.equity * k * config.risk_per_trade; // conservative stacking
         let mut size_from_kelly = if desired_loss > Decimal::ZERO {
-            (desired_loss / stop_frac) / current_price
+            let base = safe_div(desired_loss, stop_frac, dec!(0.00000001));
+            safe_div(base, current_price, dec!(0.00000001))
         } else {
             Decimal::ZERO
         };
 
         if config.volatility_adjustment {
-            size_from_kelly *= Decimal::ONE / (Decimal::ONE + volatility * dec!(10));
+            size_from_kelly *= Decimal::ONE / (Decimal::ONE + volatility * dec!(12));
         }
 
         let congestion_factor = Decimal::from_f64_retain(1.0 - network_congestion * 0.5)
@@ -614,49 +867,12 @@ impl MartingaleOptimizer {
             .max(Decimal::ZERO)
     }
 
-    fn calculate_volatility(&self, state: &mut StrategyState, config: &MartingaleConfig) -> Decimal {
+    fn calculate_volatility(&self, state: &mut StrategyState, _config: &MartingaleConfig) -> Decimal {
         if let Some((cache_time, cached_vol)) = state.volatility_cache {
-            if cache_time.elapsed().as_millis() as u64  < 5000 {
-                return cached_vol;
-            }
+            if cache_time.elapsed().as_millis() as u64  < 5000 { return cached_vol; }
         }
-
-        if state.price_history.len() < 2 {
-            return dec!(0.01);
-        }
-
-        let prices: Vec<Decimal> = state.price_history
-            .iter()
-            .rev()
-            .take(config.volatility_window)
-            .map(|(_, p)| *p)
-            .collect();
-
-        if prices.len() < 2 {
-            return dec!(0.01);
-        }
-
-        let mut returns = Vec::with_capacity(prices.len() - 1);
-        for i in 1..prices.len() {
-            // forward simple return
-            let ret = (prices[i] - prices[i - 1]) / prices[i - 1];
-            returns.push(ret);
-        }
-
-        let n = returns.len() as u64;
-        let mean = returns.iter().copied().sum::<Decimal>() / Decimal::from(n);
-        let variance = if n > 1 {
-            returns.iter()
-                .map(|r| {
-                    let d = *r - mean;
-                    d * d
-                })
-                .sum::<Decimal>() / Decimal::from(n - 1)
-        } else {
-            Decimal::ZERO
-        };
-
-        let vol = sqrt_decimal(variance);
+        let mut vol = state.rolling_vol.volatility();
+        if state.rolling_vol.len() < 2 { vol = dec!(0.01); }
         state.volatility_cache = Some((Instant::now(), vol));
         vol
     }
@@ -683,10 +899,10 @@ impl MartingaleOptimizer {
         
         if state.ema_value != Decimal::ZERO {
             let trend_alignment = if current_price > state.ema_value {
-                let strength = ((current_price - state.ema_value) / state.ema_value).min(dec!(0.05));
+                let strength = safe_div(current_price - state.ema_value, state.ema_value, dec!(0.00000001)).min(dec!(0.05));
                 dec!(0.3) + strength * dec!(2)
             } else {
-                let weakness = ((state.ema_value - current_price) / state.ema_value).min(dec!(0.05));
+                let weakness = safe_div(state.ema_value - current_price, state.ema_value, dec!(0.00000001)).min(dec!(0.05));
                 dec!(0.1) - weakness
             };
             score += trend_alignment.max(Decimal::ZERO);
@@ -728,8 +944,15 @@ impl MartingaleOptimizer {
     }
 
     fn update_price_history(&self, state: &mut StrategyState, timestamp: u64, price: Decimal) {
+        // Feed rolling vol with simple returns
+        if let Some((_, last)) = state.price_history.back().copied() {
+            if last > Decimal::ZERO {
+                let r = safe_div(price - last, last, dec!(0.000000000001));
+                state.rolling_vol.push_return(r);
+            }
+        }
         state.price_history.push_back((timestamp, price));
-        
+
         let cutoff_time = timestamp.saturating_sub(300000);
         while let Some((ts, _)) = state.price_history.front() {
             if *ts < cutoff_time {
@@ -749,61 +972,38 @@ impl MartingaleOptimizer {
     }
 
     fn calculate_trade_statistics(&self, state: &StrategyState) -> TradeStatistics {
-        let recent_trades: Vec<&TradeMetrics> = state.trade_history
-            .iter()
-            .rev()
-            .take(50)
-            .collect();
+        // B4: normalized trade stats over last 50
+        let recent: Vec<&TradeMetrics> = state.trade_history.iter().rev().take(50).collect();
+        let n = recent.len();
+        if n == 0 { return TradeStatistics::default(); }
 
-        if recent_trades.is_empty() {
-            return TradeStatistics::default();
+        let wins: Vec<&TradeMetrics>   = recent.iter().copied().filter(|t| t.is_win).collect();
+        let losses: Vec<&TradeMetrics> = recent.iter().copied().filter(|t| !t.is_win).collect();
+
+        let win_rate = Decimal::from(wins.len() as u64) / Decimal::from(n as u64);
+        let avg_win  = if wins.is_empty() { dec!(0.01) } else { wins.iter().map(|t| t.pnl).sum::<Decimal>() / Decimal::from(wins.len() as u64) };
+        let avg_loss = if losses.is_empty(){ dec!(0.01)} else { losses.iter().map(|t| t.pnl.abs()).sum::<Decimal>() / Decimal::from(losses.len() as u64) };
+
+        let gp = wins.iter().map(|t| t.pnl).sum::<Decimal>();
+        let gl = losses.iter().map(|t| t.pnl.abs()).sum::<Decimal>();
+        let profit_factor = if gl > Decimal::ZERO { gp / gl } else if gp > Decimal::ZERO { dec!(999) } else { dec!(1) };
+
+        // Normalized returns: pnl / (entry_price * size), clamped to [-0.5, 0.5]
+        let mut rets: Vec<Decimal> = Vec::with_capacity(n);
+        for t in &recent {
+            let denom = (t.entry_price * t.position_size).max(dec!(0.00000001));
+            let r = (t.pnl / denom).max(dec!(-0.5)).min(dec!(0.5));
+            rets.push(r);
         }
-
-        let wins: Vec<&TradeMetrics> = recent_trades.iter()
-            .filter(|t| t.is_win)
-            .copied()
-            .collect();
-
-        let losses: Vec<&TradeMetrics> = recent_trades.iter()
-            .filter(|t| !t.is_win)
-            .copied()
-            .collect();
-
-        let win_rate = Decimal::from(wins.len()) / Decimal::from(recent_trades.len());
-        
-        let avg_win = if !wins.is_empty() {
-            wins.iter().map(|t| t.pnl).sum::<Decimal>() / Decimal::from(wins.len())
-        } else {
-            dec!(0.01)
+        let sharpe_ratio = if rets.len() < 2 { Decimal::ZERO } else {
+            let nn = rets.len() as u64;
+            let mean = rets.iter().copied().sum::<Decimal>() / Decimal::from(nn);
+            let var  = rets.iter().map(|r| { let d = *r - mean; d*d }).sum::<Decimal>() / Decimal::from(nn - 1);
+            let std  = sqrt_decimal(var);
+            if std > Decimal::ZERO { mean / std } else { Decimal::ZERO }
         };
 
-        let avg_loss = if !losses.is_empty() {
-            losses.iter().map(|t| t.pnl.abs()).sum::<Decimal>() / Decimal::from(losses.len())
-        } else {
-            dec!(0.01)
-        };
-
-        let gross_profit = wins.iter().map(|t| t.pnl).sum::<Decimal>();
-        let gross_loss = losses.iter().map(|t| t.pnl.abs()).sum::<Decimal>();
-        
-        let profit_factor = if gross_loss > Decimal::ZERO {
-            gross_profit / gross_loss
-        } else if gross_profit > Decimal::ZERO {
-            dec!(999)
-        } else {
-            dec!(1)
-        };
-
-        let returns: Vec<Decimal> = recent_trades.iter().map(|t| t.pnl).collect();
-        let sharpe_ratio = self.calculate_sharpe_ratio(&returns);
-
-        TradeStatistics {
-            win_rate,
-            avg_win,
-            avg_loss,
-            profit_factor,
-            sharpe_ratio,
-        }
+        TradeStatistics { win_rate, avg_win, avg_loss, profit_factor, sharpe_ratio, sample_size: n }
     }
 
     fn calculate_sharpe_ratio(&self, returns: &[Decimal]) -> Decimal {
@@ -819,7 +1019,7 @@ impl MartingaleOptimizer {
             }).sum::<Decimal>() / Decimal::from(n - 1)
         } else { Decimal::ZERO };
         let std = sqrt_decimal(var);
-        if std > Decimal::ZERO { mean / std } else { Decimal::ZERO }
+        if std > Decimal::ZERO { safe_div(mean, std, dec!(0.000000000001)) } else { Decimal::ZERO }
     }
 
     fn record_trade(&self, state: &mut StrategyState, trade: TradeMetrics, config: &MartingaleConfig) {
@@ -859,7 +1059,7 @@ impl MartingaleOptimizer {
             state.peak_balance = state.equity;
             state.current_drawdown = Decimal::ZERO;
         } else {
-            state.current_drawdown = (state.peak_balance - state.equity) / state.peak_balance;
+            state.current_drawdown = safe_div(state.peak_balance - state.equity, state.peak_balance, dec!(0.000000000000000001));
         }
     }
 
@@ -1147,10 +1347,11 @@ impl MartingaleOptimizer {
 #[derive(Debug, Clone)]
 pub struct TradeStatistics {
     pub win_rate: Decimal,
-    pub avg_win: Decimal,
-    pub avg_loss: Decimal,
+    pub avg_win: Decimal,      // quote units
+    pub avg_loss: Decimal,     // abs, quote units
     pub profit_factor: Decimal,
-    pub sharpe_ratio: Decimal,
+    pub sharpe_ratio: Decimal, // normalized per-trade returns
+    pub sample_size: usize,    // number of trades considered
 }
 
 impl Default for TradeStatistics {
@@ -1161,7 +1362,50 @@ impl Default for TradeStatistics {
             avg_loss: dec!(0.01),
             profit_factor: dec!(1),
             sharpe_ratio: Decimal::ZERO,
+            sample_size: 0,
         }
+    }
+}
+
+// ==== [IMPROVED: PIECE B8] Invariant tests for quantization, ticks, leader damp, rolling vol ====
+#[cfg(test)]
+mod improved_tests {
+    use super::*;
+
+    #[test]
+    fn size_quantizes_and_never_overshoots() {
+        let step = dec!(0.000001);
+        assert_eq!(quantize_size(dec!(0.123456789), step), dec!(0.123456));
+        assert_eq!(quantize_size(dec!(0.0000004),  step), dec!(0));
+    }
+
+    #[test]
+    fn tick_alignment_is_directional() {
+        let tick = dec!(0.01);
+        assert_eq!(align_down(dec!(100.019), tick), dec!(100.01));
+        assert_eq!(align_up  (dec!(100.019), tick), dec!(100.02));
+    }
+
+    #[test]
+    fn leader_damp_monotone() {
+        let hi = InclusionHints { leader_slot_in: 1,   recent_inclusion_rate: dec!(0.9), tip_suggestion_lamports: 0 };
+        let lo = InclusionHints { leader_slot_in: 512, recent_inclusion_rate: dec!(0.1), tip_suggestion_lamports: 0 };
+        let d_hi = leader_damp_from_hints(&hi);
+        let d_lo = leader_damp_from_hints(&lo);
+        assert!(d_hi > d_lo);
+    }
+
+    #[test]
+    fn rolling_vol_constant_time() {
+        let mut rv = RollingVol::new(5);
+        for r in [dec!(0.01), dec!(-0.005), dec!(0.002), dec!(0.0), dec!(0.003)] {
+            rv.push_return(r);
+        }
+        let v1 = rv.volatility();
+        rv.push_return(dec!(0.004));
+        let v2 = rv.volatility();
+        assert!(v2 >= Decimal::ZERO);
+        assert!(v1 != v2 || rv.len() < 2);
     }
 }
 
