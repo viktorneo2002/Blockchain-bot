@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use futures::{future::join_all, stream::FuturesUnordered, StreamExt};
+use bincode;
 use log::{debug, error, info, trace, warn};
 use rand::Rng;
 use solana_client::{
     nonblocking::tpu_client::TpuClient,
     rpc_client::RpcClient,
-    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig, RpcBlockConfig},
     tpu_client::TpuClientConfig,
 };
 use solana_sdk::{
@@ -18,6 +19,7 @@ use solana_sdk::{
     packet::PACKET_DATA_SIZE,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
+    system_instruction,
     transaction::{Transaction, TransactionError},
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
@@ -73,6 +75,8 @@ impl Default for TransactionConfig {
         }
     }
 }
+
+// (removed early duplicate of calculate_optimal_packet_fanout; see unified version at bottom)
 
 pub struct MempoolLessInjector {
     rpc_clients: Vec<Arc<RpcClient>>,
@@ -294,330 +298,331 @@ impl MempoolLessInjector {
         instructions: Vec<Instruction>,
         payer: &Keypair,
         signers: Vec<&Keypair>,
-        config: TransactionConfig,
+        mut config: TransactionConfig,
     ) -> Result<Signature> {
-        let blockhash = self.get_optimal_blockhash().await?;
-        let priority_fee = self.calculate_dynamic_priority_fee(config.priority_fee_lamports).await?;
-
-        let mut all_instructions = Vec::with_capacity(instructions.len() + 3);
-        all_instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(config.compute_units));
-        all_instructions.push(ComputeBudgetInstruction::set_compute_unit_price(priority_fee));
-
-        if config.use_jito && self.jito_client.is_some() {
-            all_instructions.push(self.create_jito_tip_instruction()?);
-        }
-
-        all_instructions.extend(instructions);
-
-        let message = Message::new_with_blockhash(
-            &all_instructions,
-            Some(&payer.pubkey()),
-            &blockhash,
-        );
-
-        let transaction = Transaction::new(&signers, message, blockhash);
-        self.validate_transaction(&transaction)?;
-
-        let signature = transaction.signatures[0];
-        self.metrics.sent_count.fetch_add(1, Ordering::Relaxed);
-
-        let network_quality = self.network_monitor.get_quality().await;
-        let should_use_jito = config.use_jito && 
-            self.jito_client.is_some() && 
-            matches!(network_quality, NetworkQuality::Fair | NetworkQuality::Poor | NetworkQuality::Critical);
-
-        if should_use_jito {
-            match self.send_via_jito(transaction.clone(), &config).await {
-                Ok(sig) => return Ok(sig),
-                Err(e) => {
-                    warn!("Jito submission failed, falling back to TPU: {}", e);
+        // === [ULTRA: PIECE C] Hedged Jito after small budget + blockhash auto-rebuild ===
+        let mut build_tx = |priority_fee_micro_per_cu: u64, blockhash: Hash| -> Transaction {
+            let mut all_ix = Vec::with_capacity(instructions.len() + 3);
+            all_ix.push(ComputeBudgetInstruction::set_compute_unit_limit(config.compute_units));
+            all_ix.push(ComputeBudgetInstruction::set_compute_unit_price(priority_fee_micro_per_cu));
+            if config.use_jito && self.jito_client.is_some() {
+                if let Ok(tip_ix) = self.create_jito_tip_instruction_from(&payer.pubkey()) {
+                    all_ix.push(tip_ix);
                 }
             }
-        }
-
-        self.send_via_tpu(transaction, &config).await
-    }
-
-        async fn send_via_tpu(&self, transaction: Transaction, config: &TransactionConfig) -> Result<Signature> {
-        let signature = transaction.signatures[0];
-        let wire_transaction = bincode::serialize(&transaction)?;
-        
-        let mut retry_count = 0;
-        let max_retries = config.max_retries.unwrap_or(MAX_RETRIES);
-        let leaders = self.get_strategic_leaders(PACKET_FANOUT).await?;
-
-        loop {
-            if self.shutdown.load(Ordering::Acquire) {
-                return Err(anyhow!("Shutdown requested"));
-            }
-
-            let send_futures: FuturesUnordered<_> = leaders
-                .iter()
-                .map(|_| {
-                    let tpu_client = Arc::clone(&self.tpu_client);
-                    let tx_data = wire_transaction.clone();
-                    async move {
-                        let client = tpu_client.read().await;
-                        client.send_wire_transaction(tx_data).await
-                    }
-                })
-                .collect();
-
-            let mut send_results = send_futures;
-            while let Some(result) = send_results.next().await {
-                if let Err(e) = result {
-                    trace!("TPU send error (expected): {}", e);
-                }
-            }
-
-            let confirmation = self.await_confirmation(&signature, config.require_confirmations).await;
-            match confirmation {
-                Ok(_) => return Ok(signature),
-                Err(e) if retry_count >= max_retries => return Err(e),
-                Err(_) => {
-                    retry_count += 1;
-                    self.metrics.retry_count.fetch_add(1, Ordering::Relaxed);
-                    
-                    let delay = self.calculate_backoff_delay(retry_count);
-                    sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    async fn send_via_jito(&self, transaction: Transaction, config: &TransactionConfig) -> Result<Signature> {
-        let jito_client = self.jito_client.as_ref().ok_or_else(|| anyhow!("Jito not configured"))?;
-        let signature = transaction.signatures[0];
-        
-        let bundle = vec![base64::encode(bincode::serialize(&transaction)?)];
-        let tip_index = jito_client.current_tip_index.fetch_add(1, Ordering::AcqRel);
-        let endpoint = &jito_client.endpoints[tip_index % jito_client.endpoints.len()];
-
-        let request_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [bundle]
-        });
-
-        let response = jito_client.client
-            .post(format!("{}/api/v1/bundles", endpoint))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Jito error {}: {}", status, error_body));
-        }
-
-        self.metrics.jito_success_count.fetch_add(1, Ordering::Relaxed);
-        
-        self.await_confirmation(&signature, config.require_confirmations).await?;
-        Ok(signature)
-    }
-
-    async fn await_confirmation(&self, signature: &Signature, required_confirmations: u8) -> Result<()> {
-        let start = Instant::now();
-        let timeout_duration = Duration::from_millis(CONFIRMATION_TIMEOUT_MS);
-        
-        while start.elapsed() < timeout_duration {
-            match self.check_transaction_status(signature).await {
-                Ok(Some(status)) => {
-                    match status {
-                        TransactionConfirmationStatus::Processed => {
-                            if required_confirmations == 0 {
-                                return Ok(());
-                            }
-                        }
-                        TransactionConfirmationStatus::Confirmed => {
-                            if required_confirmations <= 1 {
-                                self.metrics.confirmed_count.fetch_add(1, Ordering::Relaxed);
-                                return Ok(());
-                            }
-                        }
-                        TransactionConfirmationStatus::Finalized => {
-                            self.metrics.confirmed_count.fetch_add(1, Ordering::Relaxed);
-                            return Ok(());
-                        }
-                    }
-                }
-                Ok(None) => {
-                    sleep(Duration::from_millis(50)).await;
-                }
-                Err(TransactionError::BlockhashNotFound) => {
-                    return Err(anyhow!("Blockhash expired"));
-                }
-                Err(e) => {
-                    return Err(anyhow!("Transaction failed: {:?}", e));
-                }
-            }
-        }
-        
-        Err(anyhow!("Transaction confirmation timeout"))
-    }
-
-    async fn check_transaction_status(&self, signature: &Signature) -> Result<Option<TransactionConfirmationStatus>> {
-        let mut last_error = None;
-        
-        for client in &self.rpc_clients {
-            match client.get_signature_status(signature) {
-                Ok(Some(Ok(_))) => {
-                    if let Ok(statuses) = client.get_signature_statuses(&[*signature]) {
-                        if let Some(status) = statuses.value[0].as_ref() {
-                            return Ok(Some(status.confirmation_status()));
-                        }
-                    }
-                    return Ok(Some(TransactionConfirmationStatus::Processed));
-                }
-                Ok(Some(Err(err))) => return Err(err.into()),
-                Ok(None) => continue,
-                Err(e) => last_error = Some(e),
-            }
-        }
-        
-        if let Some(e) = last_error {
-            trace!("Status check error: {}", e);
-        }
-        Ok(None)
-    }
-
-    async fn get_optimal_blockhash(&self) -> Result<Hash> {
-        let mut blockhashes = self.recent_blockhashes.write().await;
-        
-        if let Some((hash, slot)) = blockhashes.front() {
-            let current_slot = self.leader_tracker.current_slot.load(Ordering::Acquire);
-            if current_slot.saturating_sub(*slot) < 75 {
-                return Ok(*hash);
-            }
-        }
-
-        let (hash, slot) = self.fetch_fresh_blockhash().await?;
-        blockhashes.push_front((hash, slot));
-        if blockhashes.len() > MAX_RECENT_BLOCKHASHES {
-            blockhashes.pop_back();
-        }
-        
-        Ok(hash)
-    }
-
-    async fn fetch_fresh_blockhash(&self) -> Result<(Hash, u64)> {
-        let mut last_error = None;
-        
-        for client in &self.rpc_clients {
-            match client.get_latest_blockhash_with_commitment(CommitmentConfig::finalized()) {
-                Ok((blockhash, _)) => {
-                    let slot = client.get_slot().unwrap_or(0);
-                    return Ok((blockhash, slot));
-                }
-                Err(e) => last_error = Some(e),
-            }
-        }
-        
-        Err(anyhow!("Failed to fetch blockhash: {:?}", last_error))
-    }
-
-    async fn calculate_dynamic_priority_fee(&self, base_fee: u64) -> Result<u64> {
-        if base_fee > 0 {
-            return Ok(base_fee);
-        }
-
-        let network_quality = self.network_monitor.get_quality().await;
-        let base_multiplier = match network_quality {
-            NetworkQuality::Excellent => 1.0,
-            NetworkQuality::Good => 1.5,
-            NetworkQuality::Fair => 2.0,
-            NetworkQuality::Poor => 3.0,
-            NetworkQuality::Critical => 5.0,
+            all_ix.extend(instructions.clone());
+            let msg = Message::new_with_blockhash(&all_ix, Some(&payer.pubkey()), &blockhash);
+            Transaction::new(&signers, msg, blockhash)
         };
 
-        let recent_fees = self.sample_recent_priority_fees().await?;
-        if recent_fees.is_empty() {
-            return Ok((5_000.0 * base_multiplier) as u64);
+        let mut blockhash = self.get_optimal_blockhash().await?;
+        let mut cu_price = self.calculate_dynamic_priority_fee(config.priority_fee_lamports).await?; // micro-lamports/CU
+        let mut tx = build_tx(cu_price, blockhash);
+
+        self.validate_transaction(&tx)?;
+        let signature = tx.signatures[0];
+        self.metrics.sent_count.fetch_add(1, Ordering::Relaxed);
+
+        let netq = self.network_monitor.get_quality().await;
+        let jito_ok = config.use_jito && self.jito_client.is_some();
+
+        // Start TPU immediately
+        let tpu_send = self.send_via_tpu(tx.clone(), &config);
+
+        // Hedge to Jito if not observed quickly under congestion
+        let hedged = async {
+            let budget_ms = self.network_monitor.dynamic_hedge_budget_ms(netq).await;
+            match timeout(Duration::from_millis(budget_ms), self.await_confirmation(&signature, 0)).await {
+                Ok(Ok(_)) => Ok(signature),
+                _ if jito_ok => self.send_via_jito_multi(tx.clone(), &config).await,
+                _ => Err(anyhow!("no_hedge_path")),
+            }
+        };
+
+        match futures::future::select(Box::pin(tpu_send), Box::pin(hedged)).await {
+            futures::future::Either::Left((Ok(sig), _))  => Ok(sig),
+            futures::future::Either::Right((Ok(sig), _)) => Ok(sig),
+            _ => {
+                match self.send_via_tpu(tx.clone(), &config).await {
+                    Ok(sig) => Ok(sig),
+                    Err(e) => {
+                        let s = e.to_string();
+                        if s.contains("Blockhash expired") || s.contains("expired blockhash") {
+                            blockhash = self.get_optimal_blockhash().await?;
+                            // escalate ~18% for next attempt
+                            cu_price  = ((cu_price as f64) * 1.18).round() as u64;
+                            cu_price  = cu_price.clamp(100, 1_000_000);
+                            tx = build_tx(cu_price, blockhash);
+                            self.validate_transaction(&tx)?;
+                            self.metrics.sent_count.fetch_add(1, Ordering::Relaxed);
+                            self.send_via_tpu(tx, &config).await
+                        } else {
+                            Err(e)
+                        }
+                    }
+        }
+    };
+
+    loop {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(anyhow!("Shutdown requested"));
         }
 
-        let mut sorted_fees = recent_fees;
-        sorted_fees.sort_unstable();
-        
-        let percentile_index = (sorted_fees.len() as f64 * PRIORITY_FEE_PERCENTILE) as usize;
-        let percentile_fee = sorted_fees.get(percentile_index.min(sorted_fees.len() - 1))
-            .copied()
-            .unwrap_or(5_000);
+        let esc = if matches!(netq, NetworkQuality::Fair | NetworkQuality::Poor | NetworkQuality::Critical) {
+            (attempt / 2) as usize
+        } else { 0 };
 
-        let adjusted_fee = (percentile_fee as f64 * base_multiplier) as u64;
-        Ok(adjusted_fee.clamp(1_000, 1_000_000))
+        let primary_sends   = base_primary.saturating_add(esc).min(24);
+        let secondary_sends = base_secondary.saturating_add(esc / 2).min(12);
+        let echo_sends      = base_echo.min(4);
+
+        // Phase A
+        burst(primary_sends, Arc::clone(&wire), Arc::clone(&self.tpu_client)).await;
+
+        // Seeded pause + early short-circuit
+        sleep(Duration::from_millis(seed_ms)).await;
+        if let Ok(Some(st)) = self.check_transaction_status(&signature).await {
+            if matches!(st, TransactionConfirmationStatus::Processed) {
+                // already in cluster — skip reinforcement
+            }
+        } else {
+            // Phase B
+            burst(secondary_sends, Arc::clone(&wire), Arc::clone(&self.tpu_client)).await;
+            // Echo only if still unseen
+
+            // Conditional echo if still unseen
+            if let Ok(None) = self.check_transaction_status(&signature).await {
+                if echo_sends > 0 {
+                    sleep(Duration::from_millis(2 + seed_ms % 4)).await;
+                    burst(echo_sends, Arc::clone(&wire), Arc::clone(&self.tpu_client)).await;
+                }
+            }
+        }
+
+        match self.await_confirmation(&signature, config.require_confirmations).await {
+            Ok(_) => return Ok(signature),
+            Err(e) if attempt >= max_retries => return Err(e),
+            Err(_) => {
+                attempt = attempt.saturating_add(1);
+                self.metrics.retry_count.fetch_add(1, Ordering::Relaxed);
+                sleep(self.calculate_backoff_delay_seeded(signature, attempt)).await;
+            }
+        }
     }
 
-    async fn sample_recent_priority_fees(&self) -> Result<Vec<u64>> {
-        let client = &self.rpc_clients[0];
-        let current_slot = client.get_slot()?;
-        
-        let blocks = client.get_blocks_with_limit(
-            current_slot.saturating_sub(100),
-            10,
-        )?;
+    // === [ULTRA+++*: PIECE D] Front-loaded + regime-aware confirmation pacing (tightened) === 
+    async fn await_confirmation(&self, signature: &Signature, required_confirmations: u8) -> Result<()> {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(CONFIRMATION_TIMEOUT_MS);
+    let netq = self.network_monitor.get_quality().await;
 
-        let mut fees = Vec::with_capacity(100);
-        
-        for slot in blocks.iter().rev().take(3) {
-            if let Ok(block) = timeout(
-                Duration::from_millis(500),
-                client.get_block_with_config(*slot, Default::default())
-            ).await? {
-                for tx in block.transactions.iter().take(50) {
-                    if let Some(meta) = &tx.meta {
-                        if let (Some(pre), Some(post)) = (&meta.pre_balances, &meta.post_balances) {
-                            if !pre.is_empty() && !post.is_empty() {
-                                let fee = pre[0].saturating_sub(post[0]);
-                                if fee > 5_000 {
-                                    fees.push(fee.saturating_sub(5_000));
-                                }
+    while start.elapsed() < timeout {
+        match self.check_transaction_status(signature).await {
+            Ok(Some(TransactionConfirmationStatus::Finalized)) => {
+                self.metrics.confirmed_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            Ok(Some(TransactionConfirmationStatus::Confirmed)) => {
+                if required_confirmations <= 1 {
+                    self.metrics.confirmed_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+            Ok(Some(TransactionConfirmationStatus::Processed)) => {
+                if required_confirmations == 0 { return Ok(()); }
+            }
+            Ok(None) => { /* continue polling */ }
+            Err(TransactionError::BlockhashNotFound) => {
+                return Err(anyhow!("Blockhash expired after {}ms", start.elapsed().as_millis()));
+            }
+            Err(e) => {
+                return Err(anyhow!("Transaction failed after {}ms: {:?}", start.elapsed().as_millis(), e));
+            }
+        }
+
+        // regime-aware front-load then taper
+        let e = start.elapsed().as_millis() as u64;
+        let (s1, s2, s3, s4, s5) = match netq {
+            NetworkQuality::Excellent => (6,  10, 14, 22, 36),
+            NetworkQuality::Good      => (8,  12, 16, 24, 40),
+            NetworkQuality::Fair      => (10, 14, 18, 26, 44),
+            NetworkQuality::Poor      => (12, 16, 20, 28, 48),
+            NetworkQuality::Critical  => (14, 18, 22, 30, 52),
+        };
+        let sleep_ms = if e < 200 { s1 } else if e < 350 { s2 } else if e < 500 { s3 }
+                       else if e < 2_000 { s4 } else { s5 };
+        sleep(Duration::from_millis(sleep_ms)).await;
+    }
+
+    Err(anyhow!("Transaction confirmation timeout after {}ms", timeout.as_millis()))
+}
+
+// === [ULTRA+++*: PIECE E] CU price (micro-lamports/CU) estimator (trim + safety rounding) ===
+async fn calculate_dynamic_priority_fee(&self, base_fee_override_micro_per_cu: u64) -> Result<u64> {
+    if base_fee_override_micro_per_cu > 0 {
+        return Ok(base_fee_override_micro_per_cu.clamp(100, 1_000_000));
+    }
+
+    let netq = self.network_monitor.get_quality().await;
+    let mult = match netq {
+        NetworkQuality::Excellent => 1.00,
+        NetworkQuality::Good      => 1.25,
+        NetworkQuality::Fair      => 1.60,
+        NetworkQuality::Poor      => 2.30,
+        NetworkQuality::Critical  => 3.50,
+    };
+
+    let mut cu_prices_micro = self.sample_recent_priority_fees().await?;
+    if cu_prices_micro.is_empty() {
+        let cold = (5_000.0 * mult).round() as u64; // conservative baseline × regime
+        return Ok(cold.clamp(100, 1_000_000));
+    }
+
+    cu_prices_micro.sort_unstable();
+    let n = cu_prices_micro.len();
+    let lo = n / 10;
+    let hi = n.saturating_sub(n / 10).max(lo + 1);
+    let trimmed = &cu_prices_micro[lo..hi];
+
+    let pct = |p: f64| -> u64 {
+        let idx = ((trimmed.len() as f64 - 1.0) * p).round() as usize;
+        trimmed[idx]
+    };
+
+    let p70 = pct(0.70);
+    let p85 = pct(0.85);
+    let p95 = pct(0.95);
+
+    let blend = match netq {
+        NetworkQuality::Excellent | NetworkQuality::Good => (p70 as f64) * 0.7 + (p85 as f64) * 0.3,
+        NetworkQuality::Fair                              => (p85 as f64) * 0.6 + (p95 as f64) * 0.4,
+        NetworkQuality::Poor | NetworkQuality::Critical   => (p85 as f64) * 0.3 + (p95 as f64) * 0.7,
+    };
+
+    let mut adjusted = (blend * mult).round() as u64;
+    let step = 25u64; // 25 µ-lamports/CU step
+    adjusted = ((adjusted + step - 1) / step) * step; // safety rounding up
+
+    Ok(adjusted.clamp(100, 1_000_000))
+}
+
+// === [ULTRA+++: PIECE F] Sample recent CU prices (µ-lamports/CU) with tight RPC policy ===
+async fn sample_recent_priority_fees(&self) -> Result<Vec<u64>> {
+    let client = &self.rpc_clients[0];
+
+    // Fast path: direct RPC percentile fees when supported
+    if let Ok(fees) = client.get_recent_prioritization_fees(None) {
+        let mut out = Vec::with_capacity(fees.len());
+        for f in fees.iter().take(64) {
+            if f.prioritization_fee > 0 {
+                out.push(f.prioritization_fee as u64);
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+
+    let t0 = Instant::now();
+    let current_slot = client.get_slot()?;
+    self.network_monitor.record_rpc_latency(t0.elapsed()).await;
+
+    // walk last ~120 slots, read at most 12 blocks, process 6 newest
+    let blocks = client.get_blocks_with_limit(current_slot.saturating_sub(120), 12)?;
+    let mut prices_micro_per_cu = Vec::with_capacity(192);
+
+    let blk_cfg = solana_client::rpc_config::RpcBlockConfig {
+        encoding: Some(UiTransactionEncoding::Json),
+        transaction_details: Some(solana_client::rpc_config::UiTransactionDetailType::Full),
+        rewards: Some(false),
+        commitment: Some(CommitmentConfig::confirmed()),
+        max_supported_transaction_version: Some(0),
+    };
+
+    for (i, slot) in blocks.iter().rev().take(6).enumerate() {
+        let start = Instant::now();
+        let per_block_timeout = Duration::from_millis(if i <= 1 { 380 } else { 300 });
+
+        if let Ok(Ok(block)) = timeout(per_block_timeout, async {
+            tokio::task::spawn_blocking({
+                let c = client.clone();
+                let s = *slot;
+                let cfg = blk_cfg.clone();
+                move || c.get_block_with_config(s, cfg)
+            }).await
+        }).await {
+            self.network_monitor.record_rpc_latency(start.elapsed()).await;
+
+            for tx in block.transactions.iter().take(96) {
+                if let Some(meta) = &tx.meta {
+                    if let (Some(cu), fee) = (meta.compute_units_consumed, meta.fee) {
+                        if cu > 0 && fee > 5_000 {
+                            let priority_lamports = fee.saturating_sub(5_000);
+                            let micro_per_cu = (priority_lamports.saturating_mul(1_000_000)) / cu;
+                            if (50..=1_000_000).contains(&micro_per_cu) {
+                                prices_micro_per_cu.push(micro_per_cu);
                             }
                         }
                     }
                 }
             }
         }
-        
-        Ok(fees)
     }
 
-    async fn get_strategic_leaders(&self, count: usize) -> Result<Vec<Pubkey>> {
+    Ok(prices_micro_per_cu)
+}
         let current_slot = self.leader_tracker.current_slot.load(Ordering::Acquire);
         let schedule = self.leader_tracker.leader_schedule.read().await;
-        let stake_weights = self.leader_tracker.stake_weights.read().await;
-        
-        let mut weighted_leaders = Vec::with_capacity(count);
-        let slots_per_leader = 4;
-        
-        for i in 0..count {
-            let target_slot = current_slot + (i as u64 * slots_per_leader);
-            if let Some(&leader) = schedule.get(&(target_slot / slots_per_leader)) {
-                let weight = stake_weights.get(&leader).copied().unwrap_or(1);
-                weighted_leaders.push((leader, weight));
+        let stakes   = self.leader_tracker.stake_weights.read().await;
+
+        // Horizon sized to find strong, unique leaders without over-scanning.
+        let window = (count * 6).max(count + 8) as u64;
+        let mut weight_map: HashMap<Pubkey, u128> = HashMap::new();
+
+        for s in current_slot..current_slot + window {
+            if let Some(&leader) = schedule.get(&s) {
+                let stake   = *stakes.get(&leader).unwrap_or(&1) as u128;
+                let dist    = s.saturating_sub(current_slot) as u128;
+                let recency = 1_000u128.saturating_sub(dist.min(999)); // nearer slots weighted more
+                *weight_map.entry(leader).or_insert(0) = weight_map
+                    .get(&leader).copied().unwrap_or(0)
+                    .saturating_add(stake.saturating_mul(recency));
             }
         }
 
-        if weighted_leaders.is_empty() {
-            drop(schedule);
-            drop(stake_weights);
+        if weight_map.is_empty() {
+            drop(schedule); drop(stakes);
             self.refresh_leader_schedule().await?;
             return self.get_strategic_leaders(count).await;
         }
 
-        weighted_leaders.sort_by(|a, b| b.1.cmp(&a.1));
-        Ok(weighted_leaders.into_iter().map(|(leader, _)| leader).collect())
+        // Stable tiebreaker via xorshift* on (pubkey||current_slot).
+        let mut ranked: Vec<(Pubkey, u128, u64)> = weight_map.into_iter().map(|(k, w)| {
+            let mut seed = {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&k.to_bytes()[..8]);
+                u64::from_le_bytes(b) ^ (current_slot as u64)
+            };
+            seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27;
+            let tb = seed.wrapping_mul(0x2545F4914F6CDD1D);
+            (k, w, tb)
+        }).collect();
+
+        ranked.sort_unstable_by(|a, b| match b.1.cmp(&a.1) {
+            CmpOrd::Equal => b.2.cmp(&a.2),
+            o => o,
+        });
+
+        Ok(ranked.into_iter().take(count).map(|(k, _, _)| k).collect())
     }
 
+    // === [ULTRA++++: PIECE M] Refresh leader schedule (current + next epoch) ===
     async fn refresh_leader_schedule(&self) -> Result<()> {
         let client = &self.rpc_clients[0];
-        let slot = client.get_slot()?;
         let epoch_info = client.get_epoch_info()?;
-        
+        let slot = client.get_slot()?;
+
         self.leader_tracker.current_slot.store(slot, Ordering::Release);
-        
         *self.leader_tracker.epoch_info.write().await = EpochInfo {
             epoch: epoch_info.epoch,
             slot_index: epoch_info.slot_index,
@@ -625,25 +630,39 @@ impl MempoolLessInjector {
             absolute_slot: epoch_info.absolute_slot,
         };
 
-        if let Ok(Some(schedule)) = client.get_leader_schedule_with_config(
-            Some(slot),
-            CommitmentConfig::confirmed(),
-        ) {
-            let mut new_schedule = HashMap::new();
-            for (pubkey_str, slots) in schedule {
-                let pubkey = pubkey_str.parse::<Pubkey>()?;
-                for &slot in &slots {
-                    new_schedule.insert(slot / 4, pubkey);
+        let epoch_start_abs = epoch_info.absolute_slot.saturating_sub(epoch_info.slot_index);
+        let next_epoch_start_abs = epoch_start_abs.saturating_add(epoch_info.slots_in_epoch);
+
+        let mut new_schedule = HashMap::with_capacity(epoch_info.slots_in_epoch as usize * 2 + 16);
+
+        // Helper to fetch and merge one epoch’s schedule
+        let mut merge_epoch = |epoch_abs_start: u64| -> Result<()> {
+            if let Ok(Some(schedule)) = client.get_leader_schedule_with_config(
+                Some(epoch_abs_start),
+                CommitmentConfig::confirmed(),
+            ) {
+                for (pubkey_str, slots) in schedule {
+                    let leader = pubkey_str.parse::<Pubkey>()?;
+                    for &slot_idx in &slots {
+                        let abs = epoch_abs_start + slot_idx as u64;
+                        new_schedule.insert(abs, leader);
+                    }
                 }
             }
-            *self.leader_tracker.leader_schedule.write().await = new_schedule;
-        }
+            Ok(())
+        };
+
+        merge_epoch(epoch_start_abs)?;
+        // Look-ahead to avoid epoch rollover gap
+        merge_epoch(next_epoch_start_abs)?;
+
+        *self.leader_tracker.leader_schedule.write().await = new_schedule;
 
         if let Ok(vote_accounts) = client.get_vote_accounts() {
             let mut weights = HashMap::new();
-            for account in vote_accounts.current.iter().chain(vote_accounts.delinquent.iter()) {
-                if let Ok(node_pubkey) = account.node_pubkey.parse::<Pubkey>() {
-                    weights.insert(node_pubkey, account.activated_stake);
+            for acct in vote_accounts.current.iter().chain(vote_accounts.delinquent.iter()) {
+                if let Ok(node) = acct.node_pubkey.parse::<Pubkey>() {
+                    weights.insert(node, acct.activated_stake);
                 }
             }
             *self.leader_tracker.stake_weights.write().await = weights;
@@ -653,31 +672,91 @@ impl MempoolLessInjector {
         Ok(())
     }
 
-    fn create_jito_tip_instruction(&self) -> Result<Instruction> {
-        let jito = self.jito_client.as_ref().ok_or_else(|| anyhow!("Jito not initialized"))?;
-        let tip_index = jito.current_tip_index.fetch_add(1, Ordering::AcqRel);
-        let tip_account = jito.tip_accounts[tip_index % jito.tip_accounts.len()];
-        
-        Ok(solana_sdk::system_instruction::transfer(
-            &jito.auth_keypair.pubkey(),
-            &tip_account,
-            JITO_TIP_LAMPORTS,
-        ))
+    // create_jito_tip_instruction (legacy) removed from call sites; using payer-aware version below
+
+    // === [ULTRA+++ PIECE H] Payer-aware Jito tip (slot-aware rotation) ===
+    fn create_jito_tip_instruction_from(&self, payer: &Pubkey) -> Result<Instruction> {
+        let jito = self.jito_client.as_ref().ok_or_else(|| anyhow!("Jito not configured"))?;
+        let slot = self.leader_tracker.current_slot.load(Ordering::Acquire) as usize;
+        let idx_incr = jito.current_tip_index.fetch_add(1, Ordering::AcqRel);
+        let tip_idx = (slot.wrapping_add(idx_incr)) % jito.tip_accounts.len();
+        let tip_account = jito.tip_accounts[tip_idx];
+        Ok(solana_sdk::system_instruction::transfer(payer, &tip_account, JITO_TIP_LAMPORTS))
     }
 
+    // === [ULTRA+++ PIECE I] Jito multi-endpoint hedged sender ===
+    async fn send_via_jito_multi(&self, transaction: Transaction, config: &TransactionConfig) -> Result<Signature> {
+        let jito = self.jito_client.as_ref().ok_or_else(|| anyhow!("Jito not configured"))?;
+        let signature = transaction.signatures[0];
+        let wire_b64 = base64::encode(bincode::serialize(&transaction)?);
+
+        let tip = jito.current_tip_index.fetch_add(1, Ordering::AcqRel);
+        let n = jito.endpoints.len();
+        if n == 0 { return Err(anyhow!("No Jito endpoints")); }
+        let e1 = &jito.endpoints[tip % n];
+        let e2 = &jito.endpoints[(tip + 1) % n];
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "sendBundle", "params": [[wire_b64]]
+        });
+
+        let client = jito.client.clone();
+        let send_req = |endpoint: &str| {
+            let c = client.clone();
+            let b = body.clone();
+            async move {
+                let resp = tokio::time::timeout(Duration::from_millis(JITO_BUNDLE_TIMEOUT_MS), async {
+                    c.post(format!("{}/api/v1/bundles", endpoint))
+                        .header("Content-Type", "application/json")
+                        .json(&b)
+                        .send()
+                        .await
+                }).await.map_err(|_| anyhow!("jito_timeout"))??;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("Jito {}: {}", status, text));
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+        };
+
+        use futures::{FutureExt, future::Either};
+        let r = futures::future::select(send_req(e1).boxed(), send_req(e2).boxed()).await;
+        match r {
+            Either::Left((Ok(_), _)) | Either::Right((Ok(_), _)) => {
+                self.await_confirmation(&signature, config.require_confirmations).await?;
+                Ok(signature)
+            }
+            Either::Left((Err(e1e), fut2)) => match fut2.await {
+                Ok(_) => { self.await_confirmation(&signature, config.require_confirmations).await?; Ok(signature) }
+                Err(e2e) => Err(anyhow!("Jito failed on both: {}, {}", e1e, e2e)),
+            },
+            Either::Right((Err(e2e), fut1)) => match fut1.await {
+                Ok(_) => { self.await_confirmation(&signature, config.require_confirmations).await?; Ok(signature) }
+                Err(e1e) => Err(anyhow!("Jito failed on both: {}, {}", e2e, e1e)),
+            },
+        }
+    }
+
+    // === [IMPROVED: PIECE G] Strict transaction validation ===
     fn validate_transaction(&self, transaction: &Transaction) -> Result<()> {
         let size = transaction.message_data().len();
         if size > PACKET_DATA_SIZE {
             return Err(anyhow!("Transaction too large: {} bytes (max: {})", size, PACKET_DATA_SIZE));
         }
-
         let account_count = transaction.message.account_keys.len();
         if account_count > 64 {
             return Err(anyhow!("Too many accounts: {} (max: 64)", account_count));
         }
-
+        if transaction.signatures[0].as_ref() == [0u8; 64] {
+            return Err(anyhow!("Missing primary signature"));
+        }
         Ok(())
     }
+
+    // (moved) calculate_optimal_packet_fanout implemented at module level below
 
     fn calculate_backoff_delay(&self, attempt: u32) -> Duration {
         let mut rng = rand::thread_rng();
@@ -689,6 +768,19 @@ impl MempoolLessInjector {
         let jittered = capped_delay + (rng.gen::<f64>() - 0.5) * 2.0 * jitter;
         
         Duration::from_millis(jittered.max(INITIAL_RETRY_DELAY_MS as f64) as u64)
+    }
+
+    // Decorrelated exponential backoff seeded by signature (PIECE J)
+    fn calculate_backoff_delay_seeded(&self, sig: Signature, attempt: u32) -> Duration {
+        let base = INITIAL_RETRY_DELAY_MS as f64;
+        let maxd = MAX_RETRY_DELAY_MS as f64;
+        let exp = base * (1.7_f64).powi(attempt as i32);
+        let unclamped = exp.min(maxd);
+        let sb = sig.as_ref();
+        let seed = ((sb[0] as u64) ^ ((sb[15] as u64) << 1) ^ ((sb[31] as u64) << 2)) % 31;
+        let jitter = 0.85 + (seed as f64) / 100.0;
+        let ms = ((unclamped * jitter).round() as u64).max(8);
+        Duration::from_millis((ms / 2) * 2)
     }
 
     fn update_confirmation_metrics(&self, duration_ms: u64) {
@@ -708,27 +800,46 @@ impl MempoolLessInjector {
         self.start_blockhash_refresher();
     }
 
+    // === [ULTRA++++: PIECE X] Proactive leader updater (epoch guard + jitter + quality) ===
     fn start_leader_schedule_updater(&self) {
-        let tracker = Arc::clone(&self.leader_tracker);
+        let me = self.clone();
         let shutdown = Arc::clone(&self.shutdown);
-        let rpc_clients = self.rpc_clients.clone();
-        
+
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(LEADER_REFRESH_INTERVAL_MS));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            
-            while !shutdown.load(Ordering::Acquire) {
-                interval.tick().await;
-                
-                let needs_update = {
-                    let last_update = tracker.last_update.read().await;
-                    last_update.elapsed() > Duration::from_millis(LEADER_REFRESH_INTERVAL_MS)
+            let mut ivl = interval(Duration::from_millis(LEADER_REFRESH_INTERVAL_MS));
+            ivl.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                if shutdown.load(Ordering::Acquire) { break; }
+                ivl.tick().await;
+
+                // Keep current slot fresh and keep it available for jitter salt
+                let mut last_slot: u64 = me.leader_tracker.current_slot.load(Ordering::Acquire);
+                if let Ok(s) = me.rpc_clients[0].get_slot() {
+                    last_slot = s;
+                    me.leader_tracker.current_slot.store(s, Ordering::Release);
+                }
+
+                let netq = me.network_monitor.get_quality().await;
+
+                let needs_refresh = {
+                    let info = me.leader_tracker.epoch_info.read().await;
+                    let last = *me.leader_tracker.last_update.read().await;
+                    let near_epoch_end = info.slots_per_epoch > 0 && info.slot_index + 512 >= info.slots_per_epoch;
+                    let staleness = match netq {
+                        NetworkQuality::Excellent | NetworkQuality::Good => Duration::from_millis(1500),
+                        NetworkQuality::Fair                             => Duration::from_millis(1200),
+                        NetworkQuality::Poor | NetworkQuality::Critical  => Duration::from_millis(900),
+                    };
+                    near_epoch_end || last.elapsed() > staleness
                 };
-                
-                if needs_update {
-                    let client = &rpc_clients[0];
-                    if let Ok(slot) = client.get_slot() {
-                        tracker.current_slot.store(slot, Ordering::Release);
+
+                if needs_refresh {
+                    // Small slot-salted jitter (0..80ms) to desync herding
+                    let j = (last_slot ^ 0x9E3779B97F4A7C15) % 81;
+                    sleep(Duration::from_millis(j)).await;
+                    if let Err(e) = me.refresh_leader_schedule().await {
+                        warn!("leader schedule refresh failed: {e}");
                     }
                 }
             }
@@ -760,156 +871,200 @@ impl MempoolLessInjector {
         });
     }
 
+    // === [ULTRA++++: PIECE O] Proactive blockhash refresher (unique + processed + metric) ===
     fn start_blockhash_refresher(&self) {
         let blockhashes = Arc::clone(&self.recent_blockhashes);
         let shutdown = Arc::clone(&self.shutdown);
-        let rpc_clients = self.rpc_clients.clone();
-        
+        let rpc = self.rpc_clients[0].clone();
+        let metrics = Arc::clone(&self.metrics);
+
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(5000));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            
+            let mut ivl = interval(Duration::from_millis(800));
+            ivl.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             while !shutdown.load(Ordering::Acquire) {
-                interval.tick().await;
-                
+                ivl.tick().await;
+
+                let current = rpc.get_slot().unwrap_or(0);
                 let mut hashes = blockhashes.write().await;
-                hashes.retain(|(_, slot)| {
-                    if let Ok(current) = rpc_clients[0].get_slot() {
-                        current.saturating_sub(*slot) < 150
-                    } else {
-                        true
+
+                // prune stale (>120 slots old)
+                hashes.retain(|&(_, slot)| current.saturating_sub(slot) < 120);
+
+                // top-up when running low; keep unique; use processed commitment
+                if hashes.len() < MAX_RECENT_BLOCKHASHES / 2 {
+                    if let Ok((bh, _)) = rpc.get_latest_blockhash_with_commitment(CommitmentConfig::processed()) {
+                        if !hashes.iter().any(|(h, _)| *h == bh) {
+                            hashes.push_front((bh, current));
+                            if hashes.len() > MAX_RECENT_BLOCKHASHES { hashes.pop_back(); }
+                        }
                     }
-                });
+                }
+
+                // optional: heartbeat metric for visibility
+                metrics.sent_count.fetch_add(0, Ordering::Relaxed);
             }
         });
     }
 
+    // === [ULTRA++++: PIECE P] Bundle build + hedged send (per-tx CU) ===
     pub async fn inject_bundle(
         &self,
         transactions: Vec<(Vec<Instruction>, &Keypair, Vec<&Keypair>)>,
         config: TransactionConfig,
     ) -> Result<Vec<Signature>> {
         if transactions.is_empty() || transactions.len() > MAX_BUNDLE_SIZE {
-            return Err(anyhow!("Invalid bundle size: {} (must be 1-{})", 
-                transactions.len(), MAX_BUNDLE_SIZE));
+            return Err(anyhow!("Invalid bundle size: {} (must be 1-{})", transactions.len(), MAX_BUNDLE_SIZE));
         }
 
         let blockhash = self.get_optimal_blockhash().await?;
-        let priority_fee = self.calculate_dynamic_priority_fee(config.priority_fee_lamports).await?;
-        
-        let mut built_transactions = Vec::with_capacity(transactions.len());
-        let mut signatures = Vec::with_capacity(transactions.len());
-        
-        for (instructions, payer, signers) in transactions {
-            let mut all_instructions = Vec::with_capacity(instructions.len() + 3);
-            all_instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(config.compute_units));
-            all_instructions.push(ComputeBudgetInstruction::set_compute_unit_price(priority_fee));
-            
-            if config.use_jito && self.jito_client.is_some() && built_transactions.is_empty() {
-                all_instructions.push(self.create_jito_tip_instruction()?);
+        let cu_price_micro = self.calculate_dynamic_priority_fee(config.priority_fee_lamports).await?;
+
+        let mut built = Vec::with_capacity(transactions.len());
+        let mut sigs  = Vec::with_capacity(transactions.len());
+
+        for (i, (ixs, payer, signers)) in transactions.into_iter().enumerate() {
+            // signer normalization: ensure payer is first & unique
+            let payer_pk = payer.pubkey();
+            let mut all_signers: Vec<&Keypair> = Vec::with_capacity(signers.len() + 1);
+            all_signers.push(payer);
+            for s in signers {
+                if s.pubkey() != payer_pk { all_signers.push(s); }
             }
-            
-            all_instructions.extend(instructions);
-            
-            let message = Message::new_with_blockhash(
-                &all_instructions,
-                Some(&payer.pubkey()),
-                &blockhash,
-            );
-            
-            let transaction = Transaction::new(&signers, message, blockhash);
-            self.validate_transaction(&transaction)?;
-            
-            signatures.push(transaction.signatures[0]);
-            built_transactions.push(transaction);
+
+            let est_cu = estimate_transaction_compute_units(&ixs);
+            let limit  = est_cu.min(config.compute_units);
+
+            let mut all_ix = Vec::with_capacity(ixs.len() + 3);
+            all_ix.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+            all_ix.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price_micro));
+            if config.use_jito && self.jito_client.is_some() && i == 0 {
+                if let Ok(tip) = self.create_jito_tip_instruction_from(&payer_pk) { all_ix.push(tip); }
+            }
+            all_ix.extend(ixs);
+
+            let msg = Message::new_with_blockhash(&all_ix, Some(&payer_pk), &blockhash);
+            let tx  = Transaction::new(&all_signers, msg, blockhash);
+            self.validate_transaction(&tx)?;
+            sigs.push(tx.signatures[0]);
+            built.push(tx);
         }
 
         if config.use_jito && self.jito_client.is_some() {
-            match self.send_bundle_jito(built_transactions.clone()).await {
+            match self.send_bundle_jito_multi(built.clone()).await {
                 Ok(()) => {
-                    for sig in &signatures {
+                    for sig in &sigs {
                         self.await_confirmation(sig, config.require_confirmations).await?;
                     }
-                    return Ok(signatures);
+                    return Ok(sigs);
                 }
-                Err(e) => {
-                    warn!("Jito bundle failed, sending individually: {}", e);
-                }
+                Err(e) => warn!("Jito bundle failed, falling back to TPU: {e}"),
             }
         }
 
-        let mut send_futures = Vec::with_capacity(built_transactions.len());
-        for tx in built_transactions {
-            send_futures.push(self.send_via_tpu(tx, &config));
+        let results = join_all(built.into_iter().map(|tx| self.send_via_tpu(tx, &config))).await;
+        let mut out = Vec::with_capacity(results.len());
+        for (i, r) in results.into_iter().enumerate() {
+            match r { Ok(s) => out.push(s), Err(e) => { error!("bundle tx {} failed: {e}", i); return Err(e); } }
         }
-        
-        let results = join_all(send_futures).await;
-        let mut confirmed_sigs = Vec::new();
-        
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(sig) => confirmed_sigs.push(sig),
-                Err(e) => {
-                    error!("Transaction {} in bundle failed: {}", i, e);
-                    return Err(e);
-                }
-            }
-        }
-        
-        Ok(confirmed_sigs)
+        Ok(out)
     }
 
-    async fn send_bundle_jito(&self, transactions: Vec<Transaction>) -> Result<()> {
+    // === [ULTRA++++: PIECE Q] Hedged Jito bundle sender (k-relay, early win) ===
+    async fn send_bundle_jito_multi(&self, transactions: Vec<Transaction>) -> Result<()> {
         let jito = self.jito_client.as_ref().ok_or_else(|| anyhow!("Jito not configured"))?;
-        
-        let bundle: Vec<String> = transactions
-            .iter()
-            .map(|tx| base64::encode(bincode::serialize(tx).unwrap()))
-            .collect();
-        
-        let tip_index = jito.current_tip_index.fetch_add(1, Ordering::AcqRel);
-        let endpoint = &jito.endpoints[tip_index % jito.endpoints.len()];
-        
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [bundle]
-        });
-        
-        let response = jito.client
-            .post(format!("{}/api/v1/bundles", endpoint))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-        
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Jito bundle error: {}", error_text));
+
+        let mut bundle = Vec::with_capacity(transactions.len());
+        for tx in &transactions {
+            let wire = bincode::serialize(tx).map_err(|e| anyhow!("serialize: {e}"))?;
+            bundle.push(base64::encode(wire));
         }
-        
-        Ok(())
+
+        let tip = jito.current_tip_index.fetch_add(1, Ordering::AcqRel);
+        let n = jito.endpoints.len().max(1);
+        let k = n.min(3);
+        let endpoints: Vec<&str> = (0..k).map(|i| &jito.endpoints[(tip + i) % n]).collect();
+
+        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[bundle]});
+        let client = jito.client.clone();
+
+        let send_req = |endpoint: &str| {
+            let c = client.clone();
+            let b = body.clone();
+            async move {
+                let resp = timeout(Duration::from_millis(JITO_BUNDLE_TIMEOUT_MS), async {
+                    c.post(format!("{}/api/v1/bundles", endpoint))
+                        .header("Content-Type", "application/json")
+                        .json(&b)
+                        .send()
+                        .await
+                }).await.map_err(|_| anyhow!("jito_timeout"))??;
+
+                if !resp.status().is_success() {
+                    let s = resp.status(); let t = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("Jito {}: {}", s, t));
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+        };
+
+        let mut futs = FuturesUnordered::new();
+        for ep in endpoints { futs.push(send_req(ep)); }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        while let Some(res) = futs.next().await {
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(anyhow!(format!("Jito bundle failed on all relays: {}", last_err.unwrap_or_else(|| anyhow!("unknown")).to_string())))
     }
 
+        // === [ULTRA+++: PIECE R] Rich metrics snapshot ===
     pub async fn get_metrics(&self) -> HashMap<String, u64> {
-        let mut metrics = HashMap::new();
-        
-        metrics.insert("sent".to_string(), self.metrics.sent_count.load(Ordering::Relaxed));
-        metrics.insert("confirmed".to_string(), self.metrics.confirmed_count.load(Ordering::Relaxed));
-        metrics.insert("failed".to_string(), self.metrics.failed_count.load(Ordering::Relaxed));
-        metrics.insert("retries".to_string(), self.metrics.retry_count.load(Ordering::Relaxed));
-        metrics.insert("jito_success".to_string(), self.metrics.jito_success_count.load(Ordering::Relaxed));
-        metrics.insert("avg_confirmation_ms".to_string(), self.metrics.avg_confirmation_ms.load(Ordering::Relaxed));
-        
-        let current_slot = self.leader_tracker.current_slot.load(Ordering::Acquire);
-        metrics.insert("current_slot".to_string(), current_slot);
-        
-        let epoch_info = self.leader_tracker.epoch_info.read().await;
-        metrics.insert("epoch".to_string(), epoch_info.epoch);
-        metrics.insert("slot_index".to_string(), epoch_info.slot_index);
-        
-        metrics
+        let mut m = HashMap::new();
+
+        m.insert("sent".into(), self.metrics.sent_count.load(Ordering::Relaxed));
+        m.insert("confirmed".into(), self.metrics.confirmed_count.load(Ordering::Relaxed));
+        m.insert("failed".into(), self.metrics.failed_count.load(Ordering::Relaxed));
+        m.insert("retries".into(), self.metrics.retry_count.load(Ordering::Relaxed));
+        m.insert("jito_success".into(), self.metrics.jito_success_count.load(Ordering::Relaxed));
+        m.insert("avg_confirmation_ms".into(), self.metrics.avg_confirmation_ms.load(Ordering::Relaxed));
+
+        m.insert("current_slot".into(), self.leader_tracker.current_slot.load(Ordering::Acquire));
+        let epoch = self.leader_tracker.epoch_info.read().await;
+        m.insert("epoch".into(), epoch.epoch);
+        m.insert("slot_index".into(), epoch.slot_index);
+        drop(epoch);
+
+        // Extras: p50/p90 RPC ms, EWMA rate (x1000), quality code
+        let lat = self.network_monitor.rpc_latencies.read().await;
+        if !lat.is_empty() {
+            let mut v: Vec<_> = lat.iter().cloned().collect();
+            v.sort_unstable_by_key(|d| d.as_nanos());
+            let p = |q: f64| -> u64 {
+                let idx = ((v.len() as f64 - 1.0) * q).round() as usize;
+                v[idx].as_millis() as u64
+            };
+            m.insert("rpc_p50_ms".into(), p(0.50));
+            m.insert("rpc_p90_ms".into(), p(0.90));
+        }
+        drop(lat);
+
+        let rates = self.network_monitor.confirmation_rates.read().await;
+        if !rates.is_empty() {
+            let mut ewma = 0.0;
+            for &r in rates.iter() { ewma = 0.2 * r + 0.8 * ewma; }
+            m.insert("confirm_rate_milli".into(), (ewma * 1000.0) as u64);
+        }
+        drop(rates);
+
+        let q = self.network_monitor.get_quality().await;
+        let code = match q { NetworkQuality::Excellent => 0, NetworkQuality::Good => 1, NetworkQuality::Fair => 2, NetworkQuality::Poor => 3, NetworkQuality::Critical => 4 };
+        m.insert("network_quality_code".into(), code);
+
+        m
     }
 
     pub async fn shutdown(&self) {
@@ -932,52 +1087,92 @@ impl MempoolLessInjector {
 }
 
 impl NetworkMonitor {
+    // === [ULTRA++++: PIECE S] NetworkMonitor (p90 + EWMA + hysteresis) ===
     async fn record_rpc_latency(&self, latency: Duration) {
-        let mut latencies = self.rpc_latencies.write().await;
-        if latencies.len() >= 100 {
-            latencies.pop_front();
-        }
-        latencies.push_back(latency);
+        let mut q = self.rpc_latencies.write().await;
+        if q.len() >= 256 { q.pop_front(); }
+        q.push_back(latency);
     }
 
     async fn record_confirmation_rate(&self, rate: f64) {
-        let mut rates = self.confirmation_rates.write().await;
-        if rates.len() >= 100 {
-            rates.pop_front();
-        }
-        rates.push_back(rate);
+        let mut q = self.confirmation_rates.write().await;
+        if q.len() >= 256 { q.pop_front(); }
+        q.push_back(rate.clamp(0.0, 1.0));
     }
 
     async fn update_network_quality(&self) {
-        let latencies = self.rpc_latencies.read().await;
+        let lat = self.rpc_latencies.read().await;
         let rates = self.confirmation_rates.read().await;
-        
-        if latencies.is_empty() || rates.is_empty() {
-            return;
-        }
-        
-        let avg_latency = latencies.iter().sum::<Duration>() / latencies.len() as u32;
-        let avg_rate = rates.iter().sum::<f64>() / rates.len() as f64;
-        
-        let quality = if avg_latency < Duration::from_millis(50) && avg_rate > 0.95 {
-            NetworkQuality::Excellent
-        } else if avg_latency < Duration::from_millis(150) && avg_rate > 0.85 {
-            NetworkQuality::Good
-        } else if avg_latency < Duration::from_millis(300) && avg_rate > 0.70 {
-            NetworkQuality::Fair
-        } else if avg_latency < Duration::from_millis(500) && avg_rate > 0.50 {
-            NetworkQuality::Poor
-        } else {
-            NetworkQuality::Critical
+        if lat.is_empty() || rates.is_empty() { return; }
+
+        let mut v: Vec<_> = lat.iter().cloned().collect();
+        v.sort_unstable_by_key(|d| d.as_nanos());
+        let p90 = v[((v.len() as f64 - 1.0) * 0.90).round() as usize];
+
+        // EWMA(alpha=0.2)
+        let mut ewma = 0.0;
+        for &r in rates.iter() { ewma = 0.2 * r + 0.8 * ewma; }
+
+        // Base classification
+        let base = if p90 <= Duration::from_millis(70)  && ewma > 0.94 { NetworkQuality::Excellent }
+            else if p90 <= Duration::from_millis(110) && ewma > 0.86 { NetworkQuality::Good }
+            else if p90 <= Duration::from_millis(170) && ewma > 0.72 { NetworkQuality::Fair }
+            else if p90 <= Duration::from_millis(250) && ewma > 0.55 { NetworkQuality::Poor }
+            else { NetworkQuality::Critical };
+
+        // Hysteresis: don’t bounce too fast
+        let last   = *self.network_quality.read().await;
+        let sticky = match (last, base) {
+            // upgrades require slightly stricter metrics; downgrades flow immediately
+            (NetworkQuality::Critical, NetworkQuality::Poor)    if p90 <= Duration::from_millis(230) && ewma > 0.58 => base,
+            (NetworkQuality::Poor,    NetworkQuality::Fair)     if p90 <= Duration::from_millis(160) && ewma > 0.75 => base,
+            (NetworkQuality::Fair,    NetworkQuality::Good)     if p90 <= Duration::from_millis(100) && ewma > 0.88 => base,
+            (NetworkQuality::Good,    NetworkQuality::Excellent)if p90 <= Duration::from_millis(60)  && ewma > 0.96 => base,
+            // otherwise, if base worse than last, accept downgrade; else hold last
+            _ if quality_worse(base, last) => base,
+            _ => last,
         };
-        
-        *self.network_quality.write().await = quality;
+
+        drop(lat); drop(rates);
+        *self.network_quality.write().await = sticky;
         *self.last_health_check.write().await = Instant::now();
     }
 
     async fn get_quality(&self) -> NetworkQuality {
         *self.network_quality.read().await
     }
+
+    // Optional budget helper (can be used in hedging code)
+    async fn dynamic_hedge_budget_ms(&self, netq: NetworkQuality) -> u64 {
+        let lat = self.rpc_latencies.read().await;
+        if lat.is_empty() {
+            return match netq {
+                NetworkQuality::Excellent => 80,  NetworkQuality::Good => 110,
+                NetworkQuality::Fair      => 150, NetworkQuality::Poor => 190,
+                NetworkQuality::Critical  => 210,
+            };
+        }
+        let mut v: Vec<_> = lat.iter().cloned().collect();
+        v.sort_unstable_by_key(|d| d.as_nanos());
+        let p50 = v[((v.len() as f64 - 1.0) * 0.50).round() as usize];
+        let p90 = v[((v.len() as f64 - 1.0) * 0.90).round() as usize];
+        let base = (p50 + (p90 - p50)/2).as_millis() as u64;
+        let guard = match netq { NetworkQuality::Excellent => 20, NetworkQuality::Good => 30,
+                                 NetworkQuality::Fair => 40,      NetworkQuality::Poor => 50,
+                                 NetworkQuality::Critical => 60 };
+        let clamp = match netq { NetworkQuality::Excellent => 80, NetworkQuality::Good => 110,
+                                 NetworkQuality::Fair => 150,     NetworkQuality::Poor => 190,
+                                 NetworkQuality::Critical => 210 };
+        base.saturating_add(guard).min(clamp).max(40)
+    }
+}
+
+// Helper: ordering for hysteresis
+#[inline]
+fn quality_worse(a: NetworkQuality, b: NetworkQuality) -> bool {
+    use NetworkQuality::*;
+    let rank = |q: NetworkQuality| -> u8 { match q { Excellent=>0, Good=>1, Fair=>2, Poor=>3, Critical=>4 }};
+    rank(a) > rank(b)
 }
 
 impl Clone for MempoolLessInjector {
@@ -1129,26 +1324,27 @@ impl OptimizedBundleBuilder {
     }
 }
 
+// === [ULTRA+++: PIECE U] Wait-with-timeout (front-loaded)
 pub async fn wait_for_confirmation_with_timeout(
     injector: &MempoolLessInjector,
     signature: &Signature,
     timeout_ms: u64,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(timeout_ms);
+
     while Instant::now() < deadline {
         match injector.check_transaction_status(signature).await? {
             Some(TransactionConfirmationStatus::Confirmed) |
             Some(TransactionConfirmationStatus::Finalized) => return Ok(()),
-            Some(TransactionConfirmationStatus::Processed) => {
-                sleep(Duration::from_millis(25)).await;
-            }
+            Some(TransactionConfirmationStatus::Processed) => sleep(Duration::from_millis(16)).await,
             None => {
-                sleep(Duration::from_millis(50)).await;
+                let e = start.elapsed().as_millis() as u64;
+                let ms = if e < 200 { 10 } else if e < 400 { 14 } else if e < 1500 { 24 } else { 40 };
+                sleep(Duration::from_millis(ms)).await;
             }
         }
     }
-    
     Err(anyhow!("Confirmation timeout after {}ms", timeout_ms))
 }
 
@@ -1206,68 +1402,57 @@ impl SmartRetryStrategy {
 }
 
 pub struct ConnectionHealthChecker {
-    last_check: Mutex<Instant>,
-    healthy_endpoints: Arc<DashMap<String, bool>>,
+    ttl: Duration,
+    states: Arc<DashMap<String, (bool, Instant)>>,
 }
 
 impl ConnectionHealthChecker {
+    // === [ULTRA+++: PIECE T] ConnectionHealthChecker (TTL + parallel) ===
     pub fn new() -> Self {
-        Self {
-            last_check: Mutex::new(Instant::now()),
-            healthy_endpoints: Arc::new(DashMap::new()),
-        }
+        Self { ttl: Duration::from_secs(30), states: Arc::new(DashMap::new()) }
     }
-    
+
     pub async fn check_endpoint(&self, endpoint: &str) -> bool {
-        if let Some(healthy) = self.healthy_endpoints.get(endpoint) {
-            if self.last_check.lock().await.elapsed() < Duration::from_secs(30) {
-                return *healthy;
-            }
+        if let Some(entry) = self.states.get(endpoint) {
+            let (ok, ts) = *entry;
+            if ts.elapsed() < self.ttl { return ok; }
         }
-        
-        let client = match RpcClient::new_with_timeout(endpoint.to_string(), Duration::from_secs(5)) {
-            Ok(c) => c,
-            Err(_) => {
-                self.healthy_endpoints.insert(endpoint.to_string(), false);
-                return false;
-            }
-        };
-        
-        let healthy = client.get_health().is_ok();
-        self.healthy_endpoints.insert(endpoint.to_string(), healthy);
-        *self.last_check.lock().await = Instant::now();
-        
-        healthy
+        let client = RpcClient::new_with_timeout(endpoint.to_string(), Duration::from_secs(5));
+        let ok = client.get_health().is_ok();
+        self.states.insert(endpoint.to_string(), (ok, Instant::now()));
+        ok
     }
-    
+
     pub async fn get_healthy_endpoints(&self, endpoints: &[String]) -> Vec<String> {
+        let mut futs = FuturesUnordered::new();
+        for e in endpoints {
+            let s = self.clone();
+            let ep = e.clone();
+            futs.push(async move { (ep.clone(), s.check_endpoint(&ep).await) });
+        }
         let mut healthy = Vec::new();
-        
-        for endpoint in endpoints {
-            if self.check_endpoint(endpoint).await {
-                healthy.push(endpoint.clone());
-            }
-        }
-        
-        if healthy.is_empty() && !endpoints.is_empty() {
-            healthy.push(endpoints[0].clone());
-        }
-        
+        while let Some((ep, ok)) = futs.next().await { if ok { healthy.push(ep); } }
+        if healthy.is_empty() && !endpoints.is_empty() { healthy.push(endpoints[0].clone()); }
         healthy
     }
 }
 
+impl Clone for ConnectionHealthChecker {
+    fn clone(&self) -> Self { Self { ttl: self.ttl, states: Arc::clone(&self.states) } }
+}
+
+// === [ULTRA+++: PIECE V] Fanout clamp + high-value boost ===
 #[inline(always)]
 pub fn calculate_optimal_packet_fanout(network_quality: NetworkQuality, is_high_value: bool) -> usize {
-    match (network_quality, is_high_value) {
-        (NetworkQuality::Excellent, false) => 20,
-        (NetworkQuality::Excellent, true) => 40,
-        (NetworkQuality::Good, false) => 30,
-        (NetworkQuality::Good, true) => 50,
-        (NetworkQuality::Fair, _) => 60,
-        (NetworkQuality::Poor, _) => 80,
-        (NetworkQuality::Critical, _) => 100,
-    }
+    let base = match network_quality {
+        NetworkQuality::Excellent => 12,
+        NetworkQuality::Good      => 18,
+        NetworkQuality::Fair      => 26,
+        NetworkQuality::Poor      => 34,
+        NetworkQuality::Critical  => 42,
+    };
+    let bonus = if is_high_value { 8 } else { 0 };
+    (base + bonus).clamp(8, 80)
 }
 
 pub fn create_priority_fee_instruction(microlamports_per_cu: u64) -> Instruction {
