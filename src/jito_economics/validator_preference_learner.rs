@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,7 @@ use tokio::time::interval;
 use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 
 // fast hash for HFT-grade maps
-use ahash::RandomState;
+use ahash::{RandomState, AHashSet};
 
 // Handy alias so we pick AHash transparently everywhere
 type DMap<K, V> = DashMap<K, V, RandomState>;
@@ -51,6 +51,9 @@ const UCB_BONUS_SCALE: f64 = 0.10; // ~10% exploratory bias
 // Latency scales used in scoring/logistic (soft knee)
 const LAT_MS_SOFT_RELIABILITY: f64 = 50.0;
 const LAT_MS_SOFT_SELECTION:  f64 = 80.0;
+
+// Recompute throttle to prevent long frames when many validators flip dirty
+const RECOMPUTE_BATCH_LIMIT: usize = 256;
 
 // --- numerics helpers (no NaNs) ---
 #[inline(always)]
@@ -190,6 +193,7 @@ impl ValidatorPreferenceLearner {
         learner
     }
 
+    #[inline(always)]
     pub async fn record_transaction_outcome(&self, outcome: TransactionOutcome) -> Result<(), String> {
         self.update_sender
             .send(PreferenceUpdate::TransactionOutcome(outcome))
@@ -269,19 +273,24 @@ impl ValidatorPreferenceLearner {
             while let Some(update) = rx.recv().await {
                 match update {
                     PreferenceUpdate::TransactionOutcome(outcome) => {
-                        // Append outcome (bounded window)
-                        let mut dq = history.entry(outcome.validator).or_insert_with(VecDeque::new);
-                        if dq.len() >= PREFERENCE_WINDOW_SIZE {
-                            dq.pop_front();
+                        // Append outcome (bounded window; pre-reserve ring, no clone)
+                        let vid = outcome.validator;
+                        let mut dq = history.entry(vid).or_insert_with(|| {
+                            VecDeque::with_capacity(PREFERENCE_WINDOW_SIZE)
+                        });
+                        if dq.capacity() < PREFERENCE_WINDOW_SIZE {
+                            dq.reserve(PREFERENCE_WINDOW_SIZE - dq.capacity());
                         }
-                        dq.push_back(outcome.clone());
+                        if dq.len() >= PREFERENCE_WINDOW_SIZE { dq.pop_front(); }
+                        dq.push_back(outcome);
                         // Mark validator dirty with last-seen ts
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                        updated.insert(outcome.validator, now);
+                        let _ = updated.insert(vid, now);
                     }
                     PreferenceUpdate::SlotComplete(slot, sm) => {
                         slot_performance.insert(slot, sm);
-                        // NB: cleanup handled elsewhere
+                        // proactive slot GC to bound memory
+                        Self::cleanup_old_slots(&slot_performance, slot);
                     }
                     PreferenceUpdate::PersistState => { /* handled by persistence task */ }
                 }
@@ -299,11 +308,13 @@ impl ValidatorPreferenceLearner {
             loop {
                 tick.tick().await;
 
-                // collect dirty set to recompute
-                let dirty: Vec<Pubkey> = updated.iter().map(|e| *e.key()).collect();
+                // collect dirty set, prioritize freshest, throttle batch
+                let mut dirty: Vec<(Pubkey, u64)> = updated.iter().map(|e| (*e.key(), *e.value())).collect();
                 if dirty.is_empty() { continue; }
+                dirty.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // newest first
+                if dirty.len() > RECOMPUTE_BATCH_LIMIT { dirty.truncate(RECOMPUTE_BATCH_LIMIT); }
 
-                for vid in dirty {
+                for (vid, _) in dirty {
                     // detach history copy to avoid holding map locks
                     let maybe_hist = history.get(&vid).map(|r| r.clone());
                     if let Some(outcomes) = maybe_hist {
@@ -378,7 +389,7 @@ impl ValidatorPreferenceLearner {
                             metrics.insert(vid, updated_metrics);
                         }
                     }
-                    // clear dirty mark
+                    // clear dirty mark for processed key (unprocessed remain for next tick)
                     updated.remove(&vid);
                 }
             }
@@ -754,7 +765,7 @@ impl ValidatorPreferenceLearner {
             let scale = f.fee_stdev.max(1.0);
             let x = (priority_fee as f64 - f.p75) / scale;
             let fee_sig = 1.0 / (1.0 + (-x).exp()); // (0,1)
-            let k_fee = 0.75; // strength of fee leverage in log-odds
+            let k_fee = 0.5 + 0.5 * f.high_fee_affinity.clamp(0.0, 1.0); // scale by observed affinity
             let fee_bump = k_fee * (2.0 * fee_sig - 1.0); // [-k, +k]
 
             let logit = logit0 + safe_ln(type_mult) + safe_ln(lat_mult) + safe_ln(conf_mult) + fee_bump;
