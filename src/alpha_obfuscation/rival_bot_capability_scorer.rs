@@ -1,11 +1,633 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
+use anyhow::{Context, Result};
+use futures::future;
 
 pub fn make_rpc_client(rpc_url: &str) -> RpcClient {
     RpcClient::new_with_commitment(
         rpc_url.to_string(),
         CommitmentConfig::confirmed(), // tuned for MEV bots: confirmed is faster than finalized
     )
+}
+
+// =============== ShardedScorer v2 (adaptive width, fairness guard) ===============
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+
+pub struct ShardedScorer {
+    hi_txs: Vec<mpsc::Sender<(Signature, Pubkey)>>,
+    lo_txs: Vec<mpsc::Sender<(Signature, Pubkey)>>,
+}
+
+impl ShardedScorer {
+    pub fn new(scorer: Arc<RivalBotCapabilityScorer>, shards: usize, cap_per_q: usize) -> Self {
+        assert!(shards > 0);
+        let mut hi_txs = Vec::with_capacity(shards);
+        let mut lo_txs = Vec::with_capacity(shards);
+        for shard in 0..shards {
+            let (hi_tx, mut hi_rx) = mpsc::channel::<(Signature, Pubkey)>(cap_per_q);
+            let (lo_tx, mut lo_rx) = mpsc::channel::<(Signature, Pubkey)>(cap_per_q);
+            let s = scorer.clone();
+            tokio::spawn(async move {
+                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+                let base_width = ((cores.max(4).min(32)) / 2).max(4).min(16);
+                const BATCH_BASE: usize = 64;
+                const BATCH_HOT: usize = 96;
+                const HI_BURST_MAX: usize = 4;
+                const DEDUP_CAP: usize = 8192;
+                let mut buf: Vec<(Signature, Pubkey)> = Vec::with_capacity(BATCH_HOT);
+                let mut hi_burst = 0usize;
+                use std::collections::{HashSet, VecDeque};
+                let mut seen: HashSet<Signature> = HashSet::with_capacity(DEDUP_CAP);
+                let mut order: VecDeque<Signature> = VecDeque::with_capacity(DEDUP_CAP);
+                let mut insert_seen = |sig: Signature| {
+                    if seen.contains(&sig) { true } else {
+                        if seen.len() >= DEDUP_CAP { if let Some(old) = order.pop_front() { seen.remove(&old); } }
+                        seen.insert(sig); order.push_back(sig); false
+                    }
+                };
+                loop {
+                    let mut did_work = false; let mut hot = false;
+                    // HI burst
+                    if hi_burst < HI_BURST_MAX {
+                        let mut pulled = 0usize;
+                        while let Ok((sig, bot)) = hi_rx.try_recv() {
+                            if insert_seen(sig) { super::metrics_hdr::record_dedup(shard, true); continue; }
+                            buf.push((sig, bot)); pulled += 1; if buf.len() >= BATCH_HOT { break; }
+                        }
+                        if pulled > 0 { did_work = true; hi_burst += 1; hot = pulled >= 24; let width = if hot { (base_width + 4).min(32) } else { base_width }; drain_with_width(&s, &mut buf, width).await; }
+                    }
+                    // LO fairness
+                    if !did_work || hi_burst >= HI_BURST_MAX {
+                        let mut pulled = 0usize;
+                        while let Ok((sig, bot)) = lo_rx.try_recv() {
+                            if insert_seen(sig) { super::metrics_hdr::record_dedup(shard, false); continue; }
+                            buf.push((sig, bot)); pulled += 1; if buf.len() >= BATCH_HOT { break; }
+                        }
+                        if pulled > 0 { did_work = true; hi_burst = 0; hot = hot || pulled >= 24; let width = if hot { (base_width + 4).min(32) } else { base_width }; drain_with_width(&s, &mut buf, width).await; }
+                    }
+                    if !did_work {
+                        tokio::select! {
+                            biased;
+                            Some((sig,bot)) = hi_rx.recv() => {
+                                if insert_seen(sig) { super::metrics_hdr::record_dedup(shard, true); }
+                                else { buf.push((sig,bot)); }
+                                hi_burst = (hi_burst + 1).min(HI_BURST_MAX);
+                                while buf.len() < BATCH_BASE { if let Ok((s2,b2)) = hi_rx.try_recv() { if insert_seen(s2) { super::metrics_hdr::record_dedup(shard, true); } else { buf.push((s2,b2)); } } else { break } }
+                                drain_with_width(&s, &mut buf, base_width).await;
+                            }
+                            Some((sig,bot)) = lo_rx.recv() => {
+                                if insert_seen(sig) { super::metrics_hdr::record_dedup(shard, false); }
+                                else { buf.push((sig,bot)); }
+                                hi_burst = 0;
+                                while buf.len() < BATCH_BASE { if let Ok((s2,b2)) = lo_rx.try_recv() { if insert_seen(s2) { super::metrics_hdr::record_dedup(shard, false); } else { buf.push((s2,b2)); } } else { break } }
+                                drain_with_width(&s, &mut buf, base_width).await;
+                            }
+                            else => break,
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            hi_txs.push(hi_tx); lo_txs.push(lo_tx);
+        }
+        Self { hi_txs, lo_txs }
+    }
+    #[inline] fn shard_index(&self, bot: &Pubkey) -> usize { let mut k = 1469598103934665603u64; for b in bot.to_bytes(){ k^=b as u64; k = k.wrapping_mul(1099511628211);} jump_consistent_hash(k, self.hi_txs.len() as i32) as usize }
+    #[inline] pub fn dispatch_prio(&self, sig: Signature, bot: Pubkey) { let idx = self.shard_index(&bot); if self.hi_txs[idx].try_send((sig, bot)).is_err() { super::metrics_hdr::record_q_drop(idx, true); } }
+    #[inline] pub fn dispatch(&self, sig: Signature, bot: Pubkey) { let idx = self.shard_index(&bot); if self.lo_txs[idx].try_send((sig, bot)).is_err() { super::metrics_hdr::record_q_drop(idx, false); } }
+    #[inline] pub fn dispatch_many(&self, items: &[(Signature, Pubkey)], high: bool) { for (sig, bot) in items { if high { self.dispatch_prio(*sig,*bot);} else { self.dispatch(*sig,*bot);} } }
+}
+
+// =============== Priority Sharded Ingest (hi/lo queues) ===============
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+
+pub struct PriorityShardedScorer {
+    hi_txs: Vec<mpsc::Sender<(Signature, Pubkey)>>,
+    lo_txs: Vec<mpsc::Sender<(Signature, Pubkey)>>,
+}
+
+impl PriorityShardedScorer {
+    pub fn new(scorer: Arc<RivalBotCapabilityScorer>, shards: usize, cap_per_shard: usize) -> Self {
+        assert!(shards > 0);
+        let mut hi_txs = Vec::with_capacity(shards);
+        let mut lo_txs = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            let (hi_tx, mut hi_rx) = mpsc::channel::<(Signature, Pubkey)>(cap_per_shard);
+            let (lo_tx, mut lo_rx) = mpsc::channel::<(Signature, Pubkey)>(cap_per_shard);
+            let s = scorer.clone();
+            tokio::spawn(async move {
+                const BATCH: usize = 64; const WIDTH: usize = 8;
+                let mut buf: Vec<(Signature, Pubkey)> = Vec::with_capacity(BATCH);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(item) = hi_rx.recv() => {
+                            buf.clear(); buf.push(item);
+                            while buf.len() < BATCH { match hi_rx.try_recv(){ Ok(x)=>buf.push(x), Err(_)=>break } }
+                            drain_with_width(&s, &mut buf, WIDTH).await;
+                        }
+                        Some(item) = lo_rx.recv() => {
+                            buf.clear(); buf.push(item);
+                            while buf.len() < BATCH { match lo_rx.try_recv(){ Ok(x)=>buf.push(x), Err(_)=>break } }
+                            drain_with_width(&s, &mut buf, WIDTH).await;
+                        }
+                        else => break,
+                    }
+                }
+            });
+            hi_txs.push(hi_tx); lo_txs.push(lo_tx);
+        }
+        Self { hi_txs, lo_txs }
+    }
+    #[inline] fn shard_index(&self, bot: &Pubkey) -> usize {
+        let mut k = 1469598103934665603u64; for b in bot.to_bytes(){ k^=b as u64; k = k.wrapping_mul(1099511628211);} jump_consistent_hash(k, self.hi_txs.len() as i32) as usize
+    }
+    #[inline] pub fn dispatch_prio(&self, sig: Signature, bot: Pubkey) { let idx = self.shard_index(&bot); let _ = self.hi_txs[idx].try_send((sig, bot)); }
+    #[inline] pub fn dispatch(&self, sig: Signature, bot: Pubkey) { let idx = self.shard_index(&bot); let _ = self.lo_txs[idx].try_send((sig, bot)); }
+    #[inline] pub fn dispatch_many(&self, items: &[(Signature, Pubkey)], high: bool) { for (sig, bot) in items { if high { self.dispatch_prio(*sig,*bot);} else { self.dispatch(*sig,*bot);} } }
+}
+
+// =================== [PIECE 6: Hedged RPC (ULTRA+ v5)] ===================
+use std::{sync::Arc, time::{Duration, Instant}};
+use moka::future::Cache;
+use tokio::sync::{Semaphore, RwLock as TokioRwLock};
+use serde_json::Value;
+use solana_client::{rpc_request::RpcRequest, rpc_config::RpcTransactionConfig};
+use solana_transaction_status::UiTransactionEncoding;
+use solana_sdk::signature::Signature;
+use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
+use fastrand::Rng;
+use smallvec::SmallVec;
+
+// =================== [PIECE 20α: P² Online Quantile (SmallVec bootstrap)] ===================
+#[derive(Clone, Debug)]
+struct P2Quantile {
+    p: f64,
+    boot: SmallVec<[f64; 5]>,
+    q: [f64; 5],
+    n: [f64; 5],
+    np: [f64; 5],
+    dn: [f64; 5],
+    ready: bool,
+}
+
+impl P2Quantile {
+    fn new(p: f64) -> Self {
+        assert!((0.0..=1.0).contains(&p));
+        Self { p, boot: SmallVec::new(), q: [0.0;5], n:[0.0;5], np:[0.0;5], dn:[0.0;5], ready: false }
+    }
+    #[inline] fn parabolic(&self, i: usize, d: f64) -> f64 {
+        let q_i = self.q[i];
+        q_i + d * (
+            (self.n[i] - self.n[i-1] + d) * (self.q[i+1] - q_i) / (self.n[i+1]-self.n[i]) +
+            (self.n[i+1] - self.n[i] - d) * (q_i - self.q[i-1]) / (self.n[i]  -self.n[i-1])
+        ) / (self.n[i+1]-self.n[i-1])
+    }
+    #[inline] fn linear(&self, i: usize, d: f64) -> f64 {
+        let j = (i as isize + d as isize) as usize;
+        self.q[i] + d * (self.q[j] - self.q[i]) / (self.n[j] - self.n[i])
+    }
+    #[inline]
+    fn observe(&mut self, x: f64) {
+        if !self.ready {
+            self.boot.push(x);
+            if self.boot.len() < 5 { return; }
+            self.boot.sort_by(|a,b| a.partial_cmp(b).unwrap());
+            for i in 0..5 { self.q[i] = self.boot[i]; }
+            self.n  = [0.0, 1.0, 2.0, 3.0, 4.0];
+            self.np = [0.0, 2.0*self.p, 4.0*self.p, 2.0+2.0*self.p, 4.0];
+            self.dn = [0.0, self.p/2.0, self.p, (1.0+self.p)/2.0, 1.0];
+            self.boot.clear();
+            self.ready = true;
+            return;
+        }
+        let k = if x < self.q[0] { self.q[0]=x; 0 }
+                else if x < self.q[1] { 0 }
+                else if x < self.q[2] { 1 }
+                else if x < self.q[3] { 2 }
+                else if x <= self.q[4] { 3 } else { self.q[4]=x; 3 };
+        for i in k+1..5 { self.n[i] += 1.0; }
+        for i in 0..5 { self.np[i] += self.dn[i]; }
+        for i in 1..4 {
+            let d = self.np[i] - self.n[i];
+            let left = self.n[i] - self.n[i-1];
+            let right= self.n[i+1] - self.n[i];
+            if (d >= 1.0 && right > 1.0) || (d <= -1.0 && left > 1.0) {
+                let s = d.signum();
+                let q_hat = self.parabolic(i, s);
+                self.q[i] = if self.q[i-1] < q_hat && q_hat < self.q[i+1] { q_hat } else { self.linear(i, s) };
+                self.n[i] += s;
+            }
+        }
+    }
+    #[inline] fn quantile(&self) -> f64 { if !self.ready { 0.0 } else { self.q[2] } }
+    /// Optional deadband around current estimate to ignore micro-jitter.
+    #[inline]
+    fn observe_with_eps(&mut self, x: f64, eps_frac: f64) {
+        if self.ready && eps_frac > 0.0 {
+            let q2 = self.q[2];
+            if q2.is_finite() && q2 > 0.0 {
+                let lo = q2 * (1.0 - eps_frac);
+                let hi = q2 * (1.0 + eps_frac);
+                if x >= lo && x <= hi { return; }
+            }
+        }
+        self.observe(x)
+    }
+
+    /// Soft reset when sustained drift persists for N updates; re-centers around q2.
+    #[inline]
+    fn observe_with_shift_reset(&mut self, x: f64, eps_frac: f64, drift_cap: usize) {
+        if !self.ready { self.observe(x); return; }
+        let q2 = self.q[2];
+        if !q2.is_finite() || q2 <= 0.0 { self.observe(x); return; }
+        let lo = q2 * (1.0 - eps_frac);
+        let hi = q2 * (1.0 + eps_frac);
+        // store drift counter in dn[0]
+        if x < lo || x > hi { self.dn[0] = (self.dn[0] + 1.0).min(1e18); } else { self.dn[0] = 0.0; }
+        if (self.dn[0] as usize) >= drift_cap {
+            let mut v = [self.q[0], self.q[1], q2, self.q[3], self.q[4]];
+            v[2] = (v[2] + x) * 0.5; v[1] = (v[1] + v[2]) * 0.5; v[3] = (v[2] + v[3]) * 0.5;
+            for i in 0..5 { self.q[i] = v[i]; self.n[i] = i as f64; }
+            self.np = [0.0, 2.0*self.p, 4.0*self.p, 2.0+2.0*self.p, 4.0];
+            self.dn = [0.0, self.p/2.0, self.p, (1.0+self.p)/2.0, 1.0];
+            self.ready = true; return;
+        }
+        self.observe_with_eps(x, eps_frac);
+    }
+}
+
+// =================== [PIECE 22+++ : hdr metrics hooks (safe atomics + rolling max)] ===================
+mod metrics_hdr {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BH_MS_SUM: AtomicU64 = AtomicU64::new(0);
+    static BH_MS_CNT: AtomicU64 = AtomicU64::new(0);
+    static BH_MS_MAX: AtomicU64 = AtomicU64::new(0);
+    static FEE_SUM:   AtomicU64 = AtomicU64::new(0);
+    static FEE_CNT:   AtomicU64 = AtomicU64::new(0);
+
+    const SLOTS: usize = 64;
+    static BH_SHARD_SUM: [AtomicU64; SLOTS] = [AtomicU64::new(0); SLOTS];
+    static BH_SHARD_CNT: [AtomicU64; SLOTS] = [AtomicU64::new(0); SLOTS];
+    // Dedup counters per class (HI/LO)
+    static HI_DEDUP: [AtomicU64; SLOTS] = [AtomicU64::new(0); SLOTS];
+    static LO_DEDUP: [AtomicU64; SLOTS] = [AtomicU64::new(0); SLOTS];
+    // Encoding unsupported counters [json, jsonp, b58, b64, b64z]
+    static ENC_UNSUP: [AtomicU64; 5] = [AtomicU64::new(0); 5];
+
+    #[inline]
+    pub fn record_bh_ms(idx: usize, ms: f64) {
+        let v = if ms.is_finite() && ms >= 0.0 { ms as u64 } else { 0 };
+        BH_MS_SUM.fetch_add(v, Ordering::Relaxed);
+        BH_MS_CNT.fetch_add(1, Ordering::Relaxed);
+        // rolling max
+        let mut cur = BH_MS_MAX.load(Ordering::Relaxed);
+        while v > cur && BH_MS_MAX.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            cur = BH_MS_MAX.load(Ordering::Relaxed);
+        }
+        let j = idx & (SLOTS - 1);
+        BH_SHARD_SUM[j].fetch_add(v, Ordering::Relaxed);
+        BH_SHARD_CNT[j].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_fee_heat(_idx: usize, mlcu: f64) {
+        let v = if mlcu.is_finite() && mlcu >= 0.0 { mlcu as u64 } else { 0 };
+        FEE_SUM.fetch_add(v, Ordering::Relaxed);
+        FEE_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline] pub fn avg_bh_ms() -> f64 { (BH_MS_SUM.load(Ordering::Relaxed) as f64) / (BH_MS_CNT.load(Ordering::Relaxed).max(1) as f64) }
+    #[inline] pub fn max_bh_ms() -> u64 { BH_MS_MAX.load(Ordering::Relaxed) }
+    #[inline] pub fn avg_fee_mlcu() -> f64 { (FEE_SUM.load(Ordering::Relaxed) as f64) / (FEE_CNT.load(Ordering::Relaxed).max(1) as f64) }
+    #[inline] pub fn record_enc_unsupported(kind_idx: usize) { if kind_idx < 5 { ENC_UNSUP[kind_idx].fetch_add(1, Ordering::Relaxed); } }
+    #[inline] pub fn record_dedup(idx: usize, high: bool) {
+        let j = idx & (SLOTS - 1);
+        if high { HI_DEDUP[j].fetch_add(1, Ordering::Relaxed); } else { LO_DEDUP[j].fetch_add(1, Ordering::Relaxed); }
+    }
+}
+
+struct Ep {
+    cli: Arc<RpcClient>,
+    ewma_ms: f64,
+    err_p: f64,
+    breaker_until: Instant,
+    permits: Arc<Semaphore>,
+    rate_backoff_until: Instant,
+    rate_backoff_ms: u64,
+    // inclusion-aware probes
+    last_slot: u64,
+    slot_lag_ewma: f64,
+    bh_latency_ewma_ms: f64,
+    fee_heat_ewma_mlcu: f64,
+    // quantiles
+    q_bh_p90: P2Quantile,
+    q_bh_p99: P2Quantile,
+    q_fee_p80: P2Quantile,
+    // rate shaping (token bucket)
+    tb_tokens: f64,
+    tb_capacity: f64,
+    tb_refill_per_ms: f64,
+    tb_last: Instant,
+    // UCB1 stats
+    pulls: u64,
+    succ: u64,
+    ms_sum: f64,
+    // learned encoding support mask (1 bit per encoding)
+    enc_mask: u8,
+}
+
+impl Ep {
+    fn score(&self, ms_per_slot: f64, w_lag: f64, w_bh: f64, w_fee: f64) -> f64 {
+        // Soft-skip backends that are far behind by adding a large penalty.
+        let lag_pen = if self.slot_lag_ewma > 2.5 { 50_000.0 } else { 0.0 };
+        let mut s = self.ewma_ms * (1.0 + self.err_p.min(1.0)) + lag_pen;
+        if Instant::now() < self.breaker_until { s += 10_000.0; }
+        s + w_lag * (self.slot_lag_ewma * ms_per_slot) + w_bh * self.bh_latency_ewma_ms + w_fee * self.fee_heat_ewma_mlcu
+    }
+    #[inline]
+    fn tb_try_take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed_ms = now.saturating_duration_since(self.tb_last).as_millis() as f64;
+        if elapsed_ms > 0.0 {
+            self.tb_tokens = (self.tb_tokens + elapsed_ms * self.tb_refill_per_ms).min(self.tb_capacity);
+            self.tb_last = now;
+        }
+        if self.tb_tokens >= 1.0 { self.tb_tokens -= 1.0; true } else { false }
+    }
+    #[inline]
+    fn tb_penalize_rate(&mut self) {
+        self.tb_capacity = (self.tb_capacity * 0.8).clamp(8.0, 256.0);
+        self.tb_refill_per_ms = (self.tb_refill_per_ms * 0.85).clamp(0.005, 0.5);
+    }
+    #[inline]
+    fn tb_reward_rate(&mut self) {
+        self.tb_capacity = (self.tb_capacity * 1.02).clamp(8.0, 256.0);
+        self.tb_refill_per_ms = (self.tb_refill_per_ms * 1.02).clamp(0.005, 0.5);
+    }
+    #[inline]
+    fn supports(&self, enc: UiTransactionEncoding) -> bool { (self.enc_mask & (1u8 << enc_idx(enc))) != 0 }
+    #[inline]
+    fn mark_unsupported(&mut self, enc: UiTransactionEncoding) { let i = enc_idx(enc); if i < 8 { self.enc_mask &= !(1u8 << i); super::metrics_hdr::record_enc_unsupported(i); } }
+}
+
+#[derive(Clone)]
+pub struct HedgedRpc {
+    eps: Arc<Vec<tokio::sync::Mutex<Ep>>>,
+    min_stagger: Duration,
+    cache: Cache<String, Option<EncodedConfirmedTransactionWithStatusMeta>>,
+    none_cache: Cache<String, ()>,
+    ms_per_slot: Arc<TokioRwLock<f64>>,
+    w_lag: f64,
+    w_bh: f64,
+    w_fee: f64,
+    epsilon: f64,
+    rng: Arc<Rng>,
+    // global concurrency budget
+    global_permits: Arc<Semaphore>,
+    // UCB1 exploration strength (ms units)
+    bandit_c: f64,
+}
+
+impl HedgedRpc {
+    pub fn new(a: Arc<RpcClient>, b: Arc<RpcClient>, stagger: Duration) -> Self { Self::new_multi(vec![a,b], stagger) }
+    pub fn new_multi(clients: Vec<Arc<RpcClient>>, stagger: Duration) -> Self {
+        let eps = clients.into_iter().map(|cli| Ep {
+            cli,
+            ewma_ms: 35.0,
+            err_p: 0.0,
+            breaker_until: Instant::now(),
+            permits: Arc::new(Semaphore::new(64)),
+            rate_backoff_until: Instant::now(),
+            rate_backoff_ms: 250,
+            last_slot: 0,
+            slot_lag_ewma: 0.0,
+            bh_latency_ewma_ms: 35.0,
+            fee_heat_ewma_mlcu: 0.0,
+            q_bh_p90: P2Quantile::new(0.90),
+            q_bh_p99: P2Quantile::new(0.99),
+            q_fee_p80: P2Quantile::new(0.80),
+            tb_tokens: 64.0,
+            tb_capacity: 64.0,
+            tb_refill_per_ms: 0.04,
+            tb_last: Instant::now(),
+            pulls: 1,
+            succ: 1,
+            ms_sum: 35.0,
+            enc_mask: 0b1_1111,
+        }).map(tokio::sync::Mutex::new).collect::<Vec<_>>();
+        let this = Self {
+            eps: Arc::new(eps),
+            min_stagger: stagger.min(Duration::from_millis(25)),
+            cache: Cache::builder().time_to_live(Duration::from_millis(650)).time_to_idle(Duration::from_millis(500)).max_capacity(100_000).build(),
+            none_cache: Cache::builder().time_to_live(Duration::from_millis(320)).time_to_idle(Duration::from_millis(320)).max_capacity(150_000).build(),
+            ms_per_slot: Arc::new(TokioRwLock::new(400.0)),
+            w_lag: 0.35,
+            w_bh: 0.25,
+            w_fee: 0.02,
+            epsilon: 0.05,
+            rng: Arc::new(Rng::new()),
+            global_permits: Arc::new(Semaphore::new(256)),
+            bandit_c: 12.0,
+        };
+        this.spawn_probe_task();
+        this
+    }
+    pub async fn get_tx_fast_cached(&self, sig: &Signature, enc: UiTransactionEncoding) -> Result<Option<EncodedConfirmedTransactionWithStatusMeta>> {
+        let key = format!("{}#{}", sig, enc_to_key(enc));
+        if self.none_cache.get(&key).is_some() { return Ok(None); }
+        Ok(self.cache.get_with(key.clone(), self.fetch(sig.clone(), enc, key)).await)
+    }
+    pub async fn get_tx_fast(&self, sig: &Signature, enc: UiTransactionEncoding) -> Result<Option<EncodedConfirmedTransactionWithStatusMeta>> { (self.fetch(sig.clone(), enc, String::new())).await.ok_or(None) }
+    async fn pick_order(&self) -> Vec<usize> {
+        let msps = *self.ms_per_slot.read().await;
+        // UCB1 bandit blended with classical score
+        let mut T: f64 = 0.0;
+        let mut stats: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(self.eps.len());
+        for (i, epm) in self.eps.iter().enumerate() {
+            let ep = epm.lock().await;
+            T += ep.pulls as f64;
+            stats.push((i, ep.pulls as f64, (ep.ms_sum / (ep.pulls as f64)).max(1.0), ep.score(msps, self.w_lag, self.w_bh, self.w_fee)));
+        }
+        if T < 1.0 { T = 1.0; }
+        let lnT = T.ln();
+        let mut idx_sc: Vec<(usize, f64)> = stats.into_iter().map(|(i, n, mean_ms, sc)| {
+            let explore = self.bandit_c * (lnT / n.max(1.0)).sqrt();
+            (i, 0.60 * (mean_ms - explore) + 0.40 * sc)
+        }).collect();
+        idx_sc.sort_by(|a,b| a.1.partial_cmp(&b.1).unwrap());
+        let mut order: Vec<usize> = idx_sc.into_iter().map(|(i,_s)| i).collect();
+        if order.len() > 3 && self.rng.f64() < self.epsilon {
+            let j = 3 + self.rng.usize(..(order.len()-3));
+            order.swap(2, j);
+        }
+        order
+    }
+    fn fetch(&self, sig: Signature, enc: UiTransactionEncoding, cache_key: String) -> impl std::future::Future<Output = Option<EncodedConfirmedTransactionWithStatusMeta>> + Send + 'static {
+        let eps = self.eps.clone(); let cap = self.min_stagger; let this = self.clone(); async move {
+            let order = this.pick_order().await; if order.is_empty() { return None; }
+            let a = order[0]; let b = *order.get(1).unwrap_or(&a); let c = *order.get(2).unwrap_or(&b); let d = *order.get(3).unwrap_or(&c);
+            let msps = *this.ms_per_slot.read().await;
+            let dynamic_floor = Duration::from_millis(((msps * 0.06).clamp(5.0, 25.0)) as u64);
+            let (base1, base2, base3) = { let ep = eps[a].lock().await; let p99 = ep.q_bh_p99.quantile(); let ref_ms = if p99.is_finite() && p99 > 0.0 { p99 } else { ep.ewma_ms * 1.8 }; ((ref_ms*0.40).max(2.0), (ref_ms*0.75).max(4.0), (ref_ms*1.10).max(6.0)) };
+            let j1 = 0.7 + this.rng.f64()*0.6; let j2 = 0.8 + this.rng.f64()*0.6; let j3 = 0.9 + this.rng.f64()*0.6;
+            let floor = dynamic_floor.min(cap);
+            let stag1 = floor.min(Duration::from_millis((base1*j1) as u64));
+            let stag2 = floor.min(Duration::from_millis((base2*j2) as u64));
+            let stag3 = floor.min(Duration::from_millis((base3*j3) as u64));
+
+            // meltdown clamp
+            let meltdown = crate::metrics_hdr::max_bh_ms() as f64 > 2.5 * msps;
+
+            let f1 = Self::call_endpoint(eps.clone(), a, sig.clone(), enc, this.global_permits.clone());
+            let f2 = async { tokio::time::sleep(stag1).await; Self::call_endpoint(eps.clone(), b, sig.clone(), enc, this.global_permits.clone()).await };
+            if meltdown {
+                let r = tokio::select! { r = f1 => if r.is_some() { r } else { f2.await } };
+                if r.is_none() && !cache_key.is_empty() { let _ = this.none_cache.insert(cache_key, ()); }
+                return r;
+            }
+            let f3 = async { tokio::time::sleep(stag2).await; Self::call_endpoint(eps.clone(), c, sig.clone(), enc, this.global_permits.clone()).await };
+            let f4 = async { tokio::time::sleep(stag3).await; Self::call_endpoint(eps.clone(), d, sig.clone(), enc, this.global_permits.clone()).await };
+            let r = tokio::select! { r = f1 => if r.is_some() { r } else { tokio::select! { r2 = f2 => if r2.is_some() { r2 } else { tokio::select! { r3 = f3 => if r3.is_some() { r3 } else { f4.await }, r4 = f4 => r4, } }, r3 = f3 => if r3.is_some() { r3 } else { f4.await }, r4 = f4 => r4, } } };
+            if r.is_none() && !cache_key.is_empty() { let _ = this.none_cache.insert(cache_key, ()); }
+            r
+        } }
+    async fn call_endpoint(eps: Arc<Vec<tokio::sync::Mutex<Ep>>>, idx: usize, sig: Signature, enc_req: UiTransactionEncoding, global: Arc<Semaphore>) -> Option<EncodedConfirmedTransactionWithStatusMeta> {
+        {
+            let mut ep = eps[idx].lock().await;
+            if Instant::now() < ep.rate_backoff_until { return None; }
+            if !ep.tb_try_take() { return None; }
+        }
+        let (cli, permits, mask) = { let ep = eps[idx].lock().await; (ep.cli.clone(), ep.permits.clone(), ep.enc_mask) };
+        let (permit_local, permit_global) = match (permits.try_acquire_owned(), global.try_acquire_owned()) { (Ok(l), Ok(g)) => (l, g), _ => return None };
+        // choose encoding respecting learned mask
+        let mut enc = if (mask & (1u8 << enc_idx(enc_req))) != 0 { enc_req } else { enc_fallback_list().into_iter().find(|&e| (mask & (1u8 << enc_idx(e))) != 0).unwrap_or(UiTransactionEncoding::Base64) };
+        let start = Instant::now();
+        let timeout_ms = { let ep = eps[idx].lock().await; let p99 = ep.q_bh_p99.quantile(); ((if p99.is_finite() && p99 > 0.0 { p99 } else { ep.ewma_ms * 2.0 }) * 1.12).clamp(120.0, 1500.0) } as u64;
+        let initial_budget = (timeout_ms as f64 * 0.45) as u64;
+        // Confirmed leg
+        let cfg_conf = RpcTransactionConfig { encoding: Some(enc), commitment: Some(CommitmentConfig::confirmed()), max_supported_transaction_version: Some(0), ..Default::default() };
+        let res = tokio::time::timeout(Duration::from_millis(initial_budget), cli.get_transaction_with_config(&sig, cfg_conf)).await;
+        {
+            let dt_ms = start.elapsed().as_secs_f64()*1000.0;
+            let mut ep = eps[idx].lock().await; ep.pulls += 1; ep.ms_sum += dt_ms;
+        }
+        // Handle confirmed leg quickly
+        match res {
+            Ok(Ok(Some(v))) => {
+                let mut ep = eps[idx].lock().await; ep.err_p = (ep.err_p*0.85).max(0.0); ep.rate_backoff_ms=250; ep.tb_reward_rate(); ep.succ+=1; drop(permit_local); drop(permit_global); return Some(v)
+            }
+            Ok(Ok(None)) => { let mut ep = eps[idx].lock().await; ep.err_p = (ep.err_p + 0.02).min(1.0); }
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("unsupported") || msg.contains("encoding") {
+                    let mut ep = eps[idx].lock().await; ep.mark_unsupported(enc);
+                    if let Some(next_enc) = enc_fallback_list().into_iter().find(|&en| ep.supports(en)) { enc = next_enc; }
+                } else if msg.contains("Too many request") || msg.contains("-32005") {
+                    let mut ep = eps[idx].lock().await; let jitter = 0.5 + fastrand::f64(); let next = ((ep.rate_backoff_ms as f64 * 1.5).min(3000.0) * jitter) as u64; ep.rate_backoff_ms = next.max(250); ep.rate_backoff_until = Instant::now() + Duration::from_millis(ep.rate_backoff_ms); ep.tb_penalize_rate();
+                } else { let mut ep = eps[idx].lock().await; if ep.err_p > 0.80 { ep.breaker_until = Instant::now() + Duration::from_millis(250); } }
+            }
+            Err(_) => { let mut ep = eps[idx].lock().await; ep.err_p=(ep.err_p+0.25).min(1.0); ep.breaker_until=Instant::now()+Duration::from_millis(250); drop(permit_local); drop(permit_global); return None }
+        }
+        // Finalized leg within remaining budget
+        let elapsed = start.elapsed();
+        let remaining = Duration::from_millis(timeout_ms).saturating_sub(elapsed);
+        if remaining <= Duration::from_millis(20) { drop(permit_local); drop(permit_global); return None; }
+        let cfg_fin = RpcTransactionConfig { encoding: Some(enc), commitment: Some(CommitmentConfig::finalized()), max_supported_transaction_version: Some(0), ..Default::default() };
+        let fin = tokio::time::timeout(remaining, cli.get_transaction_with_config(&sig, cfg_fin)).await;
+        let out = match fin {
+            Ok(Ok(Some(v))) => { let mut ep = eps[idx].lock().await; ep.err_p=(ep.err_p*0.85).max(0.0); ep.rate_backoff_ms=250; ep.tb_reward_rate(); ep.succ+=1; Some(v) }
+            Ok(Ok(None)) => { let mut ep = eps[idx].lock().await; ep.err_p=(ep.err_p+0.02).min(1.0); None }
+            Ok(Err(e)) => { let msg = e.to_string(); if msg.contains("unsupported") || msg.contains("encoding") { let mut ep = eps[idx].lock().await; ep.mark_unsupported(enc); } else if msg.contains("Too many request") || msg.contains("-32005") { let mut ep = eps[idx].lock().await; let jitter = 0.5 + fastrand::f64(); let next = ((ep.rate_backoff_ms as f64 * 1.5).min(3000.0) * jitter) as u64; ep.rate_backoff_ms = next.max(250); ep.rate_backoff_until = Instant::now() + Duration::from_millis(ep.rate_backoff_ms); ep.tb_penalize_rate(); } else { let mut ep = eps[idx].lock().await; ep.err_p=(ep.err_p+0.20).min(1.0); } None }
+            Err(_) => { let mut ep = eps[idx].lock().await; ep.err_p=(ep.err_p+0.25).min(1.0); ep.breaker_until=Instant::now()+Duration::from_millis(250); None }
+        };
+        drop(permit_local); drop(permit_global);
+        out
+    }
+    pub async fn estimate_slot_ms(&self) -> Option<f64> { Some(*self.ms_per_slot.read().await) }
+
+    #[derive(Clone, Debug)]
+    pub struct EndpointSnapshot { pub index: usize, pub ewma_ms: f64, pub err_p: f64, pub slot_lag_ewma: f64, pub bh_latency_ewma_ms: f64, pub fee_heat_ewma_mlcu: f64, pub bh_p90_ms: f64, pub bh_p99_ms: f64, pub fee_p80_mlcu: f64, pub enc_mask: u8 }
+    pub async fn endpoints_snapshot(&self) -> Vec<EndpointSnapshot> { let mut out = Vec::with_capacity(self.eps.len()); for (i, epm) in self.eps.iter().enumerate() { let ep = epm.lock().await; out.push(EndpointSnapshot { index: i, ewma_ms: ep.ewma_ms, err_p: ep.err_p, slot_lag_ewma: ep.slot_lag_ewma, bh_latency_ewma_ms: ep.bh_latency_ewma_ms, fee_heat_ewma_mlcu: ep.fee_heat_ewma_mlcu, bh_p90_ms: ep.q_bh_p90.quantile(), bh_p99_ms: ep.q_bh_p99.quantile(), fee_p80_mlcu: ep.q_fee_p80.quantile(), enc_mask: ep.enc_mask }); } out }
+    fn spawn_probe_task(&self) {
+        let eps = self.eps.clone(); let msps = self.ms_per_slot.clone(); let none = self.none_cache.clone();
+        tokio::spawn(async move {
+            let alpha = 0.3; let bh_alpha = 0.25; let fee_alpha = 0.2; let mut last_max_slot = 0u64;
+            loop {
+                let mut max_slot = 0u64;
+                // probe endpoints
+                for (i, epm) in eps.iter().enumerate() {
+                    let (cli, permits) = { let ep = epm.lock().await; (ep.cli.clone(), ep.permits.clone()) };
+                    if let Ok(permit) = permits.try_acquire_owned() {
+                        let t0 = Instant::now();
+                        let slot_res = cli.get_slot().await; let dt_slot = t0.elapsed();
+                        let t1 = Instant::now(); let _ = cli.get_latest_blockhash().await; let dt_bh = t1.elapsed();
+                        drop(permit);
+                        // fee heat via raw RPC
+                        let fee_mlcu = match cli.send::<Value>(RpcRequest::GetRecentPrioritizationFees, serde_json::json!([])).await {
+                            Ok(Value::Array(a)) if !a.is_empty() => {
+                                let mut v: Vec<f64> = a.iter().filter_map(|e| e.get("prioritizationFee").and_then(|x| x.as_u64()).map(|u| u as f64)).collect();
+                                if v.is_empty() { 0.0 } else { v.sort_by(|x,y| x.partial_cmp(y).unwrap()); let idx = ((0.80f64 * ((v.len()-1) as f64)).round() as usize).min(v.len()-1); v[idx] }
+                            }
+                            _ => 0.0
+                        };
+                        if let Ok(slot) = slot_res { let mut ep = epm.lock().await; ep.last_slot = slot; let bh_ms = dt_bh.as_secs_f64()*1000.0; ep.bh_latency_ewma_ms = (1.0 - bh_alpha) * ep.bh_latency_ewma_ms + bh_alpha * bh_ms; ep.fee_heat_ewma_mlcu = (1.0 - fee_alpha) * ep.fee_heat_ewma_mlcu + fee_alpha * fee_mlcu; ep.q_bh_p90.observe_with_shift_reset(bh_ms, 0.02, 64);
+                            ep.q_bh_p99.observe_with_shift_reset(bh_ms, 0.02, 64);
+                            crate::metrics_hdr::record_bh_ms(i, bh_ms);
+                            crate::metrics_hdr::record_fee_heat(i, if fee_mlcu>0.0 { fee_mlcu } else { 0.0 });
+                            if slot > max_slot { max_slot = slot; }
+                        }
+                    }
+                }
+                for epm in eps.iter() { let mut ep = epm.lock().await; let lag = max_slot.saturating_sub(ep.last_slot) as f64; ep.slot_lag_ewma = (1.0 - alpha) * ep.slot_lag_ewma + alpha * lag; }
+                if max_slot > last_max_slot { last_max_slot = max_slot; none.invalidate_all(); }
+                // refresh ms_per_slot from best effort single sample
+                if let Some(first) = eps.get(0) { if let Ok(ep) = first.try_lock() { let cli = ep.cli.clone(); drop(ep); if let Ok(mut s) = cli.get_recent_performance_samples(1).await { if let Some(sm) = s.pop() { if sm.num_slots>0 && sm.sample_period_secs>0 { let est = 1000.0*(sm.sample_period_secs as f64)/(sm.num_slots as f64); let mut g = msps.write().await; *g = est.clamp(300.0,1200.0); } } } } }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+    }
+}
+
+#[inline]
+fn enc_to_key(enc: UiTransactionEncoding) -> &'static str {
+    match enc {
+        UiTransactionEncoding::Json => "json",
+        UiTransactionEncoding::JsonParsed => "jsonp",
+        UiTransactionEncoding::Base58 => "b58",
+        UiTransactionEncoding::Base64 => "b64",
+        UiTransactionEncoding::Base64Zstd => "b64z",
+        _ => "other",
+    }
+}
+
+#[inline]
+fn enc_idx(enc: UiTransactionEncoding) -> usize {
+    match enc { UiTransactionEncoding::Json => 0, UiTransactionEncoding::JsonParsed => 1, UiTransactionEncoding::Base58 => 2, UiTransactionEncoding::Base64 => 3, UiTransactionEncoding::Base64Zstd => 4, _ => 0 }
+}
+
+#[inline]
+fn enc_fallback_list() -> [UiTransactionEncoding; 5] {
+    [UiTransactionEncoding::Base64, UiTransactionEncoding::Base64Zstd, UiTransactionEncoding::Base58, UiTransactionEncoding::Json, UiTransactionEncoding::JsonParsed]
+}
+
+/// Jump Consistent Hash: stable, minimal movement when shards change.
+/// Ref: Lamping/Veasey (Google) — perfect for bot sharding.
+#[inline]
+pub fn jump_consistent_hash(key: u64, num_buckets: i32) -> i32 {
+    let mut b = -1i64;
+    let mut j = 0i64;
+    let mut k = key as i64;
+    while j < num_buckets as i64 {
+        b = j;
+        k = k.wrapping_mul(2862933555777941757).wrapping_add(1);
+        let x = (((b + 1) as f64) * ((1u64 << 31) as f64 / (((k >> 33) + 1) as f64))) as i64;
+        j = x;
+    }
+    b as i32
 }
 
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -26,7 +648,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock as AsyncRwLock, mpsc, RwLock};
 use tonic::transport::Channel;
 use yellowstone_grpc_client::jito_service_client::JitoServiceClient; // yellowstone-grpc-client = "6.0"
-use prometheus::{Encoder, TextEncoder, IntGauge, IntCounter, Registry, Histogram, HistogramOpts}; // prometheus = "0.14"
+use prometheus::{Encoder, TextEncoder, IntGauge, IntCounter, Registry, Histogram, HistogramOpts};
 use lazy_static::lazy_static;
 use serde::{Serialize, Deserialize};
 use anyhow::{anyhow, Result};
@@ -40,6 +662,36 @@ use serde_json;
 use reqwest;
 use pyth_client::Price as PythPrice;
 use switchboard_v2::{AggregatorAccountData, VrfAccountData};
+
+// =================== [PIECE 5: Prometheus metrics registry & histograms] ===================
+lazy_static! {
+    pub static ref REGISTRY: Registry = Registry::new_custom(Some("rival_scorer".into()), None).unwrap();
+    pub static ref TX_COUNTER: IntCounter = IntCounter::new("tx_tracked_total", "Tracked txs").unwrap();
+    pub static ref AVG_CU_GAUGE: IntGauge = IntGauge::new("avg_cu", "Average compute units").unwrap();
+    pub static ref LATENCY_HIST: Histogram = Histogram::with_opts(
+        HistogramOpts::new("rpc_latency_ms", "RPC latency ms")
+            .buckets(vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0])
+    ).unwrap();
+    pub static ref INCLUSION_MS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("inclusion_latency_ms", "Block inclusion latency ms")
+            .buckets(vec![10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0])
+    ).unwrap();
+}
+
+pub fn init_metrics() {
+    let _ = REGISTRY.register(Box::new(TX_COUNTER.clone()));
+    let _ = REGISTRY.register(Box::new(AVG_CU_GAUGE.clone()));
+    let _ = REGISTRY.register(Box::new(LATENCY_HIST.clone()));
+    let _ = REGISTRY.register(Box::new(INCLUSION_MS.clone()));
+}
+
+pub fn render_prometheus() -> String {
+    let mf = REGISTRY.gather();
+    let mut buf = Vec::new();
+    let enc = TextEncoder::new();
+    let _ = enc.encode(&mf, &mut buf);
+    String::from_utf8_lossy(&buf).to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct ScoringConfig {
@@ -170,12 +822,23 @@ pub struct BotProfile {
     pub pubkey: String,
     pub transactions: VecDeque<TransactionMetrics>,
     pub cumulative_metrics: CumulativeMetrics,
+    // ===== PIECE 12Δ: decayed online metrics
+    pub dec_success_ewma: f64,
+    pub dec_fee_ewma: f64,
+    pub dec_cu_ewma: f64,
+    pub dec_speed_ms_ewma: f64,
+    pub last_decayed_ts: u64,
     pub last_score_update: Option<u64>,
     pub last_score_value: Option<f64>,
     pub strategy_transitions: HashMap<(BotStrategy, BotStrategy), u64>,
     pub last_strategy: Option<BotStrategy>,
     pub last_seen: u64, // tracks last activity timestamp
     pub scoring_config: ScoringConfig,
+    // half-lives (seconds)
+    pub hl_success: f64,
+    pub hl_fee: f64,
+    pub hl_cu: f64,
+    pub hl_speed: f64,
 }
 
 impl BotProfile {
@@ -184,12 +847,21 @@ impl BotProfile {
             pubkey,
             transactions: VecDeque::new(),
             cumulative_metrics: CumulativeMetrics::default(),
+            dec_success_ewma: 0.0,
+            dec_fee_ewma: 0.0,
+            dec_cu_ewma: 0.0,
+            dec_speed_ms_ewma: 0.0,
+            last_decayed_ts: 0,
             last_score_update: None,
             last_score_value: None,
             strategy_transitions: HashMap::new(),
             last_strategy: None,
             last_seen: 0,
             scoring_config,
+            hl_success: 60.0,
+            hl_fee: 30.0,
+            hl_cu: 30.0,
+            hl_speed: 30.0,
         }
     }
 
@@ -199,7 +871,16 @@ impl BotProfile {
         if self.transactions.len() > self.scoring_config.max_transaction_history {
             self.transactions.pop_front();
         }
-        self.update_cumulative_metrics(&metrics);
+        // Update cumulative and transitions
+        let last = self.transactions.back().unwrap().clone();
+        self.update_cumulative_metrics(&last);
+        if let Some(prev) = self.last_strategy.take() {
+            let cur = last.strategy_type[0].clone();
+            *self.strategy_transitions.entry((prev.clone(), cur.clone())).or_insert(0) += 1;
+            self.last_strategy = Some(cur);
+        } else {
+            self.last_strategy = Some(last.strategy_type[0].clone());
+        }
     }
 
     pub fn update_cumulative_metrics(&mut self, metrics: &TransactionMetrics) {
@@ -211,12 +892,30 @@ impl BotProfile {
         self.cumulative_metrics.total_compute_units += metrics.compute_units;
         *self.cumulative_metrics.strategy_counts.entry(metrics.strategy_type[0].clone()).or_insert(0) += 1;
         self.cumulative_metrics.slot_intervals.push_back(metrics.slot);
+        if self.cumulative_metrics.slot_intervals.len() > 1024 {
+            let _ = self.cumulative_metrics.slot_intervals.pop_front();
+        }
         self.cumulative_metrics.rpc_latency_samples.push_back(metrics.rpc_latency_ms);
         self.cumulative_metrics.confirmation_latency_samples.push_back(metrics.confirmation_latency_ms);
         self.cumulative_metrics.block_inclusion_latency_samples.push_back(metrics.block_inclusion_latency_ms);
         if let Some(profit) = metrics.profit_estimate {
             self.cumulative_metrics.profits.push(profit);
         }
+        // ===== PIECE 12Δ: decayed updates (half-life EWMAs)
+        let prev = self.last_decayed_ts;
+        let now = metrics.timestamp;
+        let dt = if prev == 0 { 1 } else { now.saturating_sub(prev).max(1) } as f64;
+        let alpha = |hl: f64| -> f64 { 1.0 - 2f64.powf(-(dt/hl).max(0.0)) };
+        let a_s = alpha(self.hl_success);
+        let a_f = alpha(self.hl_fee);
+        let a_c = alpha(self.hl_cu);
+        let a_v = alpha(self.hl_speed);
+        let speed_now = self.cumulative_metrics.avg_speed_ms(self.scoring_config.slot_time_ms);
+        self.dec_success_ewma = (1.0 - a_s) * self.dec_success_ewma + a_s * (metrics.success as u8 as f64);
+        self.dec_fee_ewma     = (1.0 - a_f) * self.dec_fee_ewma     + a_f * (metrics.priority_fee as f64);
+        self.dec_cu_ewma      = (1.0 - a_c) * self.dec_cu_ewma      + a_c * (metrics.compute_units as f64);
+        self.dec_speed_ms_ewma= (1.0 - a_v) * self.dec_speed_ms_ewma+ a_v * speed_now.max(0.0);
+        self.last_decayed_ts = now;
     }
 
     pub async fn should_update_score(&self) -> bool {
@@ -259,7 +958,7 @@ impl BotProfile {
         }
 
         // 5. Burst activity — if avg speed is unusually high, refresh more often
-        let avg_speed = self.cumulative_metrics.avg_speed_ms();
+        let avg_speed = self.cumulative_metrics.avg_speed_ms(self.scoring_config.slot_time_ms);
         if avg_speed > self.scoring_config.burst_speed_threshold {
             return true;
         }
@@ -296,30 +995,24 @@ pub struct CumulativeMetrics {
 }
 
 impl CumulativeMetrics {
-    pub fn avg_speed_ms(&self) -> Option<f64> {
-        if self.slot_intervals.len() < 2 {
-            return None;
+    pub fn avg_speed_ms(&self, slot_time_ms: u64) -> f64 {
+        if self.slot_intervals.len() < 2 { return 0.0; }
+        let mut diffs = 0u64; let mut cnt = 0usize;
+        for (a,b) in self.slot_intervals.iter().zip(self.slot_intervals.iter().skip(1)) {
+            diffs = diffs.saturating_add(b.saturating_sub(*a));
+            cnt += 1;
         }
-        
-        // Prune old slots if needed
-        if self.slot_intervals.len() > 1000 {
-            self.slot_intervals.pop_front();
-        }
-        
-        let total_diff: u64 = self.slot_intervals
-            .iter()
-            .tuple_windows()
-            .map(|(a, b)| b.saturating_sub(*a))
-            .sum();
-            
-        Some(total_diff as f64 / (self.slot_intervals.len() - 1) as f64 * 400.0)
+        if cnt == 0 { return 0.0; }
+        (diffs as f64 / cnt as f64) * (slot_time_ms as f64)
     }
 }
 
 pub struct RivalBotCapabilityScorer {
     rpc_client: Arc<RpcClient>,
+    hedged: HedgedRpc,
     bot_profiles: Arc<DashMap<String, Arc<tokio::sync::RwLock<BotProfile>>>>,
     capability_scores: Arc<DashMap<String, f64>>,
+    topk: Arc<tokio::sync::Mutex<TopK>>,
     known_bot_addresses: Arc<AsyncRwLock<HashMap<String, bool>>>,
     scoring_config: ScoringConfig,
     jito_grpc_client: JitoServiceClient<Channel>,
@@ -353,7 +1046,10 @@ impl Default for ScoringWeights {
 
 impl RivalBotCapabilityScorer {
     pub async fn new(rpc_endpoint: &str, jito_grpc_endpoint: &str, config: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let rpc_client = Arc::new(make_rpc_client(rpc_endpoint));
+        let rc1 = Arc::new(make_rpc_client(rpc_endpoint));
+        let rc2 = Arc::new(make_rpc_client(rpc_endpoint));
+        let rpc_client = rc1.clone();
+        let hedged = HedgedRpc::new(rc1, rc2, Duration::from_millis(15));
 
         let channel = Channel::from_shared(jito_grpc_endpoint.to_string())?
             .connect().await?;
@@ -363,10 +1059,12 @@ impl RivalBotCapabilityScorer {
             rpc_client,
             bot_profiles: Arc::new(DashMap::new()),
             capability_scores: Arc::new(DashMap::new()),
+            topk: Arc::new(tokio::sync::Mutex::new(TopK::new(100))),
             known_bot_addresses: Arc::new(AsyncRwLock::new(HashMap::new())),
             scoring_config: ScoringConfig::default(),
             jito_grpc_client,
             config,
+            hedged,
         })
     }
 
@@ -391,6 +1089,10 @@ impl RivalBotCapabilityScorer {
         // Async lock inside profile
         {
             let mut profile = profile_arc.write().await;
+            // PIECE 8: dynamic slot-time smoothing from hedger estimate
+            if let Some(ms) = self.hedged.estimate_slot_ms().await {
+                profile.scoring_config.slot_time_ms = ((profile.scoring_config.slot_time_ms as f64 * 0.8) + (ms * 0.2)) as u64;
+            }
             profile.add_transaction(metrics);
             
             if profile.should_update_score().await {
@@ -405,7 +1107,10 @@ impl RivalBotCapabilityScorer {
                 // Clone before inserting to avoid holding lock
                 let bot_pubkey = profile.pubkey.clone();
                 drop(profile); // Release lock before inserting
-                self.capability_scores.insert(bot_pubkey, capability.score);
+                self.capability_scores.insert(bot_pubkey.clone(), capability.score);
+                // PIECE 9: feed TopK
+                let mut tk = self.topk.lock().await;
+                tk.update(bot_pubkey, capability.score);
             }
         }
         
@@ -419,12 +1124,8 @@ impl RivalBotCapabilityScorer {
         tx_sig: &Signature,
         suspected_bot: &Pubkey,
     ) -> Result<TransactionMetrics, Box<dyn std::error::Error>> {
-        let tx_opt = self.rpc_client
-            .get_transaction(
-                &tx_sig.to_string(),
-                solana_client::nonblocking::rpc_client::UiTransactionEncoding::Base64
-            )
-            .await?;
+        // PIECE 7: coalesced cached fetch via hedged RPC pool
+        let tx_opt = self.hedged.get_tx_fast_cached(tx_sig, UiTransactionEncoding::JsonParsed).await?;
         
         let tx = tx_opt.ok_or_else(|| anyhow!("Transaction not found"))?;
         let meta = tx.transaction.meta.as_ref().ok_or_else(|| anyhow!("Transaction metadata missing"))?;
@@ -441,7 +1142,7 @@ impl RivalBotCapabilityScorer {
             confirmation_latency_ms: 0.0, // Will be set later
             block_inclusion_latency_ms: 0.0, // Will be set later
             bundle_id: None,
-            tip_bid: 0,
+            tip_bid: None,
             strategy_type: self.detect_strategy_from_transaction(&tx)?,
             profit_estimate: self.compute_profit_estimate(meta),
             oracle_age_secs: None,
@@ -508,6 +1209,8 @@ impl RivalBotCapabilityScorer {
             if strategies.is_empty() {
                 strategies.push(BotStrategy::Unknown);
             }
+            // PIECE 21: merge fast program-set classifier hints
+            for x in classify_program_sets_fast(tx) { if !strategies.contains(&x) { strategies.push(x); } }
             
             strategies
         } else {
@@ -516,19 +1219,26 @@ impl RivalBotCapabilityScorer {
     }
 
     fn compute_profit_estimate(&self, meta: &TransactionStatusMeta) -> Option<f64> {
-        let mut deltas: HashMap<String, i128> = HashMap::new();
-
-        for (i, pre) in meta.pre_token_balances.iter().enumerate() {
-            let post = meta.post_token_balances.get(i)?;
-            let pre_amt = pre.ui_token_amount.amount.parse::<i128>().ok()?;
-            let post_amt = post.ui_token_amount.amount.parse::<i128>().ok()?;
-            let change = post_amt.saturating_sub(pre_amt);
-            deltas.entry(pre.mint.clone()).and_modify(|v| *v += change).or_insert(change);
+        use std::collections::HashMap;
+        #[derive(Hash, Eq, PartialEq)] struct Key { acc: u16, mint: String }
+        let mut pre: HashMap<Key, i128> = HashMap::new();
+        let mut post: HashMap<Key, i128> = HashMap::new();
+        if let Some(bals) = &meta.pre_token_balances {
+            for b in bals { let amt = b.ui_token_amount.amount.parse::<i128>().ok()?; pre.insert(Key{acc:b.account_index as u16, mint:b.mint.clone()}, amt); }
         }
-
-        let profit_units: i128 = deltas.values().copied().filter(|d| *d > 0).sum();
-        if profit_units == 0 { return None; }
-        Some(profit_units as f64)
+        if let Some(bals) = &meta.post_token_balances {
+            for b in bals { let amt = b.ui_token_amount.amount.parse::<i128>().ok()?; post.insert(Key{acc:b.account_index as u16, mint:b.mint.clone()}, amt); }
+        }
+        let mut deltas_pos: i128 = 0;
+        for (k, pre_amt) in pre.into_iter() { let post_amt = *post.get(&k).unwrap_or(&0); let d = post_amt.saturating_sub(pre_amt); if d > 0 { deltas_pos = deltas_pos.saturating_add(d); } }
+        // mints only in post
+        if let Some(pb) = &meta.post_token_balances {
+            for b in pb { let k = Key{acc:b.account_index as u16, mint:b.mint.clone()}; if !meta.pre_token_balances.as_ref().map_or(false, |v| v.iter().any(|x| x.account_index as u16 == k.acc && x.mint == k.mint)) {
+                    let amt = b.ui_token_amount.amount.parse::<i128>().ok()?; if amt > 0 { deltas_pos = deltas_pos.saturating_add(amt); }
+                }
+            }
+        }
+        if deltas_pos == 0 { None } else { Some(deltas_pos as f64) }
     }
 
     pub async fn update_bot_capability_score(&self, bot_pubkey: &String) -> Result<(), Box<dyn std::error::Error>> {
@@ -820,7 +1530,7 @@ impl RivalBotCapabilityScorer {
     pub fn export_capabilities(&self) -> HashMap<String, f64> {
         self.capability_scores
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|e| (e.key().clone(), *e.value()))
             .collect()
     }
 
