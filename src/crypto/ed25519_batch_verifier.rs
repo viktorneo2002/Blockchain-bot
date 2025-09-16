@@ -1,64 +1,798 @@
-// ========================= NUMA/core pinning helper (hardened) =========================
+// ========================= PATCH 24: route_cost_scurve module =========================
+#[cfg(feature = "route_cost_scurve")]
+pub mod route_cost_scurve {
+    use std::env;
+
+    pub fn env_u64(key: &str, default: u64) -> u64 {
+        env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    }
+
+    pub fn env_i32(key: &str, default: i32) -> i32 {
+        env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    }
+
+    // Saturating, smooth S-curve: credit_ns = CAP * (1 - exp(- (profit * slope) / CAP))
+    pub fn profit_ns_credit_scurve(profit_lamports: u64, slope_ns_per_lamport: u64) -> u64 {
+        const CAP: u64 = 1_000_000; // 1ms max credit per tx
+        if profit_lamports == 0 { return 0; }
+        let scaled = (profit_lamports as u128).saturating_mul(slope_ns_per_lamport as u128);
+        let exp_arg = -(scaled as f64 / CAP as f64);
+        let credit = CAP as f64 * (1.0 - exp_arg.exp());
+        credit as u64
+    }
+
+    // Phase basis-points given a predicted FINISH timestamp (us within slot)
+    pub fn phase_bp_finish_us(finish_us: u64) -> i32 {
+        // Slot timing constants (us)
+        const SLOT_START: u64 = 0;
+        const SLOT_MID: u64 = 400_000;  // 400ms
+        const SLOT_TAIL: u64 = 450_000; // 450ms
+        const SLOT_END: u64 = 500_000;  // 500ms
+
+        // Phase thresholds (basis points, 0-10_000)
+        const PHASE_EARLY_BP: i32 = 200;    // 2% into slot
+        const PHASE_MID_BP: i32 = 8000;     // 80% into slot
+        const PHASE_TAIL_BP: i32 = 9000;    // 90% into slot
+
+        let phase = if finish_us < SLOT_MID {
+            // Early phase: linear ramp from 0 to PHASE_MID_BP
+            let progress = (finish_us - SLOT_START) as f64 / (SLOT_MID - SLOT_START) as f64;
+            (progress * PHASE_MID_BP as f64) as i32
+        } else if finish_us < SLOT_TAIL {
+            // Mid phase: constant at PHASE_MID_BP
+            PHASE_MID_BP
+        } else if finish_us < SLOT_END {
+            // Tail phase: linear ramp from PHASE_MID_BP to PHASE_TAIL_BP
+            let progress = (finish_us - SLOT_TAIL) as f64 / (SLOT_END - SLOT_TAIL) as f64;
+            PHASE_MID_BP + (progress * (PHASE_TAIL_BP - PHASE_MID_BP) as f64) as i32
+        } else {
+            // End phase: linear penalty beyond SLOT_END
+            let over_ms = (finish_us - SLOT_END) / 1_000;
+            PHASE_TAIL_BP - (over_ms * 10) as i32  // -10bp per ms over
+        };
+
+        phase.clamp(-10_000, 10_000)  // Clamp to ±100%
+    }
+
+    // Back-compat alias used by older call sites; keeps API stable.
+    #[inline]
+    pub fn phase_bp_predicted_finish(now_us: u64) -> i32 {
+        phase_bp_finish_us(now_us)
+    }
+
+    // ========================= PATCH 36: route_cost::price (REPLACE) =========================
+    #[inline]
+    pub fn price(wait_ns: u64, cwnd_head: i32, profit_ns_credit: u64) -> i128 {
+        use core::cmp::max;
+
+        // Base components (signed i128 to keep monotonic arithmetic)
+        let mut w = (*W_WAIT * wait_ns as f64) as i128;
+        let c = if cwnd_head < 0 {
+            (*W_CWND * (-(cwnd_head as f64))) as i128
+        } else { 0 };
+
+        // Profit credit (already time-priced via scurve)
+        let mut p = (*W_PROFIT * profit_ns_credit as f64) as i128;
+
+        // Phase bps at predicted FINISH time (finish ≈ now + wait)
+        let finish_us = crate::clock::now_us().saturating_add(wait_ns / 1_000);
+        let phase_bp  = phase_bp_finish_us(finish_us) as i128;
+
+        // Apply bps skew to profit (existing behavior)
+        p = p + (p.saturating_mul(phase_bp)) / 10_000;
+
+        // NEW: tail penalty also boosts the *weight of waiting* near slot end.
+        // Gain factor in bps (default 100bp). Only applies to negative bps (penalty).
+        let gain_bp: i128 = std::env::var("QAB_TAIL_WAIT_BOOST_BP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(100) as i128;
+
+        if phase_bp < 0 && gain_bp > 0 {
+            // w += w * (|phase_bp| * gain_bp) / 1e8   (two bps factors)
+            let bump = (w.saturating_mul((-phase_bp) * gain_bp)) / 100_000_000;
+            w = w.saturating_add(bump);
+        }
+
+        // Lower is better
+        w + c - p
+    }
+}
+
+// ========================= PATCH 20: clock::cycles helpers (ADD) =========================
+// ========================= PATCH 30: clock::cycles drift-guard (REPLACE + ADD periodic resync) =========================
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[inline]
+pub fn now_cycles() -> u64 { 
+    unsafe { core::arch::x86_64::_rdtsc() } 
+}
+
+// ========================= PATCH 57: triple_cache (REPLACE module) =========================
+pub mod triple_cache {
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    #[inline] 
+    fn shards() -> usize {
+        std::env::var("QAB_TRIPLE_CACHE_SHARDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64)
+            .clamp(1, 1024)
+    }
+
+    #[inline]
+    fn max_entries() -> usize {
+        std::env::var("QAB_TRIPLE_CACHE_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(262_144)
+            .max(1024)
+    }
+
+    #[inline]
+    fn ttl_us() -> u64 {
+        std::env::var("QAB_TRIPLE_CACHE_TTL_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(250_000)
+            .max(10_000)
+    }
+
+    struct Shard {
+        map: RwLock<HashMap<u64, (u64, u8)>>,
+        ins: AtomicUsize,
+    }
+
+    static SHARDS: Lazy<Box<[Shard]>> = Lazy::new(|| {
+        let n = shards();
+        (0..n)
+            .map(|_| Shard { 
+                map: RwLock::new(HashMap::new()), 
+                ins: AtomicUsize::new(0) 
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+
+    #[inline] 
+    fn pick(hv: u64) -> &'static Shard {
+        let mask = SHARDS.len() as u64 - 1;
+        // round up to power-of-two if not already; simple fallback to modulo
+        let idx = if SHARDS.len().is_power_of_two() {
+            (hv & mask) as usize
+        } else {
+            (hv % (SHARDS.len() as u64)) as usize
+        };
+        &SHARDS[idx]
+    }
+
+    #[inline]
+    pub fn get(now_us: u64, hv: u64) -> Option<bool> {
+        let s = pick(hv);
+        let g = s.map.read().unwrap();
+        if let Some(&(exp, v)) = g.get(&hv) {
+            if now_us <= exp { return Some(v != 0); }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn put(now_us: u64, hv: u64, verdict_ok: bool) {
+        let s = pick(hv);
+        let exp = now_us.saturating_add(ttl_us());
+        {
+            let mut w = s.map.write().unwrap();
+            w.insert(hv, (exp, if verdict_ok {1} else {0}));
+            // Per-shard opportunistic GC
+            if s.ins.fetch_add(1, Relaxed) & 0x7FF == 0 {
+                let cap = max_entries() / SHARDS.len().max(1);
+                if w.len() > cap {
+                    let want = w.len() - cap;
+                    let now = now_us;
+                    let mut freed = 0usize;
+                    let keys: Vec<u64> = w.iter()
+                        .filter_map(|(k,(e,_))| if *e < now { Some(*k) } else { None })
+                        .take(want)
+                        .collect();
+                    for k in keys { w.remove(&k); freed += 1; if freed >= want { break; } }
+                    if freed < want {
+                        // simple bounded eviction of remaining
+                        for k in w.keys().cloned().take(want - freed).collect::<Vec<_>>() {
+                            if w.remove(&k).is_some() { freed += 1; if freed >= want { break; } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ========================= PATCH 53B: dalek_chunk_ctl module =========================
+pub mod dalek_chunk_ctl {
+    use once_cell::sync::Lazy;
+    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    static CUR: Lazy<AtomicUsize> = Lazy::new(|| {
+        let base = std::env::var("QAB_DALEK_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048);
+        AtomicUsize::new(base.clamp(64, 8192))
+    });
+
+    #[inline]
+    fn cmin() -> usize {
+        std::env::var("QAB_DALEK_CHUNK_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512)
+            .clamp(64, 8192)
+    }
+
+    #[inline]
+    fn cmax() -> usize {
+        std::env::var("QAB_DALEK_CHUNK_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8192)
+            .clamp(256, 32768)
+    }
+
+    #[inline]
+    pub fn cur_chunk() -> usize {
+        CUR.load(Relaxed)
+    }
+
+    // If we had to bisect → shrink a bit; if clean pass → grow a bit
+    #[inline]
+    pub fn report(bisected: bool) {
+        let cur = CUR.load(Relaxed);
+        let next = if bisected {
+            core::cmp::max(cmin(), (cur * 7) / 8) // −12.5%
+        } else {
+            core::cmp::min(cmax(), (cur * 9) / 8) // +12.5%
+        };
+        CUR.store(next, Relaxed);
+    }
+}
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+mod cycles_cal {
+    use once_cell::sync::Lazy;
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) static MULT_Q32_NS: Lazy<AtomicU64> = Lazy::new(|| {
+        AtomicU64::new(init_mult_q32_ns())
+    });
+    static LAST_T_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+    static LAST_CYC:  Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+    #[inline]
+    unsafe fn read_ns_raw() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts);
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
+    }
+
+    fn init_mult_q32_ns() -> u64 {
+        unsafe {
+            let t0 = read_ns_raw();
+            let c0 = super::now_cycles();
+            let target = t0 + 2_000_000; // 2ms
+            let mut t1 = t0;
+            while t1 < target { core::hint::spin_loop(); t1 = read_ns_raw(); }
+            let c1 = super::now_cycles();
+            let dns = t1.saturating_sub(t0).max(1);
+            let dcy = c1.saturating_sub(c0).max(1);
+            let mult = ((u128::from(dns) << 32) / u128::from(dcy)).clamp(1, u128::from(u64::MAX)) as u64;
+            LAST_T_NS.store(t1, Relaxed);
+            LAST_CYC.store(c1, Relaxed);
+            mult
+        }
+    }
+
+    // Called occasionally from worker loop to keep drift <~50ppm; EWMA to avoid steps
+    #[inline]
+    pub fn resync_tick() {
+        // Every ~100ms wall time at most; cheap read-only when not due
+        let now_c = super::now_cycles();
+        let last_c = LAST_CYC.load(Relaxed);
+        if now_c.wrapping_sub(last_c) < 100_000_000 { return; } // ~100ms at 1 GHz; safe heuristic
+
+        unsafe {
+            let t0 = LAST_T_NS.load(Relaxed);
+            let c0 = LAST_CYC.load(Relaxed);
+            let t1 = read_ns_raw();
+            let c1 = super::now_cycles();
+            let dns = t1.saturating_sub(t0).max(1);
+            let dcy = c1.saturating_sub(c0).max(1);
+            let meas = ((u128::from(dns) << 32) / u128::from(dcy)).clamp(1, u128::from(u64::MAX)) as u64;
+
+            // EWMA update: 1/16 step (smooth)
+            let prev = MULT_Q32_NS.load(Relaxed);
+            let next = ((prev as u128 * 15) + meas as u128 + 15) >> 4;
+            MULT_Q32_NS.store(next as u64, Relaxed);
+
+            LAST_T_NS.store(t1, Relaxed);
+            LAST_CYC.store(c1, Relaxed);
+        }
+    }
+}
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[inline]
+pub fn cycles_to_ns(dcycles: u64) -> u64 {
+    let m = cycles_cal::MULT_Q32_NS.load(core::sync::atomic::Ordering::Relaxed);
+    ((u128::from(dcycles) * u128::from(m)) >> 32) as u64
+}
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[inline]
+pub fn cycles_resync_tick() { cycles_cal::resync_tick() }
+
+#[cfg(not(all(target_os="linux", target_arch="x86_64")))]
+#[inline] 
+pub fn now_cycles() -> u64 { now_us() * 1_000 }
+
+#[cfg(not(all(target_os="linux", target_arch="x86_64")))]
+#[inline] 
+pub fn cycles_to_ns(dcycles: u64) -> u64 { dcycles }
+
+#[cfg(not(all(target_os="linux", target_arch="x86_64")))]
+#[inline] 
+pub fn cycles_resync_tick() {}
+
+#[cfg(not(all(target_os="linux", target_arch="x86_64")))]
+#[inline]
+pub fn now_cycles() -> u64 {
+    // portable fallback: approximate in ns using clock; good enough off x86_64/linux
+    crate::clock::now_us() * 1_000
+}
+
+#[cfg(not(all(target_os="linux", target_arch="x86_64")))]
+#[inline]
+pub fn cycles_to_ns(dcycles: u64) -> u64 { dcycles }
+
+// ========================= PATCH 56: pin_to_core_and_node with RT scheduling =========================
 // cpuset-aware mapping with optional NUMA mem-bind and RT scheduling
 #[cfg(all(feature = "core_affinity", target_os = "linux"))]
 fn pin_to_core_and_node(core_id: usize) {
     use core_affinity::CoreId;
     use std::str::FromStr;
+    use std::fs;
+    use std::env;
+    use libc::{sched_param, sched_setscheduler, SCHED_RR, SCHED_FIFO, SCHED_OTHER, c_int};
+    
+    // Helper to set real-time priority for the current thread
+    fn set_realtime_priority(rt_prio: i32) -> Result<(), String> {
+        if rt_prio <= 0 {
+            return Ok(());  // No RT priority requested
+        }
+        
+        let max_prio = unsafe { libc::sched_get_priority_max(SCHED_RR) };
+        let min_prio = unsafe { libc::sched_get_priority_min(SCHED_RR) };
+        
+        // Clamp priority to valid range
+        let prio = rt_prio.clamp(min_prio, max_prio);
+        
+        let param = sched_param { sched_priority: prio };
+        
+        // Try SCHED_RR first, fall back to SCHED_FIFO if not available
+        let policies = [SCHED_RR, SCHED_FIFO, SCHED_OTHER];
+        
+        for policy in policies.iter() {
+            let result = unsafe {
+                sched_setscheduler(0, *policy, &param)
+            };
+            
+            if result == 0 {
+                if *policy == SCHED_RR || *policy == SCHED_FIFO {
+                    return Ok(());
+                }
+                return Err("Only non-RT scheduling available".to_string());
+            }
+        }
+        
+        let err = std::io::Error::last_os_error();
+        Err(format!("Failed to set RT priority: {}", err))
+    }
+    use std::os::unix::thread::JoinHandleExt;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use libc::{sched_param, sched_setscheduler, SCHED_RR, sched_setaffinity, cpu_set_t, CPU_SET};
+    use std::mem::{size_of, zeroed};
+    use std::io::Error as IoError;
+    use std::ptr;
 
-    fn parse_coreset() -> Option<Vec<usize>> {
+    // Environment config with safe defaults
+    static CPUSET: once_cell::sync::Lazy<Option<Vec<usize>>> = once_cell::sync::Lazy::new(|| {
         std::env::var("QAB_CPUSET").ok().and_then(|s| {
-            let m: Vec<_> = s.split(',').filter_map(|t| usize::from_str(t.trim()).ok()).collect();
+            let m: Vec<_> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             if m.is_empty() { None } else { Some(m) }
+        })
+    });
+    
+    static AVOID_SMT: bool = std::env::var("QAB_AVOID_SMT")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(true);
+    
+    static RT_PRIO: i32 = std::env::var("QAB_RT_PRIO")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(70);
+    
+    static MLOCKALL: bool = std::env::var("QAB_MLOCKALL")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false);
+    
+    static THP_HINT: bool = std::env::var("QAB_THP_HINT")
+        .map(|s| s != "0" && !s.eq_ignore_ascii_case("false")).unwrap_or(true);
+    
+    // One-time init for NUMA and CPU topology
+    static NODE_CPUS: once_cell::sync::Lazy<Vec<Vec<usize>>> = once_cell::sync::Lazy::new(|| {
+        let mut nodes = Vec::new();
+        if let Ok(entries) = fs::read_dir("/sys/devices/system/node") {
+            for entry in entries.filter_map(Result::ok) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("node") {
+                        if let Ok(cpus) = fs::read_to_string(entry.path().join("cpulist")) {
+                            let cpus: Vec<_> = cpus.trim().split(',')
+                                .flat_map(|r| {
+                                    let mut parts = r.splitn(2, '-');
+                                    let start = parts.next()?.parse::<usize>().ok()?;
+                                    let end = parts.next().and_then(|e| e.parse::<usize>().ok()).unwrap_or(start);
+                                    Some(start..=end)
+                                })
+                                .flatten()
+                                .collect();
+                            if !cpus.is_empty() { nodes.push(cpus); }
+                        }
+                    }
+                }
+            }
+        }
+        if nodes.is_empty() {
+            // Fallback: assume all cores on node 0
+            if let Some(cores) = core_affinity::get_core_ids() {
+                nodes.push(cores.into_iter().map(|c| c.id).collect());
+            }
+        }
+        nodes
+    });
 
-// ========================= PATCH 30: Per-L3 cwnd with ECN marks =========================
+    // Get CPU siblings from sysfs
+    fn get_siblings(cpu: usize) -> Vec<usize> {
+        let path = format!("/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", cpu);
+        fs::read_to_string(path).ok()
+            .and_then(|s| {
+                let cpus: Vec<_> = s.trim().split(',')
+                    .flat_map(|r| {
+                        let mut parts = r.splitn(2, '-');
+                        let start = parts.next()?.parse::<usize>().ok()?;
+                        let end = parts.next().and_then(|e| e.parse::<usize>().ok()).unwrap_or(start);
+                        Some(start..=end)
+                    })
+                    .flatten()
+                    .collect();
+                if cpus.len() > 1 { Some(cpus) } else { None }
+            })
+            .unwrap_or_else(Vec::new)
+    }
+
+    // Bind memory to NUMA node
+    #[cfg(feature = "jemallocator")]
+    fn bind_memory(node: usize) -> Result<(), String> {
+        use jemalloc_ctl::{arena, Error};
+        let mib = arena::mib(arena::MibOptions::new(node as u32))?;
+        mib.set(Some(node as u32)).map_err(|e| e.to_string())
+    }
+
+    // Set RT priority
+    fn set_rt_priority(prio: i32) -> Result<(), String> {
+        if prio <= 0 { return Ok(()); }
+        let param = sched_param { sched_priority: prio };
+        let res = unsafe { sched_setscheduler(0, SCHED_RR, &param) };
+        if res == 0 { Ok(()) } else { Err(IoError::last_os_error().to_string()) }
+    }
+
+    // Lock all current and future memory
+    fn lock_memory() -> Result<(), String> {
+        if !MLOCKALL { return Ok(()); }
+        #[cfg(target_os = "linux")] {
+            use libc::{mlockall, MCL_CURRENT, MCL_FUTURE};
+            let res = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
+            if res == 0 { Ok(()) } else { Err(IoError::last_os_error().to_string()) }
+        }
+        #[cfg(not(target_os = "linux"))] {
+            Ok(())
+        }
+    }
+
+    // Set transparent hugepage hint
+    fn set_thp_hint() {
+        if !THP_HINT { return; }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true).open("/sys/kernel/mm/transparent_hugepage/defrag") {
+            let _ = std::io::Write::write_all(&mut f, b"madvise\n");
+        }
+    }
+
+    // Main pinning logic
+    let cores: Vec<usize> = CPUSET.clone().unwrap_or_else(|| {
+        core_affinity::get_core_ids()
+            .map(|ids| ids.into_iter().map(|c| c.id).collect())
+            .unwrap_or_else(|| (0..num_cpus::get()).collect())
+    });
+
+    if cores.is_empty() { return; }
+    
+    let core_id = core_id % cores.len();
+    let target_core = cores[core_id];
+    
+    // Find NUMA node for this core
+    let node = NODE_CPUS.iter().position(|node_cpus| 
+        node_cpus.contains(&target_core)
+    ).unwrap_or(0);
+    
+    // Avoid SMT siblings if requested
+    let mut cpus = vec![target_core];
+    if AVOID_SMT {
+        let siblings: Vec<_> = get_siblings(target_core).into_iter()
+            .filter(|&c| c != target_core)
+            .collect();
+        if !siblings.is_empty() {
+            if let Some(coreset) = CPUSET.as_ref() {
+                // Only exclude siblings that are in our cpuset
+                for sib in siblings {
+                    if coreset.contains(&sib) {
+                        cpus.push(sib);
+                    }
+                }
+            } else {
+                cpus.extend(siblings);
+            }
+        }
+    }
+    
+    // Set CPU affinity
+    unsafe {
+        let mut set: cpu_set_t = zeroed();
+        for &cpu in &cpus {
+            CPU_SET(cpu, &mut set);
+        }
+        let _ = sched_setaffinity(
+            0, // current thread
+            size_of::<cpu_set_t>(),
+            &set as *const _
+        );
+    }
+    
+    // Set RT priority
+    if let Err(e) = set_rt_priority(RT_PRIO) {
+        eprintln!("Failed to set RT priority: {}", e);
+    }
+    
+    // Bind memory to NUMA node
+    #[cfg(feature = "jemallocator")]
+    if let Err(e) = bind_memory(node) {
+        eprintln!("Failed to bind memory to NUMA node: {}", e);
+    }
+    
+    // Lock memory
+    if let Err(e) = lock_memory() {
+        eprintln!("Failed to lock memory: {}", e);
+    }
+    
+    // Set THP hint
+    set_thp_hint();
+    
+    // Set thread name for debugging
+    let _ = std::thread::current().name().map(|name| {
+        std::thread::Builder::new()
+            .name(format!("{}_t{}", name, core_id))
+            .spawn(|| {})
+            .ok()
+            .map(|h| h.join().ok());
+    });
+    
+    // Set core affinity as fallback
+    if let Some(cores) = core_affinity::get_core_ids() {
+        if let Some(&core) = cores.get(core_id % cores.len()) {
+            core_affinity::set_for_current(core);
+        }
+    }
+
+// ========================= PATCH: l3_cwnd AIMD+EWMA (REPLACE struct/new/on_occupancy) =========================
 #[cfg(all(feature="l3_cwnd", feature="numa_hotcold"))]
 mod l3_cwnd {
     use once_cell::sync::Lazy;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    
     static CWND_MAX:    Lazy<u32> = Lazy::new(|| std::env::var("QAB_L3_CWND_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096));
     static CWND_MIN:    Lazy<u32> = Lazy::new(|| std::env::var("QAB_L3_CWND_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64));
     static ECN_HIGH_BP: Lazy<u32> = Lazy::new(|| std::env::var("QAB_L3_ECN_HIGH_BP").ok().and_then(|s| s.parse().ok()).unwrap_or(8500));
     static ECN_LOW_BP:  Lazy<u32> = Lazy::new(|| std::env::var("QAB_L3_ECN_LOW_BP").ok().and_then(|s| s.parse().ok()).unwrap_or(5000));
     static BETA_NUM:    Lazy<u32> = Lazy::new(|| std::env::var("QAB_L3_BETA_NUM").ok().and_then(|s| s.parse().ok()).unwrap_or(7));
     static BETA_DEN:    Lazy<u32> = Lazy::new(|| std::env::var("QAB_L3_BETA_DEN").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
-    pub struct Cwnd { cwnd: AtomicU32, ssthresh: AtomicU32, hi_cnt: AtomicU32, lo_cnt: AtomicU32, pub ce_marks: AtomicU64 }
+    
+    pub struct Cwnd {
+        cwnd: AtomicU32,
+        ssthresh: AtomicU32,
+        hi_cnt: AtomicU32,
+        lo_cnt: AtomicU32,
+        pub ce_marks: AtomicU64,
+        occ_ewma_bp: AtomicU32, // 0..10000 basis points
+    }
+    
     impl Cwnd {
-        pub fn new(init: u32) -> Self { let init = init.clamp(*CWND_MIN, *CWND_MAX); Self { cwnd: AtomicU32::new(init), ssthresh: AtomicU32::new(*CWND_MAX), hi_cnt: AtomicU32::new(0), lo_cnt: AtomicU32::new(0), ce_marks: AtomicU64::new(0) } }
+        pub fn new(init: u32) -> Self {
+            let init = init.clamp(*CWND_MIN, *CWND_MAX);
+            Self {
+                cwnd: AtomicU32::new(init),
+                ssthresh: AtomicU32::new(*CWND_MAX),
+                hi_cnt: AtomicU32::new(0),
+                lo_cnt: AtomicU32::new(0),
+                ce_marks: AtomicU64::new(0),
+                occ_ewma_bp: AtomicU32::new(*ECN_LOW_BP),
+            }
+        }
+        
         #[inline] pub fn window(&self) -> u32 { self.cwnd.load(Relaxed) }
         #[inline] pub fn headroom(&self, inflight: u32) -> i32 { self.window() as i32 - inflight as i32 }
+
+        // ========================= PATCH 27: l3_cwnd::on_occupancy (REPLACE) =========================
+        // 
+        // Implements a guarded slow-start burst mode with the following behavior:
+        // - In slow-start (cwnd < ssthresh): aggressive multiplicative increase
+        // - In congestion avoidance: standard additive increase
+        // - On congestion: multiplicative decrease with beta factor
+        // - Maintains EWMA of occupancy for stability
+        // - Uses environment variables for tuning parameters
         pub fn on_occupancy(&self, occ_bp: u32) {
-            if occ_bp >= *ECN_HIGH_BP { let _ = self.hi_cnt.fetch_add(1, Relaxed); self.lo_cnt.store(0, Relaxed);
-                if self.hi_cnt.load(Relaxed) >= 2 { let cur = self.cwnd.load(Relaxed);
-                    let dec = (cur as u64 * (*BETA_NUM as u64)) / (*BETA_DEN as u64);
-                    let next = (dec as u32).clamp(*CWND_MIN, *CWND_MAX);
-                    self.cwnd.store(next, Relaxed); self.ssthresh.store(next, Relaxed); self.hi_cnt.store(0, Relaxed); self.ce_marks.fetch_add(1, Relaxed);
-                }}
-            else if occ_bp <= *ECN_LOW_BP { let _ = self.lo_cnt.fetch_add(1, Relaxed); self.hi_cnt.store(0, Relaxed);
-                if self.lo_cnt.load(Relaxed) >= 2 { let cur = self.cwnd.load(Relaxed); let next = (cur.saturating_add(1)).clamp(*CWND_MIN, *CWND_MAX); self.cwnd.store(next, Relaxed); self.lo_cnt.store(0, Relaxed); } }
-            else { self.hi_cnt.store(0, Relaxed); self.lo_cnt.store(0, Relaxed); }
-        }
-    }
+            // Load current state with appropriate ordering
+            let cwnd = self.cwnd.load(Relaxed);
+            let ssthresh = self.ssthresh.load(Relaxed);
+            
+            // Update EWMA of occupancy (0..10000 basis points, 10_000 = 100%)
+            let prev = self.occ_ewma_bp.load(Relaxed) as u64;
+            let gamma = 128u64; // 0.128 fixed-point smoothing (out of 1000)
+            let next = ((prev * (1000 - gamma)) + (occ_bp.min(10_000) as u64 * gamma)) / 1000;
+            self.occ_ewma_bp.store(next as u32, Relaxed);
+            
+            // Load and update state counters with relaxed ordering (single-writer)
+            let mut hi = self.hi_cnt.load(Relaxed);
+            let mut lo = self.lo_cnt.load(Relaxed);
+            
+            // Check for high occupancy (congestion)
+            if next as u32 >= *ECN_HIGH_BP {
+                hi = hi.saturating_add(1);
+                self.hi_cnt.store(hi, Relaxed);
+                self.lo_cnt.store(0, Relaxed);
+                
+                // Only react to sustained high occupancy (2+ consecutive samples)
+                if hi >= 2 {
+                    // Multiplicative decrease (AIMD)
+                    let dec = (cwnd as u64 * (*BETA_NUM as u64)) / (*BETA_DEN as u64);
+                    let new_cwnd = dec.max(*CWND_MIN).min(*CWND_MAX);
+                    
+                    // Update state
+                    self.cwnd.store(new_cwnd, Relaxed);
+                    self.ssthresh.store(new_cwnd.max(2), Relaxed); // Ensure ssthresh >= 2
+                    self.hi_cnt.store(0, Relaxed);
+                    self.ce_marks.fetch_add(1, Relaxed);
+                }
+            } 
+            // Check for low occupancy (underutilization)
+            else if next as u32 <= *ECN_LOW_BP {
+                lo = lo.saturating_add(1);
+                self.lo_cnt.store(lo, Relaxed);
+                self.hi_cnt.store(0, Relaxed);
+                
+                // Only react to sustained low occupancy (2+ consecutive samples)
+                if lo >= 2 {
+                    // Slow start (exponential growth) or congestion avoidance (linear growth)
+                    let new_cwnd = if cwnd < ssthresh {
+                        // Slow start: double the window (capped at CWND_MAX)
+                        cwnd.saturating_mul(2).min(*CWND_MAX)
+                    } else {
+                        // Congestion avoidance: additive increase (capped at CWND_MAX)
+                        cwnd.saturating_add(1).min(*CWND_MAX)
+                    };
+                    
+                    // Update state
+                    self.cwnd.store(new_cwnd, Relaxed);
+                    self.lo_cnt.store(0, Relaxed);
+                }
+            } 
+            // Moderate occupancy: reset counters but don't change window
+            else {
+                self.hi_cnt.store(0, Relaxed);
+                self.lo_cnt.store(0, Relaxed);
 }
 
-// ========================= PATCH 31: route_cost for cross-group routing =========================
+// ========================= PATCH 50: route_cost::price (REPLACE) =========================
 #[cfg(all(feature="route_cost", feature="numa_hotcold"))]
 mod route_cost {
     use once_cell::sync::Lazy;
     static W_WAIT:   Lazy<f64> = Lazy::new(|| std::env::var("QAB_ROUTE_W_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0));
     static W_CWND:   Lazy<f64> = Lazy::new(|| std::env::var("QAB_ROUTE_W_CWND").ok().and_then(|s| s.parse().ok()).unwrap_or(0.4));
     static W_PROFIT: Lazy<f64> = Lazy::new(|| std::env::var("QAB_ROUTE_W_PROFIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8));
-    #[inline] pub fn price(wait_ns: u64, cwnd_head: i32, profit_ns_credit: u64) -> i128 {
-        let w = (*W_WAIT * wait_ns as f64) as i128;
-        let c = (*W_CWND * (-(cwnd_head.max(-1024)) as f64)) as i128;
-        let p = (*W_PROFIT * (profit_ns_credit as f64)) as i128;
-        w + c - p
+    
+    #[inline]
+    pub fn price(wait_ns: u64, cwnd_head: i32, profit_ns_credit: u64) -> i128 {
+        use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use once_cell::sync::Lazy;
+
+        #[inline] 
+        fn iabs128(x: i128) -> u128 { 
+            if x >= 0 { x as u128 } else { (-x) as u128 } 
+        }
+
+        static AUTOSCALE: Lazy<bool> = Lazy::new(|| matches!(std::env::var("QAB_ROUTE_AUTOSCALE").as_deref(), Ok("1")));
+        static EWMA_W: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+        static EWMA_C: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+        static EWMA_P: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+
+        // Base components
+        let mut w = (*W_WAIT * wait_ns as f64) as i128;
+        let mut c = 0i128;
+        if cwnd_head < 0 {
+            c = (*W_CWND * (-(cwnd_head as f64))) as i128; // penalty when overfull
+        }
+        let mut p = (*W_PROFIT * profit_ns_credit as f64) as i128;
+
+        // cwnd positive headroom → small profit bonus (bps per unit headroom, capped)
+        if cwnd_head > 0 {
+            let gain_bp: i128 = std::env::var("QAB_CWND_HEAD_BONUS_BP")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(40) as i128; // 0.40% per unit headroom
+            let cap_units: i128 = std::env::var("QAB_CWND_HEAD_BONUS_CAP")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(8) as i128;
+            let units = core::cmp::min(cwnd_head as i128, cap_units).max(0);
+            let bump = (p.saturating_mul(units * gain_bp)) / 10_000;
+            p = p.saturating_add(bump);
+        }
+
+        // Finish-phase skew (profit) + tail wait upweight (kept)
+        #[cfg(all(feature="route_cost_scurve"))]
+        {
+            let svc_est_ns = crate::svc_obs::est_ns();
+            let finish_us  = crate::clock::now_us().saturating_add((wait_ns.saturating_add(svc_est_ns)) / 1_000);
+            let phase_bp   = crate::route_cost_scurve::phase_bp_finish_us(finish_us) as i128;
+            
+            p = p + (p.saturating_mul(phase_bp)) / 10_000;
+
+            let gain_bp: i128 = std::env::var("QAB_TAIL_WAIT_BOOST_BP")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(100) as i128;
+            if phase_bp < 0 && gain_bp > 0 {
+                let bump = (w.saturating_mul((-phase_bp) * gain_bp)) / 100_000_000;
+                w = w.saturating_add(bump);
+            }
+        }
+
+        // Autoscale (optional)
+        let upd = |a: &AtomicU64, x: u64| {
+            let prev = a.load(Relaxed).max(1);
+            let next = (((prev as u128) * 15) + (x as u128) + 15) >> 4;
+            a.store(next as u64, Relaxed);
+            next as u64
+        };
+        
+        let ew_w = upd(&EWMA_W, (iabs128(w).min(u128::from(u64::MAX))) as u64).max(1);
+        let ew_c = upd(&EWMA_C, (iabs128(c).min(u128::from(u64::MAX))) as u64).max(1);
+        let ew_p = upd(&EWMA_P, (iabs128(p).min(u128::from(u64::MAX))) as u64).max(1);
+
+        if *AUTOSCALE {
+            let wn = ((iabs128(w) << 10) / ew_w as u128) as i128 * if w >= 0 { 1 } else { -1 };
+            let cn = ((iabs128(c) << 10) / ew_c as u128) as i128 * if c >= 0 { 1 } else { -1 };
+            let pn = ((iabs128(p) << 10) / ew_p as u128) as i128 * if p >= 0 { 1 } else { -1 };
+            wn + cn - pn
+        } else {
+            w + c - p
+        }
     }
 }
 
 // (helpers impl placed later in file)
 
-// ========================= PATCH 22: deadline-aware bounded promotion =========================
-// Extends PATCH 20; feature: numa_hotcold
+// ========================= PATCH: l3_hotcold_promotion::promote_bounded (REPLACE) =========================
 #[cfg(all(target_os="linux", feature="numa_hotcold"))]
 mod l3_hotcold_promotion {
     use super::*;
@@ -81,23 +815,35 @@ mod l3_hotcold_promotion {
     }
 
     pub fn promote_bounded(g: &super::l3_hotcold::L3GroupHC) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         let budget = (*super::l3_hotcold::PROMOTE_BUDGET).min(*PROMOTE_CREDIT);
         let window = (budget * 2).max(8);
         let mut moved = 0usize;
+
+        // Optional cwnd guard
+        #[cfg(feature="l3_cwnd")]
+        {
+            let inflight = g.load.load(Relaxed) as u32;
+            if g.cwnd.headroom(inflight) <= 0 { return 0; }
+        }
+
         let mut buf: smallvec::SmallVec<[super::ShardItem; 128]> = smallvec::SmallVec::with_capacity(window);
         for _ in 0..window {
             if let Some(it) = g.cold.pop() { buf.push(it); } else { break; }
         }
         if buf.is_empty() { return 0; }
+
         buf.sort_unstable_by(|a,b| promo_score(b).cmp(&promo_score(a)));
         for it in buf.into_iter() {
-            if moved >= budget { let _ = g.cold.push(it); continue; }
+            if moved >= budget {
+                let _ = g.cold.push(it);
+                continue;
+            }
             if g.hot.push(Arc::clone(&it)).is_ok() {
                 g.hot_load.fetch_add(1, Relaxed);
                 moved += 1;
             } else {
                 let _ = g.cold.push(it);
-                break;
             }
         }
         moved
@@ -238,6 +984,9 @@ mod fast_ring_meta {
 
     impl<T> FastMpmc<T> {
         pub fn with_capacity(mut cap: usize) -> Self {
+            use libc::{madvise, mlock, MADV_HUGEPAGE};
+            use core::sync::atomic::Ordering::Relaxed;
+            
             cap = ceil_pow2(cap.max(8));
             let size = cap * core::mem::size_of::<Slot<T>>();
             let layout = Layout::from_size_align(size, 2 * 1024 * 1024).unwrap();
@@ -247,13 +996,89 @@ mod fast_ring_meta {
                 ptr = unsafe { alloc_zeroed(l2) } as *mut Slot<T>;
             } else {
                 #[cfg(target_os="linux")]
-                unsafe { libc::madvise(ptr as *mut _, size as libc::size_t, libc::MADV_HUGEPAGE); }
+                unsafe { madvise(ptr as *mut _, size as libc::size_t, MADV_HUGEPAGE); }
             }
             for i in 0..cap { unsafe { (*ptr.add(i)).seq.store(i as u64, Relaxed); } }
+
             // meta arrays
             let meta_deadline = unsafe { alloc_zeroed(Layout::array::<AtomicU64>(cap).unwrap()) } as *mut AtomicU64;
             let meta_flags    = unsafe { alloc_zeroed(Layout::array::<AtomicU32>(cap).unwrap()) } as *mut AtomicU32;
-            Self { mask: cap-1, head: AtomicUsize::new(0), _pad0: [0;64], tail: AtomicUsize::new(0), _pad1: [0;64], buf: ptr, cap, meta_deadline, meta_flags }
+
+            #[cfg(target_os="linux")]
+            unsafe {
+                let md_sz = (cap * core::mem::size_of::<AtomicU64>()) as libc::size_t;
+                let mf_sz = (cap * core::mem::size_of::<AtomicU32>()) as libc::size_t;
+                let _ = madvise(meta_deadline as *mut _, md_sz, MADV_HUGEPAGE);
+                let _ = madvise(meta_flags as *mut _,    mf_sz, MADV_HUGEPAGE);
+
+                if std::env::var("QAB_RING_MLOCK").ok().as_deref() == Some("1") {
+                    let _ = mlock(ptr as *const _, size as libc::size_t);
+                    let _ = mlock(meta_deadline as *const _, md_sz);
+                    let _ = mlock(meta_flags as *const _,    mf_sz);
+                }
+
+                // NEW: optional NUMA bind (preferred node)
+                if let Ok(s) = std::env::var("QAB_RING_NUMA_NODE") {
+                    if let Ok(node) = s.parse::<i32>() {
+                        if node >= 0 {
+                            #[inline]
+                            unsafe fn mbind_prefer(addr: *mut u8, len: usize, node: i32) {
+                                // nodemask as u64; MPOL_PREFERRED
+                                let mask: u64 = 1u64 << (node as u64);
+                                let _ = libc::syscall(
+                                    libc::SYS_mbind,
+                                    addr as *mut libc::c_void,
+                                    len as libc::size_t,
+                                    libc::MPOL_PREFERRED,
+                                    &mask as *const u64,
+                                    8 * core::mem::size_of::<u64>(),
+                                    0u64
+                                );
+                            }
+                            mbind_prefer(ptr as *mut u8, size, node);
+                            mbind_prefer(meta_deadline as *mut u8, md_sz as usize, node);
+                            mbind_prefer(meta_flags as *mut u8,    mf_sz as usize, node);
+                        }
+                    }
+                }
+            }
+
+            if std::env::var("QAB_RING_PRETOUCH").ok().as_deref() == Some("1") {
+                unsafe {
+                    let page = 4096usize;
+                    let mut off = 0usize;
+                    while off < size { core::ptr::write_volatile((ptr as *mut u8).add(off), 0u8); off += page; }
+                    let mut o2 = 0usize;
+                    while o2 < cap * core::mem::size_of::<AtomicU64>() { core::ptr::write_volatile((meta_deadline as *mut u8).add(o2), 0u8); o2 += page; }
+                    let mut o3 = 0usize;
+                    while o3 < cap * core::mem::size_of::<AtomicU32>() { core::ptr::write_volatile((meta_flags as *mut u8).add(o3), 0u8); o3 += page; }
+                }
+            }
+
+            Self {
+                mask: cap-1,
+                head: AtomicUsize::new(0), _pad0: [0;64],
+                tail: AtomicUsize::new(0), _pad1: [0;64],
+                buf: ptr, cap,
+                meta_deadline, meta_flags
+            }            core::ptr::write_volatile((meta_flags as *mut u8).add(o3), 0u8); 
+                        o3 += page; 
+                    }
+                }
+            }
+            
+{{ ... }}
+            Self { 
+                mask: cap-1, 
+                head: AtomicUsize::new(0), 
+                _pad0: [0;64], 
+                tail: AtomicUsize::new(0), 
+                _pad1: [0;64], 
+                buf: ptr, 
+                cap, 
+                meta_deadline, 
+                meta_flags 
+            }
         }
         #[inline] pub fn capacity(&self) -> usize { self.cap }
         #[inline]
@@ -714,18 +1539,155 @@ mod group_futex_bitset {
 
     #[inline] pub fn set_idle(mask: &AtomicU32, bit: u8)   { let m = 1u32 << bit; mask.fetch_or(m, Relaxed); }
     #[inline] pub fn clear_idle(mask: &AtomicU32, bit: u8) { let m = !(1u32 << bit); mask.fetch_and(m, Relaxed); }
-    #[inline] fn pick_lane(mask: u32) -> Option<u8> { if mask == 0 { None } else { Some(mask.trailing_zeros() as u8) } }
+
+    #[inline]
+    fn pick_lane_rr(seq: &AtomicU32, mask: u32) -> Option<u8> {
+        if mask == 0 { return None; }
+        // Rotate starting position by seq to avoid bias
+        let base = (seq.load(std::sync::atomic::Ordering::Relaxed) & 31) as u8;
+        for off in 0..32u8 {
+            let bit = ((base as u32 + off as u32) & 31) as u8;
+            if (mask & (1u32 << bit)) != 0 { return Some(bit); }
+        }
+        None
+    }
+
+    #[inline] pub fn wake_one(seq: &AtomicU32, idle_mask: &AtomicU32) {
+        let snap = idle_mask.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(bit) = pick_lane_rr(seq, snap) {
+            let _ = seq.fetch_add(1, std::sync::atomic::Ordering::Release);
+            futex_wake_bitset(seq, 1u32 << bit);
+        }
+    }
 
     #[inline] pub fn park(seq: &AtomicU32, idle_mask: &AtomicU32, lane_bit: u8, idle_backoff_us: u64) {
         let seqv = seq.load(std::sync::atomic::Ordering::Acquire);
         let lane_mask = 1u32 << lane_bit;
         futex_wait_bitset(seq, seqv, lane_mask, idle_backoff_us as u32);
     }
-    #[inline] pub fn wake_one(seq: &AtomicU32, idle_mask: &AtomicU32) {
-        let snap = idle_mask.load(Relaxed);
-        if let Some(bit) = pick_lane(snap) {
-            let _ = seq.fetch_add(1, std::sync::atomic::Ordering::Release);
-            futex_wake_bitset(seq, 1u32 << bit);
+
+    // Auto-scale wakeups based on system load. Returns the number of workers woken.
+    #[inline] pub fn wake_auto(
+        seq: &AtomicU32, 
+        idle_mask: &AtomicU32, 
+        work_queue_depth: usize,  // Current depth of the work queue
+        max_workers: usize,       // Maximum number of workers to wake
+        min_workers: usize,       // Minimum workers to ensure progress
+    ) -> usize {
+        // Load current idle mask
+        let idle = idle_mask.load(Relaxed);
+        if idle == 0 {
+            return 0;  // No idle workers to wake
+        }
+
+        // Calculate how many workers to wake based on queue depth
+        // Use log2(work_queue_depth + 1) to scale wakeups with load
+        let log2_plus1 = 64 - (work_queue_depth + 1).leading_zeros() as usize;
+        let k = (log2_plus1 * 2).clamp(min_workers, max_workers.min(32));
+        
+        if k == 0 {
+            return 0;
+        }
+
+        // Find up to k idle workers to wake
+        let mut to_wake = 0u32;
+        let mut count = 0;
+        let mut mask = idle;
+        
+        while mask != 0 && count < k {
+            let bit = mask.trailing_zeros() as u8;
+            to_wake |= 1u32 << bit;
+            mask ^= 1u32 << bit;  // Clear the bit
+            count += 1;
+        }
+
+        if to_wake != 0 {
+            // Use fetch_or to avoid races with concurrent wake_auto calls
+            let old = idle_mask.fetch_and(!to_wake, Relaxed);
+            let actually_woke = old & to_wake;
+            if actually_woke != 0 {
+                futex_wake_bitset(seq, actually_woke);
+                actually_woke.count_ones() as usize
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+
+    // Proportional multi-wake with CWND awareness. Returns the number of workers woken.
+    //
+    // This is similar to wake_auto but uses the congestion window (cwnd) to scale
+    // the number of workers woken, which helps maintain high throughput under
+    // congestion while avoiding excessive wakeups during backoff.
+    //
+    // # Arguments
+    // - seq: Sequence number for futex operations (must be the same for all calls)
+    // - idle_mask: Bitmask of idle workers (1 = idle)
+    // - cwnd: Current congestion window (packets in flight)
+    // - min_cwnd: Minimum cwnd to start waking workers
+    // - max_workers: Maximum number of workers to wake in one call
+    // - min_workers: Minimum workers to ensure progress
+    //
+    // # Returns
+    // Number of workers actually woken (0 if none available or cwnd too low)
+    #[inline] 
+    pub fn wake_auto_cwnd(
+        seq: &AtomicU32,
+        idle_mask: &AtomicU32,
+        cwnd: i32,              // Current congestion window
+        min_cwnd: i32,          // Minimum cwnd to start waking workers
+        max_workers: usize,     // Maximum workers to wake
+        min_workers: usize,     // Minimum workers to ensure progress
+    ) -> usize {
+        // If we're below min_cwnd, don't wake any workers (exponential backoff)
+        if cwnd < min_cwnd {
+            return 0;
+        }
+
+        // Load current idle mask
+        let idle = idle_mask.load(Relaxed);
+        if idle == 0 {
+            return 0;  // No idle workers to wake
+        }
+
+        // Calculate how many workers to wake based on cwnd headroom
+        // This gives us a smooth scaling from min_workers to max_workers
+        // as cwnd grows from min_cwnd to 2*min_cwnd
+        let cwnd_ratio = ((cwnd - min_cwnd) as f32 / min_cwnd as f32).clamp(0.0, 1.0);
+        let target_workers = min_workers + ((max_workers - min_workers) as f32 * cwnd_ratio.sqrt()) as usize;
+        
+        // Ensure we don't wake more workers than are actually idle
+        let k = target_workers.min(idle.count_ones() as usize);
+        if k == 0 {
+            return 0;
+        }
+
+        // Find up to k idle workers to wake
+        let mut to_wake = 0u32;
+        let mut count = 0;
+        let mut mask = idle;
+        
+        while mask != 0 && count < k {
+            let bit = mask.trailing_zeros() as u8;
+            to_wake |= 1u32 << bit;
+            mask ^= 1u32 << bit;  // Clear the bit
+            count += 1;
+        }
+
+        if to_wake != 0 {
+            // Atomically clear the bits we're trying to wake
+            let old = idle_mask.fetch_and(!to_wake, Relaxed);
+            let actually_woke = old & to_wake;
+            if actually_woke != 0 {
+                // Wake the workers
+                futex_wake_bitset(seq, actually_woke);
+                return actually_woke.count_ones() as usize;
+            }
+        }
+        
+        0
         }
     }
 }
@@ -898,10 +1860,22 @@ mod ipc_scale {
     #[inline]
     pub fn update_and_scale(ipc_sample: f64) -> f64 {
         let now = crate::clock::now_us();
-        let alpha_ms = *IPC_ALPHA_MILLIS as f64;
-        let alpha_base = if alpha_ms <= 0.0 { 1.0 } else { (1.0 - (-(now as f64)/(alpha_ms*1000.0)).exp()).clamp(0.0, 1.0) };
-        let ipc_smoothed = EWMA_IPC.with(|s| { let prev = s.get(); let next = prev + alpha_base * (ipc_sample - prev); s.set(next); next });
-        (*IPC_TARGET / ipc_smoothed.max(0.5)).powf(0.7).clamp(*SCALE_MIN, *SCALE_MAX)
+        // Load previous state
+        let (prev_ipc, last_us) = (
+            EWMA_IPC.with(|s| s.get()),
+            LAST_US.with(|t| t.get())
+        );
+        let dt_us = now.saturating_sub(last_us).max(1);
+        LAST_US.with(|t| t.set(now));
+
+        let tau_us = (*IPC_ALPHA_MILLIS).saturating_mul(1_000).max(1);
+        let alpha  = 1.0 - (- (dt_us as f64) / (tau_us as f64)).exp(); // time-aware EWMA
+
+        let next = prev_ipc + alpha * (ipc_sample - prev_ipc);
+        EWMA_IPC.with(|s| s.set(next));
+
+        // Scale target→actual smoothly; clamp to safe envelope
+        (*IPC_TARGET / next.max(0.25)).powf(0.7).clamp(*SCALE_MIN, *SCALE_MAX)
     }
 }
 
@@ -912,6 +1886,102 @@ mod perf_ipc_recover {
     pub fn ensure_ready() {
         CYC.with(|c| unsafe { if let Some(ref mut ctr) = *c.get() { let pg = &*ctr.page; if pg.index == 0 { libc::ioctl(ctr.fd, libc::PERF_EVENT_IOC_DISABLE, 0); libc::ioctl(ctr.fd, libc::PERF_EVENT_IOC_ENABLE, 0); } } });
         INS.with(|i| unsafe { if let Some(ref mut ctr) = *i.get() { let pg = &*ctr.page; if pg.index == 0 { libc::ioctl(ctr.fd, libc::PERF_EVENT_IOC_DISABLE, 0); libc::ioctl(ctr.fd, libc::PERF_EVENT_IOC_ENABLE, 0); } } });
+    }
+}
+
+// ========================= PATCH 61: CPU pinning and real-time scheduling =========================
+
+/// Set real-time scheduling priority (FIFO/RR) if running on Linux with sufficient permissions
+#[inline]
+pub fn maybe_set_fifo() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let class = std::env::var("QAB_SCHED_CLASS")
+            .ok()
+            .unwrap_or_else(|| "fifo".to_string());
+        let prio = std::env::var("QAB_SCHED_PRIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50)
+            .clamp(1, 99);
+        let policy = if class.eq_ignore_ascii_case("rr") {
+            libc::SCHED_RR
+        } else {
+            libc::SCHED_FIFO
+        };
+        let mut sp = libc::sched_param {
+            sched_priority: prio,
+        };
+        let _ = libc::sched_setscheduler(0, policy, &mut sp as *mut _);
+    }
+}
+
+/// Parse CPU set from string (e.g., "0-3,8,10-11")
+#[cfg(target_os = "linux")]
+unsafe fn parse_cpuset(s: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for part in s.split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                for c in lo..=hi {
+                    v.push(c);
+                }
+            }
+        } else if let Ok(x) = part.trim().parse::<usize>() {
+            v.push(x);
+        }
+    }
+    v
+}
+
+/// Pin the current thread to specific CPUs based on worker_id and environment configuration
+/// 
+/// # Arguments
+/// * `worker_id` - The ID of the worker thread (used to determine which CPU to pin to)
+/// 
+/// # Environment Variables
+/// - `QAB_CPUSET`: Comma-separated list of CPU IDs or ranges (e.g., "0-3,8-11")
+/// - `QAB_CPUSET_MODE`: Set to "exclusive" to pin each worker to a different CPU,
+///   or any other value to allow sharing of CPUs between workers
+#[inline]
+pub fn maybe_pin_cpuset(worker_id: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if let Ok(mask_s) = std::env::var("QAB_CPUSET") {
+            let exclusive = matches!(
+                std::env::var("QAB_CPUSET_MODE").as_deref(),
+                Ok("exclusive")
+            );
+            let mut list = parse_cpuset(&mask_s);
+            if list.is_empty() {
+                return;
+            }
+            list.sort_unstable();
+            list.dedup();
+
+            let cpu = if exclusive {
+                // In exclusive mode, assign each worker to a different CPU in round-robin fashion
+                list[worker_id % list.len()]
+            } else {
+                // In shared mode, all workers can use all CPUs
+                usize::MAX
+            };
+
+            let mut set: libc::cpu_set_t = core::mem::zeroed();
+            let sz = core::mem::size_of::<libc::cpu_set_t>();
+
+            if cpu == usize::MAX {
+                // Set all CPUs in the list
+                for &c in &list {
+                    libc::CPU_SET(c, &mut set);
+                }
+            } else {
+                // Set only the specific CPU
+                libc::CPU_SET(cpu, &mut set);
+            }
+
+            let _ = libc::sched_setaffinity(0, sz, &set as *const _);
+        }
     }
 }
 
@@ -1070,6 +2140,24 @@ impl Ed25519BatchVerifier {
         let picked = choose_core(core_id, &all, coreset.as_deref());
         let _ = core_affinity::set_for_current(picked);
 
+        // Parse RT priority from environment (0 = no RT scheduling)
+        let rt_prio = std::env::var("QAB_RT_PRIORITY")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        
+        // Set real-time scheduling if requested
+        if rt_prio > 0 {
+            if let Err(e) = set_realtime_priority(rt_prio) {
+                eprintln!("WARN: {}", e);
+            }
+        }
+        
+        // Bind to NUMA node if possible
+        if let Some(node) = numa_node_for_core(picked.id) {
+            bind_node(node);
+        }
+
         #[allow(unused)]
         fn bind_node(cpu_index: usize) {
             #[cfg(feature = "numa")]
@@ -1147,6 +2235,51 @@ static STEAL_ROT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "advanced_sched")]
 use crossbeam_utils::sync::{Parker, Unparker};
+
+// Token-based wakeup guard to prevent lost wake-ups
+#[cfg(feature = "advanced_sched")]
+struct WakeTokenGuard {
+    token: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "advanced_sched")]
+impl WakeTokenGuard {
+    fn new() -> Self {
+        Self {
+            token: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    // Prepare to park, returning true if we should actually park
+    fn prepare_park(&self) -> bool {
+        // Set token to false (consume any pending wakeup)
+        !self.token.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    // Wake up the waiter if it's parked
+    fn unpark(&self) {
+        // Set token to true (indicate wakeup)
+        if !self.token.swap(true, std::sync::atomic::Ordering::Release) {
+            // If we transitioned from false to true, we need to wake
+            // The actual unpark will be handled by the parker
+        }
+    }
+
+    // Park with a timeout, using the token to avoid lost wakeups
+    fn park_timeout(&self, parker: &Parker, timeout: Duration) -> bool {
+        if self.prepare_park() {
+            // Double-check if we got a wakeup between prepare_park and park
+            if !self.token.load(std::sync::atomic::Ordering::Acquire) {
+                parker.park_timeout(timeout);
+            }
+            // Consume the token
+            self.token.swap(false, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+}
 #[cfg(feature = "advanced_sched")]
 use crossbeam_utils::CachePadded;
 #[cfg(feature = "advanced_sched")]
@@ -1357,9 +2490,147 @@ for i in 0..num_workers {
         .expect("spawn worker");
 }
 
-// ...
 
 if t1 <= t2 { k1 } else { k2 }
+}
+
+// ========================= PATCH 60: p2c_pick adaptive 2-of-K chooser =========================
+#[inline(always)]
+fn p2c_pick(&self, cache_key: u64, profit: u64) -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    #[inline(always)]
+    fn fast_range_u64(x: u64, n: usize) -> usize {
+        ((u128::from(x) * u128::from(n as u64)) >> 64) as usize
+    }
+
+    #[inline]
+    fn cand_cost(me: &Ed25519BatchVerifier, wid: usize, profit: u64) -> i128 {
+        let backlog = me.backlog[wid].load(Relaxed);
+        let svc_ns  = me.svc_ns[wid].load(Relaxed).max(1);
+        let wait_ns = (backlog.saturating_mul(svc_ns)) as u64;
+
+        #[cfg(all(feature="numa_hotcold", feature="l3_cwnd"))]
+        let cwnd_head = {
+            let gid = me.my_group[wid];
+            let g = &me.l3_groups_hc[gid];
+            let inflight = g.load.load(Relaxed) as u32;
+            g.cwnd.headroom(inflight)
+        };
+        #[cfg(not(all(feature="numa_hotcold", feature="l3_cwnd")))]
+        let cwnd_head = 0;
+
+        #[cfg(feature="route_cost_scurve")]
+        let profit_credit = crate::route_cost_scurve::profit_ns_credit_scurve(
+            profit,
+            std::env::var("QAB_PROFIT_NS_PER_LAMPORT").ok().and_then(|s| s.parse().ok()).unwrap_or(25)
+        );
+        #[cfg(not(feature="route_cost_scurve"))]
+        let profit_credit: u64 = profit;
+
+        crate::route_cost::price(wait_ns, cwnd_head, profit_credit)
+    }
+
+    let n = self.inbox.len();
+    if n <= 1 { return 0; }
+
+    // Adaptive K selection based on system load and performance
+    let k = {
+        // Get system load metrics
+        let total_load: u64 = self.backlog.iter().map(|b| b.load(Relaxed)).sum();
+        let avg_load = total_load / n as u64;
+        let max_load = self.backlog.iter().map(|b| b.load(Relaxed)).max().unwrap_or(1);
+        let load_imbalance = max_load.saturating_sub(avg_load).saturating_mul(100) / avg_load.max(1);
+        
+        // Base K on load characteristics (4-16 candidates)
+        let base_k = if load_imbalance > 50 {
+            // High imbalance → more candidates
+            8 + (load_imbalance.min(200) / 25) as usize
+        } else {
+            // Low imbalance → fewer candidates
+            4 + (load_imbalance / 10) as usize
+        };
+        
+        // Adjust K based on profit (higher profit → more candidates)
+        let profit_scale = (profit as f64).log2().max(1.0) / 10.0;
+        let scaled_k = (base_k as f64 * profit_scale).round() as usize;
+        
+        // Clamp to reasonable range
+        (scaled_k).clamp(4, 16).min(n)
+    };
+
+    // Generate K unique candidates using hash mixing
+    let keyb = cache_key.to_le_bytes();
+    let mut hashes = Vec::with_capacity(k);
+    let h0 = xxhash_rust::xxh3::xxh3_64(&keyb);
+    hashes.push(h0);
+    
+    // Generate additional hashes by mixing with previous hashes and profit
+    for i in 1..k {
+        let mut mix = [0u8; 16];
+        mix[..8].copy_from_slice(&hashes[i-1].to_le_bytes());
+        mix[8..].copy_from_slice(&profit.to_le_bytes());
+        hashes.push(xxhash_rust::xxh3::xxh3_64(&mix));
+    }
+    
+    // Map hashes to worker indices and ensure uniqueness
+    let mut ks = Vec::with_capacity(k);
+    for &h in &hashes {
+        let mut idx = fast_range_u64(h, n);
+        // Ensure uniqueness with linear probing
+        while ks.contains(&idx) {
+            idx = (idx + 1) % n;
+        }
+        ks.push(idx);
+    }
+
+    // Evaluate costs for all candidates
+    let mut cand: Vec<_> = ks.into_iter()
+        .map(|wid| (cand_cost(self, wid, profit), wid))
+        .collect();
+    
+    // Sort by cost (ascending)
+    cand.sort_unstable_by_key(|&(cost, _)| cost);
+    
+    // Get the two best candidates
+    let (c1, a) = cand[0];
+    let (c2, b) = cand[1];
+
+    // Adaptive tie-breaking with dynamic epsilon band
+    let eps_bp = if k > 8 { 100 } else { 200 }; // Tighter band with more candidates
+    let base = core::cmp::min(core::cmp::abs(c1), core::cmp::abs(c2)).max(1);
+    let eps = (base * eps_bp as i128) / 10_000;
+    
+    if (c1 - c2).abs() <= eps {
+        // Affinity by key (reuse the same hash as before for consistency)
+        let affinity = fast_range_u64(xxhash_rust::xxh3::xxh3_64(&keyb), n);
+        if a == affinity && b != affinity { return a; }
+        if b == affinity && a != affinity { return b; }
+
+        // Prefer lane with service time below cluster average
+        let lanes = self.svc_ns.len().max(1);
+        let sum_ns: u64 = self.svc_ns.iter().map(|a| a.load(Relaxed)).sum::<u64>().max(1);
+        let avg = sum_ns / lanes as u64;
+        let s1 = self.svc_ns[a].load(Relaxed);
+        let s2 = self.svc_ns[b].load(Relaxed);
+        if (s1 <= avg) != (s2 <= avg) { 
+            return if s1 <= avg { a } else { b }; 
+        }
+
+        // Fallback to low-discrepancy tie rotation (deterministic)
+        thread_local! { 
+            static TIE_ROT: std::cell::Cell<u32> = std::cell::Cell::new(0); 
+        }
+        let rot = TIE_ROT.with(|t| { 
+            let v = t.get(); 
+            t.set(v.wrapping_add(1)); 
+            v.reverse_bits() 
+        });
+        return if (rot & 1) == 0 { a } else { b };
+    }
+
+    // Return the better candidate based on cost
+    if c1 <= c2 { a } else { b }
 }
 
 fn dispatch_p2c(&self, item: ShardItem) {
@@ -1380,7 +2651,24 @@ fn dispatch_p2c(&self, item: ShardItem) {
 
 // ...
 
-fn worker_loop(&self, worker_id: usize, parker: Parker, _unparker: std::sync::Arc<Unparker>) {
+fn worker_loop(&self, worker_id: usize, parker: Parker, unparker: std::sync::Arc<Unparker>) {
+    // Set CPU affinity for this worker thread
+    #[cfg(target_os = "linux")]
+    {
+        thread_local! { 
+            static AFF_SET: std::cell::Cell<bool> = std::cell::Cell::new(false); 
+        }
+        AFF_SET.with(|f| if !f.get() { 
+            // Use the new maybe_pin_cpuset function from this module
+            maybe_pin_cpuset(worker_id);
+            // Also set real-time scheduling if configured
+            maybe_set_fifo();
+            f.set(true); 
+        });
+    }
+
+    // Create a wake token guard for this worker
+    let wake_guard = WakeTokenGuard::new();
     let local = &self.workers[worker_id];
     let stealers = &self.stealers;
     let mut batch: Vec<ShardItem> = Vec::with_capacity(MAX_BATCH_SIZE);
@@ -1397,13 +2685,39 @@ fn worker_loop(&self, worker_id: usize, parker: Parker, _unparker: std::sync::Ar
             if let Some(it) = self.inbox[worker_id].pop() { batch.push(it); from_inbox += 1; continue; }
             break;
         }
-        if self.inbox[worker_id].is_empty() { self.inbox_wake[worker_id].store(0, AOrd::Release); }
+        if self.inbox[worker_id].is_empty() { 
+            self.inbox_wake[worker_id].store(0, AOrd::Release); 
+            
+            // PATCH 22W: Wake multiple workers after bulk drain if needed
+            #[cfg(all(target_os = "linux", feature = "group_futex_bitset", feature = "numa_hotcold"))]
+            {
+                let gid = self.my_group[worker_id];
+                let g = &self.l3_groups_hc[gid];
+                // Wake up to 4 idle workers if we processed a significant batch
+                if from_inbox >= 4 {
+                    wake_many(&g.futex_seq, &g.idle_mask, 4);
+                }
+            }
+        }
         // 2) local deque
         while batch.len() < target { if let Some(it) = local.pop() { batch.push(it); continue; } break; }
-        // 3) injector
+        // 3) injector with bulk wake support
+        let mut bulk_count = 0;
         while batch.len() < target {
             match self.injector.steal() {
-                Steal::Success(it) => { batch.push(it); }
+                Steal::Success(it) => { 
+                    batch.push(it); 
+                    bulk_count += 1;
+                    // PATCH 22W: Wake multiple workers after bulk steal
+                    if bulk_count % 8 == 0 { // Wake others every 8 items
+                        #[cfg(all(target_os = "linux", feature = "group_futex_bitset", feature = "numa_hotcold"))]
+                        {
+                            let gid = self.my_group[worker_id];
+                            let g = &self.l3_groups_hc[gid];
+                            wake_many(&g.futex_seq, &g.idle_mask, 2); // Wake up to 2 workers
+                        }
+                    }
+                }
                 Steal::Retry => continue,
                 Steal::Empty => break,
             }
@@ -1411,7 +2725,35 @@ fn worker_loop(&self, worker_id: usize, parker: Parker, _unparker: std::sync::Ar
         // 3b) L3 ring before any cold-steal (HOT/COLD with promotion)
         #[cfg(feature = "numa_hotcold")]
         {
+            // NUMA drain tick promotion: keep HOT ring fresh before draining
+            if batch.len() < target {
+                let gid = self.my_group[worker_id];
+                let g = &self.l3_groups_hc[gid];
+                // Only promote if we have room in the HOT ring
+                if g.hot_load.load(Ordering::Relaxed) < g.hot.capacity() {
+                    let _ = l3_hotcold_promotion::promote_bounded(g);
+                }
+            }
             self.try_drain_l3(worker_id, &mut batch, target);
+            
+            // Periodically run maintenance tasks
+        #[cfg(feature = "advanced_sched")]
+        {
+            static TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            
+            // Run VK cache GC every 16K ticks (~2.6s at 6.1us/tick)
+            if tick & 0x3FFF == 0 {
+                vk_cache_gc_tick();
+            }
+            
+            // Run HOT maintenance every 4K ticks (~25ms at 6.1us/tick)
+            if tick & 0xFFF == 0 {
+                let gid = self.my_group[worker_id];
+                let g = &self.l3_groups_hc[gid];
+                hot_maint_prune_stale(g);
+            }
+        }          }
         }
         // 4) hybrid spin, then NUMA-aware steal
         if batch.len() < target {
@@ -1455,27 +2797,117 @@ fn worker_loop(&self, worker_id: usize, parker: Parker, _unparker: std::sync::Ar
                     {
                         let gid = self.my_group[worker_id];
                         let g = &self.l3_groups_hc[gid];
-                        group_futex::park(&g.futex_seq, 50);
+                        // Use the wake guard for futex-based parking as well
+                        if wake_guard.prepare_park() {
+                            group_futex::park(&g.futex_seq, 50);
+                            wake_guard.token.store(false, std::sync::atomic::Ordering::Release);
+                        }
                         continue;
                     }
                     #[cfg(not(all(feature = "numa_hotcold", feature = "group_futex")))]
-                    { parker.park_timeout(Duration::from_micros(50)); continue; }
+                    { 
+                        wake_guard.park_timeout(&parker, Duration::from_micros(50));
+                        continue; 
+                    }
                 }
             }
         }
-        if batch.is_empty() { continue; }
+        if batch.is_empty() { 
+            // ========================= PATCH 52: Coalesced worker heartbeat =========================
+            // Only run maintenance on one lane per NUMA node to reduce contention
+            static MAINT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let maint_tick = MAINT_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            
+            // Each NUMA node designates one worker to handle maintenance
+            let is_maint_worker = worker_id % 16 == (maint_tick as usize % 16);
+            
+            if is_maint_worker {
+                // Run VK cache GC every 16K ticks (~2.6s at 6.1us/tick)
+                if maint_tick % 16_384 == 0 {
+                    vk_cache_gc_tick();
+                }
+                
+                // Run HOT maintenance every 4K ticks (~25ms at 6.1us/tick)
+                if maint_tick % 4_096 == 0 {
+                    #[cfg(feature = "numa_hotcold")]
+                    {
+                        let gid = self.my_group[worker_id];
+                        let g = &self.l3_groups_hc[gid];
+                        hot_maint_prune_stale(g);
+                    }
+                }
+                
+                // Resync clock every 1M ticks (~6.5s at 6.1us/tick)
+                if maint_tick % 1_048_576 == 0 {
+                    cycles_resync_tick();
+                }
+            }
+            
+            // Backoff to avoid tight spinning
+            std::thread::yield_now();
+            continue; 
+        }
 
         // queue-wait metrics using serialized TSC
-        let now_cyc = clock::now_cycles_serialized();
+        let now_cyc = now_cycles();
         for it in &batch { if sample_pow2() { self.metrics.queue_wait_us.observe(it.age_us_cyc(now_cyc) as f64); } }
         // de-duplicate within-batch before verification
         let (uniq_batch, remap) = self.dedupe_batch(&batch);
-        let start = Instant::now();
+        
+        // PATCH 46: Preempt-aware service time measurement with fenced cycles
+        // Start/end stamps with OoO fencing
+        let c_start = now_cycles_fenced();
         let uniq_results = Self::verify_batch_dalek(&uniq_batch);
+        let c_end = now_cycles_fenced();
+        let dcy = c_end.wrapping_sub(c_start);
+        let dns = cycles_to_ns(dcy).max(1);
+        let done = batch.len().max(1) as u64;
+        let per_item = (dns / done).max(1);
+        
+        // Preemption/migration guard (best-effort)
+        #[inline]
+        fn cur_cpu() -> i32 {
+            #[cfg(all(target_os="linux", target_arch="x86_64"))] { 
+                unsafe { libc::sched_getcpu() } 
+            }
+            #[cfg(not(all(target_os="linux", target_arch="x86_64")))] { -1 }
+        }
+        
+        static mut LAST_CPU: i32 = -1;
+        let this_cpu = cur_cpu();
+        let migrated = unsafe {
+            let prev = LAST_CPU;
+            LAST_CPU = this_cpu;
+            prev >= 0 && prev != this_cpu
+        };
+
+        // Jitter guard vs previous lane svc_ns
+        use core::sync::atomic::Ordering::Relaxed;
+        let prev = self.svc_ns[worker_id].load(Relaxed).max(1);
+        let hard_hi = prev.saturating_mul(8);   // reject >8x spikes
+        let hard_lo = prev / 8;                 // reject <1/8 dips (timer glitches)
+        let accept = !migrated && per_item >= hard_lo && per_item <= hard_hi;
+
+        // Update lane svc_ns with asymmetric smoothing; feed global svc_obs iff accepted
+        if accept {
+            let next = if per_item >= prev {
+                // slow grow toward worse (25%)
+                (((prev as u128 * 3) + per_item as u128 + 3) >> 2) as u64
+            } else {
+                // fast cut toward better (50%)
+                (((prev as u128) + per_item as u128) >> 1) as u64
+            };
+            self.svc_ns[worker_id].store(next.max(1), Relaxed);
+            svc_obs::update_sample(per_item);
+        } else {
+            // soft decay toward better when rejecting
+            let next = (((prev as u128 * 7) + prev as u128) >> 3) as u64;
+            self.svc_ns[worker_id].store(next.max(1), Relaxed);
+        }
+        
         // fan-out results to original order
         let mut results: Vec<Result<bool, BatchVerifierError>> = Vec::with_capacity(batch.len());
         for &u in remap.iter() { results.push(uniq_results[u].clone()); }
-        let elapsed = start.elapsed();
 
         // per-CPU counters: aggregate ok/fail
         let mut okc: u64 = 0; let mut flc: u64 = 0;
@@ -1486,24 +2918,220 @@ fn worker_loop(&self, worker_id: usize, parker: Parker, _unparker: std::sync::Ar
         let processed = results.len() as u64;
         self.inflight.fetch_sub(processed, AOrd::Relaxed);
         if from_inbox > 0 { self.backlog[worker_id].fetch_sub(from_inbox as u64, AOrd::Relaxed); }
-        // EWMA ns/item, alpha = 1/16
-        let sample_ns = (elapsed.saturating_mul(1_000)) / processed.max(1);
-        let old = self.svc_ns[worker_id].load(AOrd::Relaxed);
-        let mut new = old - (old >> 4) + (sample_ns >> 4);
-        // RDPMC fast-path: recover + throttled sampling + smooth scaling
-        #[cfg(feature = "rdpmc_ipc")]
-        {
-            perf_ipc_recover::ensure_ready();
-            if let Some((_cyc,_ins, ipc)) = perf_ipc::sample_ipc_throttled(2000) {
-                let scale = ipc_scale::update_and_scale(ipc);
-                new = (((new as f64) * scale) as u64).max(1);
-            }
-        }
-        self.svc_ns[worker_id].store(new.max(1), AOrd::Relaxed);
     }
 }
 
 // ===== CU-budget clamp wiring =====
+#[cfg(all(feature="advanced_sched"))]
+impl Ed25519BatchVerifier {
+    #[inline]
+    fn ceil_pow2_u32(mut v: u32) -> u32 { v -= 1; v |= v>>1; v |= v>>2; v |= v>>4; v |= v>>8; v |= v>>16; v + 1 }
+    #[inline]
+    fn floor_pow2_u32(v: u32) -> u32 { 1u32 << (31 - v.leading_zeros()) }
+    
+    // ========================= PATCH 51: cur_batch_size with global svc guardrail =========================
+    #[inline]
+    fn cur_batch_size(&self) -> usize {
+        use core::sync::atomic::Ordering::Relaxed;
+        
+        // Live svc stats across lanes
+        let lanes = self.svc_ns.len().max(1);
+        let mut sum: u64 = 0;
+        let mut mx:  u64 = 1;
+        for a in &self.svc_ns {
+            let v = a.load(Relaxed).max(1);
+            sum = sum.saturating_add(v);
+            if v > mx { mx = v; }
+        }
+        let avg = (sum / lanes as u64).max(1);
+
+        // Effective svc: blend toward max to hedge tails (25% weight on max)
+        let mut eff_svc = avg.saturating_add((mx.saturating_sub(avg)) / 4).max(1);
+        
+        // Global guardrail: don't be too optimistic if global svc is worse
+        #[cfg(feature = "svc_obs")] {
+            let global_est = crate::svc_obs::est_ns();
+            if global_est > eff_svc {
+                // Blend 25% toward global estimate when it's worse
+                eff_svc = eff_svc.saturating_add(
+                    (global_est.saturating_sub(eff_svc) + 3) / 4
+                );
+            }
+        }
+
+        // Raw target to meet latency bound (with 10% headroom for safety)
+        let raw_want = ((self.target_latency_us as u64 * 900) / eff_svc.max(1))
+            .clamp(MIN_BATCH_SIZE as u64, MAX_BATCH_SIZE as u64) as usize;
+
+        // Asymmetric smoothing: fast to cut, slow to grow
+        let mut bs = self.batch_size.lock();
+        let prev = (*bs).clamp(MIN_BATCH_SIZE, MAX_BATCH_SIZE);
+        
+        let next = if raw_want < prev {
+            // Fast cut: 50% toward target when reducing
+            (prev + raw_want) / 2
+        } else {
+            // Slow growth: 12.5% toward target when increasing
+            ((prev as u64 * 7 + raw_want as u64 + 7) >> 3) as usize
+        };
+
+        // Snap to nearest Po2
+        let lo = floor_pow2_u32(next as u32).max(MIN_BATCH_SIZE as u32);
+        let hi = ceil_pow2_u32(next as u32).min(MAX_BATCH_SIZE as u32);
+        let next = if (hi - next as u32) < (next as u32 - lo) { 
+            hi as usize 
+        } else { 
+            lo as usize 
+        };
+
+        // Enforce min/max bounds
+        let next = next.clamp(MIN_BATCH_SIZE, MAX_BATCH_SIZE);
+        *bs = next;
+        next
+        let want = ((self.target_latency_us as u64 * 1_000) / svc_ns_avg)
+            .clamp(MIN_BATCH_SIZE as u64, MAX_BATCH_SIZE as u64) as usize;
+
+        // Smooth towards 'want' (25% step) to avoid oscillation
+        let mut bs = self.batch_size.lock();
+        let prev = *bs;
+        let next = (((prev as u64 * 3) + want as u64 + 3) >> 2) as usize;
+        
+        // PATCH 23: Snap to nearest power of two for better alloc/SIMD behavior
+        let next = if next <= 1 {
+            next // 0 and 1 are already powers of two
+        } else {
+            let lo = self.floor_pow2_u32(next as u32);
+            let hi = self.ceil_pow2_u32(next as u32);
+            
+            // Choose the nearest power of two, with preference for lower on tie
+            if next - lo as usize <= hi as usize - next {
+                lo as usize
+            } else {
+                hi as usize
+            }
+        }.clamp(MIN_BATCH_SIZE, MAX_BATCH_SIZE);
+        
+        *bs = next;
+        next
+    }
+
+    #[inline]
+    fn cold_steal_round(
+        &self,
+        worker_id: usize,
+        ord: &[usize],
+        out: &mut Vec<ShardItem>,
+        target: usize
+    ) -> usize {
+        use core::sync::atomic::Ordering::Relaxed;
+        let need0 = target.saturating_sub(out.len());
+        if need0 == 0 { return 0; }
+
+        // Rank groups by route_cost::price; prefer own group first
+        let mut cand: smallvec::SmallVec<[(i128, usize); 32]> = smallvec::SmallVec::new();
+        let myg = self.my_group[worker_id];
+
+        for (gid, g) in self.l3_groups_hc.iter().enumerate() {
+            let inflight = g.load.load(Relaxed) as u32;
+            #[cfg(feature="l3_cwnd")]
+            let head = g.cwnd.headroom(inflight);
+            #[cfg(not(feature="l3_cwnd"))]
+            let head = 0;
+
+            #[cfg(all(feature="route_cost"))]
+            let svc = self.group_svc_ns.get(gid).map(|a| a.load(Relaxed)).unwrap_or(1);
+            #[cfg(not(all(feature="route_cost")))]
+            let svc = 1;
+
+            let wait_ns = (g.hot_load.load(Relaxed).saturating_add(g.load.load(Relaxed))) * svc;
+            let price = crate::route_cost::price(wait_ns, head, 0);
+            // Bias own group slightly
+            let price = if gid == myg { price - 64 } else { price };
+            cand.push((price, gid));
+        }
+        cand.sort_unstable_by(|a,b| a.0.cmp(&b.0));
+
+        let mut taken = 0usize;
+        for &(_, gid) in cand.iter() {
+            let g = &self.l3_groups_hc[gid];
+
+            // JIT promotion (bounded)
+            let _ = crate::l3_hotcold_promotion::promote_bounded(g);
+
+            // Drain HOT first
+            let before = out.len();
+            crate::l3_hotcold::drain_hot(g, out, target);
+            let got_hot = out.len() - before;
+
+            if out.len() < target {
+                crate::l3_hotcold::drain_cold(g, out, target);
+            }
+            let got = out.len() - before;
+            taken += got;
+            if taken >= need0 { break; }
+            // If neither hot nor cold yielded, move on quickly
+            if got == 0 && got_hot == 0 { continue; }
+        }
+
+        // Hard fallback: crossbeam deque stealing if we still need items
+        if out.len() < target {
+            #[inline]
+            fn fast_range_u64(x: u64, n: usize) -> usize {
+                ((u128::from(x) * u128::from(n as u64)) >> 64) as usize
+            }
+            let need = target - out.len();
+            let burst = need.min(32);
+
+            // Unbiased rotation using time+worker hash
+            let seed = crate::clock::now_cycles().wrapping_mul(0x9E3779B185EBCA87);
+            let mut idx = fast_range_u64(seed ^ (worker_id as u64).rotate_left(17), ord.len());
+
+            for _ in 0..ord.len() {
+                let j = ord[idx];
+                let mut pulled = 0usize;
+                // Try to take a small burst from this victim before moving on
+                while pulled < burst && out.len() < target {
+                    match self.stealers[j].steal() {
+                        crossbeam_deque::Steal::Success(it) => { out.push(it); pulled += 1; }
+                        crossbeam_deque::Steal::Retry => continue,
+                        crossbeam_deque::Steal::Empty => break,
+                    }
+                }
+                if out.len() >= target { break; }
+                idx = (idx + 1) % ord.len();
+            }
+        }
+        taken
+    }
+
+    #[cfg(all(feature = "ring_meta"))]
+    #[inline]
+    fn try_drain_l3(&self, worker_id: usize, out: &mut Vec<ShardItem>, target: usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let gid = self.my_group[worker_id];
+        let g = &self.l3_groups_hc[gid];
+
+        let mut tmp: smallvec::SmallVec<[(ShardItem, u64); 64]> = smallvec::SmallVec::new();
+        let sample = target.saturating_mul(2).min(64);
+
+                (true,  false) => core::cmp::Ordering::Greater,
+                (false, true ) => core::cmp::Ordering::Less,
+                (true,  true ) => core::cmp::Ordering::Equal,
+            }
+        });
+
+        // Take the best; requeue any overflow back to HOT (stable)
+        for (i, (it, dl)) in tmp.into_iter().enumerate() {
+            if out.len() < target {
+                out.push(it);
+            } else {
+                let _ = g.hot.push_with_meta(it, crate::fast_ring_meta::META_F_HOT0 | crate::fast_ring_meta::META_F_DEADLINE, dl);
+                g.hot_load.fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
 #[cfg(all(feature="advanced_sched", feature="cu_budget"))]
 impl Ed25519BatchVerifier {
     #[inline]
@@ -1573,10 +3201,29 @@ impl FailStats {
 }
     }
 }
+// ========================= PATCH: pin_to_core_and_node (non-Linux fallback) =========================
 #[cfg(all(feature = "core_affinity", not(target_os = "linux")))]
 fn pin_to_core_and_node(core_id: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    
+    static NEXT_CORE: AtomicUsize = AtomicUsize::new(0);
+    
+    // Simple round-robin core assignment if no specific core is requested
+    let core_id = core_id % num_cpus::get();
+    
     if let Some(cores) = core_affinity::get_core_ids() {
-        if let Some(core) = cores.get(core_id) { let _ = core_affinity::set_for_current(*core); }
+        if let Some(&core) = cores.get(core_id % cores.len()) {
+            if core_affinity::set_for_current(core) {
+                // Successfully set affinity
+                return;
+            }
+        }
+        
+        // Fallback: round-robin assignment
+        let idx = NEXT_CORE.fetch_add(1, Ordering::Relaxed) % cores.len();
+        if let Some(&core) = cores.get(idx) {
+            let _ = core_affinity::set_for_current(core);
+        }
     }
 }
 
@@ -1787,6 +3434,31 @@ const GPU_THRESHOLD: usize = 96; // speculative threshold for GPU path
 const PRIORITY_LEVELS: usize = 256;
 const MAX_INFLIGHT_ITEMS: usize = 128 * 1024;
 
+// ========================= PATCH 44: svc_obs - Global per-item service time estimator =========================
+pub mod svc_obs {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use once_cell::sync::Lazy;
+
+    // Global robust EWMA of per-item service time (ns)
+    static EWMA_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1_000)); // sane nonzero seed
+
+    #[inline]
+    pub fn est_ns() -> u64 {
+        EWMA_NS.load(Relaxed).max(1)
+    }
+
+    // Robust update: clamp sample into [ewma/4, ewma*4] then 1/8 smoothing
+    #[inline]
+    pub fn update_sample(sample_ns: u64) {
+        let prev = EWMA_NS.load(Relaxed).max(1);
+        let lo = prev / 4;
+        let hi = prev.saturating_mul(4);
+        let s = sample_ns.clamp(lo.max(1), hi);
+        let next = (((prev as u128) * 7) + (s as u128) + 7) >> 3;
+        EWMA_NS.store(next as u64, Relaxed);
+    }
+}
+
 // ========================= Inline TSC clock (cycles -> microseconds) =========================
 mod clock {
     use once_cell::sync::Lazy;
@@ -1823,7 +3495,35 @@ mod clock {
     });
 
     #[inline(always)] pub fn now_cycles() -> u64 { rdtsc() }
-    #[inline(always)] pub fn now_cycles_serialized() -> u64 {
+    
+    #[inline(always)] 
+    pub fn now_cycles_fenced() -> u64 {
+        #[cfg(all(target_os="linux", target_arch="x86_64"))] {
+            use once_cell::sync::Lazy;
+            static USE_RDTSCP: Lazy<bool> = Lazy::new(|| matches!(std::env::var("QAB_TSC_SERIALIZE").as_deref(), Ok("rdtscp")));
+            
+            unsafe {
+                if *USE_RDTSCP {
+                    let mut aux: u32 = 0;
+                    // rdtscp is ordered after all prior ops; followed by lfence to order subsequent ops
+                    let t = core::arch::x86_64::_rdtscp(&mut aux);
+                    core::arch::x86_64::_mm_lfence();
+                    t as u64
+                } else {
+                    core::arch::x86_64::_mm_lfence();
+                    let t = core::arch::x86_64::_rdtsc();
+                    core::arch::x86_64::_mm_lfence();
+                    t as u64
+                }
+            }
+        }
+        #[cfg(not(all(target_os="linux", target_arch="x86_64")))] {
+            now_cycles()
+        }
+    }
+    
+    #[inline(always)] 
+    pub fn now_cycles_serialized() -> u64 {
         #[cfg(target_arch = "x86_64")] {
             unsafe {
                 core::arch::x86_64::_mm_lfence();
@@ -2061,32 +3761,10 @@ impl BatchVerifier {
             match ParsedItem::try_from(it) {
                 Ok(p) => parsed.push(p),
                 Err(_) => return items.iter().map(|x| Self::verify_item(x)).collect(),
-            }
-        }
-        Self::verify_batch_from_parsed(&parsed)
     }
 
-    fn verify_batch_from_parsed(parsed: &[ParsedItem]) -> Vec<Result<bool, BatchVerifierError>> {
-        use ed25519_dalek::{Signature, VerifyingKey};
-        let n = parsed.len();
-        if n == 0 { return vec![]; }
-        // Build aligned vectors
-        let mut msgs: Vec<&[u8]> = parsed.iter().map(|p| p.msg.as_ref()).collect();
-        let mut sigs: Vec<Signature> = parsed.iter().map(|p| p.sig.clone()).collect();
-        let mut keys: Vec<VerifyingKey> = parsed.iter().map(|p| p.vk.clone()).collect();
-
-        // Batch fusion: sort by verifying key bytes to improve locality and reduce branch mispredicts
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_unstable_by_key(|&i| keys[i].to_bytes());
-
-        let mut msgs_sorted: Vec<&[u8]> = Vec::with_capacity(n);
-        let mut sigs_sorted: Vec<Signature> = Vec::with_capacity(n);
-        let mut keys_sorted: Vec<VerifyingKey> = Vec::with_capacity(n);
-        for i in &idx { msgs_sorted.push(msgs[*i]); sigs_sorted.push(sigs[*i]); keys_sorted.push(keys[*i]); }
-
-        // Process in SIMD-friendly chunks in parallel; leftover fallback to singles
-        let mut out = vec![Err(BatchVerifierError::VerificationFailed); n];
-        // closure to process a chunk [start, end)
+    // Slow path: bisect to identify bads
+    fn mark_range(
         let process_chunk = |start: usize, end: usize, out: &mut [Result<bool, BatchVerifierError>]| {
             let len = end - start;
             if len == 0 { return; }
@@ -2121,6 +3799,562 @@ impl BatchVerifier {
             }
         }
         out
+    }
+}
+
+// ========================= PATCH 22: group_futex_bitset::wake_many (ADD) =========================
+#[inline]
+pub fn wake_many(seq: &std::sync::atomic::AtomicU32, idle_mask: &std::sync::atomic::AtomicU32, mut k: usize) {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    if k == 0 { return; }
+    let mut snap = idle_mask.load(Relaxed);
+    if snap == 0 { return; }
+
+    // Round-robin start to keep fairness
+    let base = (seq.load(Relaxed) & 31) as u8;
+    let mut woke = 0usize;
+
+    for off in 0..32u8 {
+        if woke >= k { break; }
+        let bit = ((base as u32 + off as u32) & 31) as u8;
+        let mask = 1u32 << bit;
+        if snap & mask == 0 { continue; }
+        // Clear this idle bit optimistically (avoid thundering herd)
+        let prev = idle_mask.fetch_and(!mask, Release);
+        if prev & mask != 0 {
+            let _ = seq.fetch_add(1, Release);
+            // futex_wake_bitset(seq, mask);
+            unsafe {
+                let _ = libc::syscall(
+                    libc::SYS_futex,
+                    seq as *const _ as *const u32,
+                    libc::FUTEX_WAKE_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    1u32,
+                    0 as *const libc::timespec,
+                    0 as *mut libc::c_void,
+                    mask
+                );
+            }
+            woke += 1;
+        }
+        snap &= !mask;
+        if snap == 0 { break; }
+    }
+}
+
+// ========================= PATCH 37: verify_batch_dalek with iterative bisect and stronger prefetch =========================
+fn verify_batch_dalek(items: &[ShardItem]) -> Vec<Result<bool, BatchVerifierError>> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use smallvec::SmallVec;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    use std::intrinsics::prefetch_read_data;
+
+    // Thread-local storage for verification state to avoid allocations
+    thread_local! {
+        static TLS: RefCell<(
+            SmallVec<[usize; 1024]>,            // Original indices
+            SmallVec<[&'static [u8]; 1024]>,    // Message references
+            SmallVec<[Signature; 1024]>,        // Signatures
+            SmallVec<[VerifyingKey; 1024]>,     // Verification keys
+            HashMap<u64, usize>,                // Deduplication map (hash -> index)
+            SmallVec<[Option<usize>; 1024]>     // Mapping from original index to dedup index
+        )> = RefCell::new(Default::default());
+    }
+
+    let n = items.len();
+    if n == 0 { return Vec::new(); }
+
+    // Output preset to "failed" (will be overwritten on success)
+    let mut out = vec![Err(BatchVerifierError::VerificationFailed); n];
+
+    TLS.with(|cell| {
+        let (ref mut idx, ref mut msgs, ref mut sigs, ref mut keys, 
+             ref mut dedup, ref mut orig_to_dedup) = *cell.borrow_mut();
+        
+        // Clear and reserve space
+        idx.clear(); msgs.clear(); sigs.clear(); keys.clear();
+        dedup.clear(); orig_to_dedup.clear();
+        
+        // Pre-allocate to avoid reallocation
+        idx.reserve(n); 
+        msgs.reserve(n); 
+        sigs.reserve(n); 
+        keys.reserve(n);
+        orig_to_dedup.resize(n, None);
+        
+        // First pass: deduplicate (vk, sig, msg) tuples using a hash map
+        let mut hasher = DefaultHasher::new();
+        for (i, item) in items.iter().enumerate() {
+            // Skip empty messages
+            if item.msg.is_empty() { continue; }
+            
+            // Compute a combined hash of (vk_bytes || sig_bytes || msg)
+            hasher.write(&item.vk_bytes);
+            hasher.write(&item.sig.to_bytes());
+            hasher.write(item.msg.as_ref());
+            let hash = hasher.finish();
+            
+            // Check if we've seen this (vk, sig, msg) before
+            match dedup.entry(hash) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    // Duplicate found - just reference the existing entry
+                    orig_to_dedup[i] = Some(*entry.get());
+                },
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    // New unique entry - add to our working sets
+                    let new_idx = idx.len();
+                    entry.insert(new_idx);
+                    orig_to_dedup[i] = Some(new_idx);
+                    
+                    // SAFETY: We ensure the slice outlives this function call
+                    let msg_slice = unsafe { 
+                        core::slice::from_raw_parts(item.msg.as_ptr(), item.msg.len()) 
+                    };
+                    
+                    idx.push(i);
+                    msgs.push(msg_slice);
+                    sigs.push(item.sig.clone());
+                    keys.push(item.vk.clone());
+                }
+            }
+            
+            hasher = DefaultHasher::new(); // Reset hasher for next iteration
+        }
+        
+        if idx.is_empty() { return; }
+
+        // Sort for locality by vk_bytes (descending): reduces cache thrash in dalek
+        {
+            let mut indices: Vec<_> = (0..idx.len()).collect();
+            indices.sort_unstable_by(|&a, &b| {
+                items[idx[b]].vk_bytes.cmp(&items[idx[a]].vk_bytes)
+            });
+            
+            // Apply the permutation to all parallel arrays
+            let mut pos = 0;
+            while pos < indices.len() {
+                let target = indices[pos];
+                if target == pos { 
+                    pos += 1; 
+                    continue; 
+                }
+                
+                // Swap all parallel arrays
+                msgs.swap(pos, target);
+                sigs.swap(pos, target);
+                keys.swap(pos, target);
+                idx.swap(pos, target);
+                
+                // Update the permutation
+                for i in pos+1..indices.len() {
+                    if indices[i] == pos { 
+                        indices[i] = target; 
+                        break; 
+                    }
+                }
+                indices[pos] = pos;
+                
+                pos += 1;
+            }
+        }
+
+        // Fast path: whole batch passes
+        if VerifyingKey::verify_batch(&msgs[..], &sigs[..], &keys[..]).is_ok() {
+            // Mark all original items as verified, including duplicates
+            for (orig_idx, &dedup_idx_opt) in orig_to_dedup.iter().enumerate() {
+                if dedup_idx_opt.is_some() {
+                    out[orig_idx] = Ok(true);
+                }
+            }
+            return;
+        }
+
+        // Iterative bisect implementation with explicit stack to avoid recursion overhead
+        // and prefetching for better cache utilization
+        let mut stack = SmallVec::<[(usize, usize, bool); 32]>::new();
+        stack.push((0, idx.len(), false));  // (lo, hi, is_legacy_ok)
+        
+        while let Some((lo, hi, is_legacy_ok)) = stack.pop() {
+            if hi <= lo { continue; }
+            
+            // Prefetch data for the next iteration
+            if hi - lo > 1 {
+                let mid = lo + ((hi - lo) >> 1);
+                unsafe {
+                    // Prefetch verification keys, signatures, and messages for both halves
+                    prefetch_read_data(keys[lo].as_bytes().as_ptr(), 1);
+                    prefetch_read_data(sigs[lo].as_bytes().as_ptr(), 1);
+                    if let Some(msg) = msgs.get(lo) { prefetch_read_data(msg.as_ptr(), 1); }
+                    
+                    if mid < keys.len() {
+                        prefetch_read_data(keys[mid].as_bytes().as_ptr(), 1);
+                        prefetch_read_data(sigs[mid].as_bytes().as_ptr(), 1);
+                        if let Some(msg) = msgs.get(mid) { prefetch_read_data(msg.as_ptr(), 1); }
+                    }
+                }
+            }
+            
+            // Try batch verification first
+            if VerifyingKey::verify_batch(&msgs[lo..hi], &sigs[lo..hi], &keys[lo..hi]).is_ok() {
+                // Mark all items in this range as verified
+                for i in lo..hi {
+                    for (orig_idx, &dedup_idx_opt) in orig_to_dedup.iter().enumerate() {
+                        if let Some(dedup_idx) = dedup_idx_opt {
+                            if dedup_idx == i {
+                                out[orig_idx] = Ok(true);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            // If down to one item, verify it individually
+            if hi - lo == 1 {
+                let verify_result = if is_legacy_ok {
+                    // Try strict verification first, fall back to non-strict
+                    keys[lo].verify_strict(msgs[lo], &sigs[lo])
+                        .or_else(|_| keys[lo].verify(msgs[lo], &sigs[lo]))
+                } else {
+                    // Strict verification only
+                    keys[lo].verify_strict(msgs[lo], &sigs[lo])
+                };
+                
+                if verify_result.is_ok() {
+                    // Mark all original items that map to this deduplicated entry
+                    for (orig_idx, &dedup_idx_opt) in orig_to_dedup.iter().enumerate() {
+                        if let Some(dedup_idx) = dedup_idx_opt {
+                            if dedup_idx == lo {
+                                out[orig_idx] = Ok(true);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            // Split the range and process both halves (right first to maintain LIFO order)
+            let mid = lo + ((hi - lo) >> 1);
+            stack.push((lo, mid, is_legacy_ok));
+            stack.push((mid, hi, is_legacy_ok));
+        }
+        
+        // If any items failed strict verification, retry with legacy support
+        if out.iter().any(|r| r.is_err()) {
+            // Reset failed items
+            for (i, res) in out.iter_mut().enumerate() {
+                if res.is_err() && orig_to_dedup[i].is_some() {
+                    *res = Err(BatchVerifierError::VerificationFailed);
+                }
+            }
+            
+            // Retry with legacy verification
+            stack.push((0, idx.len(), true));
+            while let Some((lo, hi, _)) = stack.pop() {
+                // Same logic as above but with is_legacy_ok=true
+                if hi <= lo { continue; }
+                
+                if VerifyingKey::verify_batch(&msgs[lo..hi], &sigs[lo..hi], &keys[lo..hi]).is_ok() {
+                    // Mark all items in this range as verified
+                    for i in lo..hi {
+                        for (orig_idx, &dedup_idx_opt) in orig_to_dedup.iter().enumerate() {
+                            if let Some(dedup_idx) = dedup_idx_opt {
+                                if dedup_idx == i && out[orig_idx].is_err() {
+                                    out[orig_idx] = Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                
+                if hi - lo == 1 {
+                    if keys[lo].verify(msgs[lo], &sigs[lo]).is_ok() {
+                        for (orig_idx, &dedup_idx_opt) in orig_to_dedup.iter().enumerate() {
+                            if let Some(dedup_idx) = dedup_idx_opt {
+                                if dedup_idx == lo && out[orig_idx].is_err() {
+                                    out[orig_idx] = Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                
+                let mid = lo + ((hi - lo) >> 1);
+                stack.push((lo, mid, true));
+                stack.push((mid, hi, true));
+            }
+        }
+    });
+
+    out
+}
+
+// ========================= PATCH 48: HOT maintenance for deadline aging and COLD demotion =========================
+#[cfg(all(feature = "advanced_sched", feature = "numa_hotcold"))]
+fn hot_maint_prune_stale(g: &crate::l3_hotcold::L3GroupHC) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Instant, Duration};
+    
+    // Environment variable for max age in HOT (default 50ms)
+    const MAX_HOT_AGE_MS: u64 = 50;
+    const NS_PER_MS: u64 = 1_000_000;
+    
+    // Only run on the leader to avoid contention
+    if !g.is_leader() { return; }
+    
+    // Skip if HOT is empty or we can't acquire the lock
+    let hot_load = g.hot_load.load(Relaxed);
+    if hot_load == 0 { return; }
+    
+    // Try to lock HOT (non-blocking)
+    let now = Instant::now();
+    if let Ok(mut hot) = g.hot.try_lock() {
+        let mut i = 0;
+        let mut pruned = 0;
+        let max_age = Duration::from_millis(MAX_HOT_AGE_MS);
+        
+        // Scan HOT ring in LRU order (oldest first)
+        while i < hot.len() && pruned < hot_load / 4 { // Limit to 25% per scan
+            if let Some((item, enq_time)) = hot.get_mut(i) {
+                if now.duration_since(*enq_time) > max_age {
+                    // Move to COLD if possible, else drop
+                    if let Err(old_item) = g.cold.push(item.take().unwrap()) {
+                        // COLD full, drop the item
+                        pruned += 1;
+                    }
+                    hot.remove(i);
+                    g.hot_load.fetch_sub(1, Relaxed);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        
+        // If we pruned anything, update the COLD load counter
+        if pruned > 0 {
+            g.cold_load.fetch_add(pruned as u32, Relaxed);
+        }
+    }
+}
+
+// ========================= PATCH 53C: verify_batch_dalek (REPLACE) =========================
+#[cfg(feature = "advanced_sched")]
+fn verify_batch_dalek(items: &[ShardItem]) -> Vec<Result<bool, BatchVerifierError>> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use smallvec::SmallVec;
+    use std::{cell::RefCell, collections::HashMap};
+
+    #[inline] fn pf_t0(p: *const u8) {
+        #[cfg(target_arch="x86_64")]
+        unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, 3) }
+    }
+    #[inline] fn pf_nta(p: *const u8) {
+        #[cfg(target_arch="x86_64")]
+        unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, 0) }
+    }
+
+    thread_local! {
+        static TLS: RefCell<(
+            SmallVec<[usize; 4096]>,        // idx (global)
+            SmallVec<[&'static [u8]; 4096]>,// msgs
+            SmallVec<[Signature; 4096]>,    // sigs
+            SmallVec<[VerifyingKey; 4096]>, // keys
+            SmallVec<[u64; 4096]>,          // hv (aligned with idx/msgs/sigs/keys)
+            HashMap<u64, usize>,            // hv -> unique index
+            SmallVec<[Option<usize>; 4096]>,// dup_of
+            SmallVec<[(usize,usize); 4096]> // bisect stack
+        )> = RefCell::new((
+            SmallVec::new(), SmallVec::new(), SmallVec::new(), SmallVec::new(),
+            SmallVec::new(), HashMap::new(), SmallVec::new(), SmallVec::new()
+        ));
+    }
+
+    let n = items.len();
+    if n == 0 { return Vec::new(); }
+    let now_us = crate::clock::now_us();
+    let mut out = vec![Err(BatchVerifierError::VerificationFailed); n];
+
+    TLS.with(|cell| {
+        let (ref mut idx, ref mut msgs, ref mut sigs, ref mut keys, ref mut hvs, ref mut seen, ref mut dup_of, ref mut stk) = *cell.borrow_mut();
+        idx.clear(); msgs.clear(); sigs.clear(); keys.clear(); hvs.clear(); seen.clear(); dup_of.clear(); stk.clear();
+        idx.reserve_exact(n); msgs.reserve_exact(n); sigs.reserve_exact(n); keys.reserve_exact(n); hvs.reserve_exact(n);
+        dup_of.resize(n, None);
+
+        // Stage uniques w/ cross-batch cache short-circuit + strong dedup
+        for i in 0..n {
+            let it = &items[i];
+            if it.msg.is_empty() { continue; }
+
+            if i + 8 < n {
+                let nxt = &items[i + 8];
+                pf_t0(nxt.msg.as_ptr());
+                pf_nta(nxt.sig.as_ref().as_ptr());
+                pf_nta(nxt.vk.as_bytes().as_ptr());
+            }
+
+            // hv over vk||sig||msg (seeded)
+            let mut seed = xxhash_rust::xxh3::xxh3_64(&it.vk_bytes);
+            let sig_bytes = it.sig.to_bytes();
+            seed = xxhash_rust::xxh3::xxh3_64_with_seed(&sig_bytes, seed);
+            let hv = xxhash_rust::xxh3::xxh3_64_with_seed(it.msg.as_ref(), seed);
+
+            // Cross-batch cache hit → immediate verdict (no work)
+            if let Some(ok) = crate::triple_cache::get(now_us, hv) {
+                out[i] = if ok { Ok(true) } else { Err(BatchVerifierError::VerificationFailed) };
+                continue;
+            }
+
+            // Intra-batch dedup
+            if let Some(&j) = seen.get(&hv) {
+                let same =
+                    items[j].vk_bytes == it.vk_bytes &&
+                    items[j].sig.to_bytes() == sig_bytes &&
+                    items[j].msg.as_ref() == it.msg.as_ref();
+                if same { dup_of[i] = Some(j); continue; }
+            }
+
+            idx.push(i);
+            msgs.push(unsafe { core::slice::from_raw_parts(it.msg.as_ptr(), it.msg.len()) });
+            sigs.push(it.sig.clone());
+            keys.push(it.vk.clone());
+            hvs.push(hv);
+            seen.insert(hv, idx.len() - 1);
+        }
+
+        if idx.is_empty() { return; }
+
+        // Locality order by vk_bytes desc; apply in-place to side arrays (incl. hvs)
+        idx.sort_unstable_by(|&a, &b| items[b].vk_bytes.cmp(&items[a].vk_bytes));
+        let mut p = 0usize;
+        while p < idx.len() {
+            let want = idx[p];
+            if want == p { p += 1; continue; }
+            msgs.swap(p, want); sigs.swap(p, want); keys.swap(p, want); hvs.swap(p, want);
+            idx.swap(p, want);
+        }
+
+        // Chunked unique verify (caps tail)
+        let chunk = std::env::var("QAB_DALEK_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(2048).max(64);
+        let mut start = 0usize;
+        while start < idx.len() {
+            let chunk = crate::dalek_chunk_ctl::cur_chunk();
+            let end = core::cmp::min(start + chunk, idx.len());
+            let mut did_bisect = false;
+
+            if VerifyingKey::verify_batch(&msgs[start..end], &sigs[start..end], &keys[start..end]).is_ok() {
+                for k in start..end {
+                    out[idx[k]] = Ok(true);
+                    crate::triple_cache::put(now_us, hvs[k], true);
+                }
+            } else {
+                // Iterative bisect (no recursion)
+                did_bisect = true;
+                stk.clear();
+                stk.push((start, end));
+                while let Some((lo, hi)) = stk.pop() {
+                    if hi <= lo { continue; }
+                    if (hi - lo) == 1 {
+                        let strict_only = matches!(std::env::var("QAB_ED25519_STRICT_ONLY").as_deref(), Ok("1"));
+                        let ok = if strict_only {
+                            keys[lo].verify_strict(msgs[lo], &sigs[lo]).is_ok()
+                        } else {
+                            keys[lo].verify_strict(msgs[lo], &sigs[lo]).is_ok()
+                            || keys[lo].verify(msgs[lo], &sigs[lo]).is_ok()
+                        };
+                        out[idx[lo]] = if ok { Ok(true) } else { Err(BatchVerifierError::VerificationFailed) };
+                        crate::triple_cache::put(now_us, hvs[lo], ok);
+                        continue;
+                    }
+                    if VerifyingKey::verify_batch(&msgs[lo..hi], &sigs[lo..hi], &keys[lo..hi]).is_ok() {
+                        for k in lo..hi {
+                            out[idx[k]] = Ok(true);
+                            crate::triple_cache::put(now_us, hvs[k], true);
+                        }
+                        continue;
+                    }
+                    let mid = lo + ((hi - lo) >> 1);
+                    stk.push((mid, hi));
+                    stk.push((lo,  mid));
+                }
+            }
+
+            crate::dalek_chunk_ctl::report(did_bisect);
+            start = end;
+        }
+
+        // Propagate verdicts to duplicates
+        for i in 0..n {
+            if let Some(juniq) = dup_of[i] {
+                let orig_global = idx[juniq];
+                out[i] = out[orig_global].clone();
+            }
+        }
+    });
+
+    out
+}
+
+// ========================= VK Cache GC =========================
+#[cfg(feature = "advanced_sched")]
+const VK_CACHE_MAX: usize = {
+    match option_env!("QAB_VK_CACHE_MAX") {
+        Some(s) => match s.parse::<usize>() { 
+            Ok(v) if v >= 1024 => v, 
+            _ => 262_144 
+        },
+        None => 262_144
+    }
+};
+
+#[cfg(feature = "advanced_sched")]
+#[inline]
+fn vk_cache_gc_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use rand::Rng as _;
+    
+    static TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    
+    // Only run GC every ~16k batches to reduce overhead
+    if TICK.fetch_add(1, Relaxed) & 0x3FFF != 0 { 
+        return; 
+    }
+    
+    // Check if we're over the cache limit
+    let len = VK_CACHE.read().len();
+    if len <= VK_CACHE_MAX { 
+        return; 
+    }
+    
+    // Perform random eviction if cache is too large
+    let mut w = VK_CACHE.write();
+    let mut cnt = len.saturating_sub(VK_CACHE_MAX);
+    let mut rng = rand::rngs::SmallRng::from_entropy();
+    
+    while cnt > 0 && !w.is_empty() {
+        // Sample and remove a random key
+        if let Some(k) = w.keys().next().cloned() {
+            let _ = w.remove(&k);
+            cnt -= 1;
+            
+            // Randomly skip a few to avoid hot-looping on the same buckets
+            let skip = rng.gen_range(1..=7);
+            for _ in 0..skip {
+                if let Some(k2) = w.keys().next().cloned() {
+                    let _ = w.remove(&k2);
+                    if cnt == 0 { break; }
+                    cnt -= 1;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
     }
 }
 
@@ -2248,26 +4482,6 @@ impl BatchVerifier {
                             stats.avg_batch_time_us.store(new_avg, Ordering::Relaxed);
                             histogram!("verifier.batch_time_us", batch_time as f64);
                             histogram!("verifier.batch_size", items.len() as f64);
-                            
-                            // echo original indices back
-                            let indexed_results: Vec<_> = batch
-                                .iter()
-                                .map(|(orig_idx, _)| *orig_idx)
-                                .zip(results.into_iter())
-                                .collect();
-                            
-                            let _ = result_sender.send(indexed_results);
-                        }
-                        Err(_) => {
-                            if shutdown.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-            
-            worker_handles.push(handle);
         }
         
         Self {
