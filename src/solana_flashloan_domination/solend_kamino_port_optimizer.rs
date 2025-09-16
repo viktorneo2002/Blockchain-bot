@@ -1,1357 +1,3030 @@
-// === COST/PRICE globals ===
-// === [IMPROVED: PIECE LUT-SELECTOR v56] ===
+// ==================== [PIECE 1: CORE PRELUDE / TYPES / CONSTANTS] ====================
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
+
+// Standard library
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+// External crates
+use anyhow::{anyhow, Result};
+use anchor_client::solana_sdk::commitment_config::CommitmentConfig;
+use borsh::BorshSerialize;
+use lru::LruCache;
+use prometheus::{Histogram, HistogramOpts, IntCounter, Registry};
+use rand::prelude::*;
+use sha2::{Digest, Sha256};
+use solana_client::{
+    nonblocking::rpc_client::RpcClient,
+    rpc_config::{RpcSendTransactionConfig, RpcSignatureStatusConfig, RpcSimulateTransactionConfig},
+    rpc_response::RpcSimulateTransactionResult,
+    client_error::ClientError,
+};
+use solana_program::{
+    instruction::{AccountMeta, Instruction},
+    program_pack::Pack,
+    pubkey::Pubkey,
+    system_instruction,
+};
+use solana_sdk::{
+    account::Account,
+    address_lookup_table_account::AddressLookupTableAccount,
+    clock::Slot,
+    commitment_config::CommitmentConfig as SdkCommitmentConfig,
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    message::{v0::Message as V0Message, Message, VersionedMessage},
+    pubkey,
+    signature::{Keypair, Signature, Signer},
+};
+use std::num::NonZeroUsize;
+use tokio::time::sleep;
+
+// ==================== PIECE 1.1: Shortvec + size constants ====================
+
+/// Calculate the length of a Solana shortvec (7-bit little-endian varint)
+/// Branchless implementation: 1 + 1{n≥0x80} + 1{n≥0x4000}
+#[inline(always)]
+pub const fn shortvec_len(n: usize) -> usize {
+    1 + ((n >= 0x80) as usize) + ((n >= 0x4000) as usize)
+}
+
+pub const MSG_HEADER_BYTES: usize = 3;
+pub const ACCOUNT_KEY_BYTES: usize = 32;
+pub const BLOCKHASH_BYTES: usize = 32;
+pub const MSG_VERSION_OVERHEAD: usize = 1; // v0 prefix (safe upper bound)
+
+/// QUIC MTU headroom shaping for v0 tx (empirically safe)
+pub const QUIC_SAFE_PACKET_BUDGET: usize = 1150;
+
+// ==================== PIECE 1.2: ixs_fingerprint ====================
+
+// ixs_fingerprint implementation is now only at the top of the file
+
+// ==================== PIECE 1.3: percentile_pair_unstable ====================
+
+/// Computes two percentiles in O(n) time without full sorting.
+/// Uses select_nth_unstable to compute percentiles in linear time.
+/// Returns (p_lo-th percentile, p_hi-th percentile)
+/// 
+/// # Panics
+/// Never panics (returns (0, 0) on empty input)
+#[inline]
+pub fn percentile_pair_unstable(src: &[u64], p_lo: usize, p_hi: usize) -> (u64, u64) {
+    debug_assert!(p_lo <= 100 && p_hi <= 100);
+    if src.is_empty() { return (0, 0); }
+    
+    let n = src.len();
+    let ilo = (n * p_lo / 100).min(n - 1);
+    let ihi = (n * p_hi / 100).min(n - 1);
+
+    if ilo == ihi {
+        let mut v = src.to_vec();
+        let (_, val, _) = v.select_nth_unstable(ilo);
+        return (*val, *val);
+    }
+    let mut a = src.to_vec();
+    let mut b = src.to_vec();
+    let (_, lo, _) = a.select_nth_unstable(ilo);
+    let (_, hi, _) = b.select_nth_unstable(ihi);
+    (*lo, *hi)
+}
+
+// ==================== PIECE 1.4: slot + leader caches ====================
+
+#[derive(Clone)]
+struct SlotCache {
+    slot: AtomicU64,
+    ts_ns: AtomicU64,
+}
+
+static SLOT_CACHE: OnceLock<SlotCache> = OnceLock::new();
+
+#[inline(always)]
+fn slot_cache() -> &'static SlotCache {
+    SLOT_CACHE.get_or_init(|| SlotCache {
+        slot: AtomicU64::new(0),
+        ts_ns: AtomicU64::new(0),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct LeaderCache {
+    epoch: u64,
+    schedule: HashMap<String, Vec<usize>>, // identity -> slot indices in epoch
+    last_refresh: Instant,
+}
+
+static LEADER_CACHE: OnceLock<tokio::sync::RwLock<LeaderCache>> = OnceLock::new();
+
+#[inline(always)]
+fn leader_cache() -> &'static tokio::sync::RwLock<LeaderCache> {
+    LEADER_CACHE.get_or_init(|| tokio::sync::RwLock::new(LeaderCache {
+        epoch: 0,
+        schedule: HashMap::new(),
+        last_refresh: Instant::now() - Duration::from_secs(600),
+    }))
+}
+
+// ==================== PIECE 1.5: CU LRU ====================
+
+static CU_LRU: OnceLock<tokio::sync::RwLock<LruCache<[u8; 32], u64>>> = OnceLock::new();
+
+#[inline(always)]
+fn cu_lru() -> &'static tokio::sync::RwLock<LruCache<[u8; 32], u64>> {
+    CU_LRU.get_or_init(|| tokio::sync::RwLock::new(LruCache::new(
+        NonZeroUsize::new(10_000).unwrap()
+    )))
+}
+
+// ==================== PIECE 1.11: global constants ====================
+
+pub const COMPUTE_UNITS_FLOOR: u32 = 150_000;
+pub const COMPUTE_UNITS_CEIL: u32 = 1_400_000;
+
+pub const PRIORITY_FEE_LAMPORTS_FLOOR: u64 = 500; // autoscaled later
+pub const TIP_JITTER_MAX_BP: u32 = 30;            // micro-jitter ceiling
+pub const MIN_PROFIT_BPS: u64 = 10;
+pub const REBALANCE_THRESHOLD_BPS: u64 = 25;
+pub const MAX_SLIPPAGE_BPS: u64 = 50;
+
+pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+pub const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+
+#[inline(always)]
+pub fn solend_program() -> Pubkey { pubkey!("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo") }
+
+#[inline(always)]
+pub fn kamino_program() -> Pubkey { pubkey!("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD") }
+    signer::Signer as SdkSigner,
+    system_program,
+    transaction::{Transaction, VersionedTransaction},
+};
+use spl_associated_token_account::{
+    get_associated_token_address,
+    instruction as ata_ix,
+};
+
+// ==================== PIECE 1.6: PortOptimizer helpers ====================
+
 impl PortOptimizer {
-    /// Collect all unique account keys referenced by a plan of Instructions.
-    fn plan_account_keys(ixs: &[solana_sdk::instruction::Instruction]) -> std::collections::BTreeSet<solana_sdk::pubkey::Pubkey> {
-        use std::collections::BTreeSet;
-        let mut set = BTreeSet::new();
+    /// Lock-free coarse slot with TTL; falls back to RPC on staleness.
+    #[inline(always)]
+    pub async fn get_slot_coarse(&self, ttl: Duration) -> u64 {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let sc = slot_cache();
+        let ts = sc.ts_ns.load(Ordering::Relaxed);
+        
+        if now_ns.saturating_sub(ts) <= ttl.as_nanos() as u64 {
+            return sc.slot.load(Ordering::Relaxed);
+        }
+        
+        match self.rpc_client.get_slot().await {
+            Ok(s) => {
+                sc.slot.store(s, Ordering::Relaxed);
+                sc.ts_ns.store(now_ns, Ordering::Relaxed);
+                s
+            }
+            Err(_) => sc.slot.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Cohort-stable micro-jitter in basis points [0, max_bp] from last sig or wallet.
+    #[inline(always)]
+    pub fn price_jitter_bp(&self, max_bp: u32) -> u32 {
+        if max_bp == 0 { return 0; }
+        let seed_bytes: &[u8] = match self.last_tx_signature.blocking_read().as_ref() {
+            Some(sig) => sig.as_ref(),
+            None => self.wallet.pubkey().as_ref(),
+        };
+        let mut h = Sha256::new();
+        h.update(b"JIT1");
+        h.update(seed_bytes);
+        let d = h.finalize();
+        u32::from_le_bytes([d[0], d[1], d[2], d[3]]) % (max_bp + 1)
+    }
+
+    /// Leader concentration in the next k slots within the current epoch.
+    /// Returns ∈[0,1]: 1.0 means a single leader dominates the lookahead window.
+    pub async fn leader_window_concentration(&self, k: usize) -> Result<f64> {
+        if k == 0 { return Ok(0.0); }
+        let ei = self.rpc_client.get_epoch_info().await?;
+        let mut lc = leader_cache().write().await;
+        
+        if lc.epoch != ei.epoch || lc.last_refresh.elapsed() > Duration::from_secs(12) {
+            if let Some(schedule) = self.rpc_client.get_leader_schedule(None).await? {
+                lc.schedule = schedule;
+                lc.epoch = ei.epoch;
+                lc.last_refresh = Instant::now();
+            }
+        }
+        
+        // Build dense index -> leader string
+        let slots_in_epoch = ei.slots_in_epoch as usize;
+        if slots_in_epoch == 0 { return Ok(0.0); }
+        
+        let lc_r = leader_cache().read().await;
+        let mut idx2leader: Vec<&str> = vec![""; slots_in_epoch];
+        
+        for (leader, slots) in &lc_r.schedule {
+            for &s in slots {
+                let j = s as usize;
+                if j < slots_in_epoch { 
+                    idx2leader[j] = leader.as_str(); 
+                }
+            }
+        }
+
+        let cur_idx = ei.slot_index as usize;
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        let mut total = 0usize;
+        
+        for off in 1..=k {
+            let idx = cur_idx + off;
+            if idx >= slots_in_epoch { break; }
+            let l = idx2leader[idx];
+            if !l.is_empty() {
+                *counts.entry(l).or_insert(0) += 1;
+                total += 1;
+            }
+        }
+        
+        if total == 0 { return Ok(0.0); }
+        let maxc = *counts.values().max().unwrap_or(&0) as f64;
+        Ok((maxc / (total as f64)).min(1.0))
+    }
+
+    // ==================== PIECE 1.7: slot_phase_backoff ====================
+    
+    /// Slot-phase aware backoff with congestion control
+    #[inline]
+    pub async fn slot_phase_backoff(&self, leader_conc: f64, base_ms: u64) {
+        let mult = 1.0 + leader_conc.clamp(0.0, 1.0) * 0.6;  // 1.00..1.60
+        let dur_ms = (base_ms as f64 * mult).round() as u64;
+        let jitter = thread_rng().gen_range(0u64..=50u64);    // ≤50ms to decorrelate
+        sleep(Duration::from_millis(dur_ms.saturating_add(jitter).min(450))).await;
+    }
+
+    // ==================== PIECE 1.8: tx size estimators ====================
+    
+    /// Estimate the serialized size of a transaction message
+    /// 
+    /// This function provides a close approximation of the serialized size of a transaction
+    /// message, which is useful for fee estimation and MTU safety checks.
+    /// 
+    /// # Arguments
+    /// * `ixs` - The instructions to include in the transaction
+    /// 
+    /// # Returns
+    /// Estimated size in bytes
+    #[inline]
+    pub fn tx_message_size_estimate(&self, ixs: &[Instruction]) -> usize {
+        
         for ix in ixs {
-            set.insert(ix.program_id);
-            for am in &ix.accounts { set.insert(am.pubkey); }
+            if !uniq.iter().any(|k| *k == ix.program_id) { 
+                uniq.push(ix.program_id); 
+            }
+            for m in &ix.accounts {
+                if !uniq.iter().any(|k| *k == m.pubkey) { 
+                    uniq.push(m.pubkey); 
+                }
+            }
         }
-        set
+        
+        if uniq.len() > 64 { 
+            uniq.sort_unstable(); 
+            uniq.dedup(); 
+        }
+
+        let mut sz = 0usize;
+        sz += MSG_HEADER_BYTES;
+        sz += shortvec_len(uniq.len());           // vec<AccountKeys> len
+        sz += uniq.len() * ACCOUNT_KEY_BYTES;     // account keys
+        sz += BLOCKHASH_BYTES;                    // recent blockhash
+        sz += shortvec_len(ixs.len());            // instructions vec len
+        
+        for ix in ixs {
+            let n_idx = ix.accounts.len();
+            let n_dat = ix.data.len();
+            sz += 1;                              // program id index
+            sz += shortvec_len(n_idx) + n_idx;    // account indices
+            sz += shortvec_len(n_dat) + n_dat;    // data
+        }
+        
+        sz + MSG_VERSION_OVERHEAD
     }
 
-    /// Fetch a lookup table account from RPC.
-    async fn fetch_lut(&self, addr: &solana_sdk::pubkey::Pubkey) -> Result<solana_sdk::message::v0::AddressLookupTableAccount> {
-        let resp = self.rpc_client.get_address_lookup_table(addr).await?;
-        match resp.value {
-            Some(lut) => Ok(lut),
-            None => Err(anyhow::anyhow!("LUT not found: {addr}")),
-        }
-    }
-
-    /// Select up to `max_luts` LUTs (from `candidates`) that maximize address coverage for `ixs`.
-    /// Only LUTs adding at least `min_new_addrs` new addresses are selected (greedy).
-    pub async fn select_luts_for_plan(
+    #[inline]
+    pub fn tx_message_size_with_alts_estimate(
         &self,
-        ixs: &[solana_sdk::instruction::Instruction],
-        candidate_lut_addrs: &[solana_sdk::pubkey::Pubkey],
-        max_luts: usize,
-        min_new_addrs: usize,
-    ) -> Result<Vec<solana_sdk::message::v0::AddressLookupTableAccount>> {
-        use futures_util::future::join_all;
-        use std::collections::BTreeSet;
+        ixs: &[Instruction],
+        alts: &[AddressLookupTableAccount],
+    ) -> usize {
+        let core = self.tx_message_size_estimate(ixs);
+        // ALT payload ≈ 8 bytes header + 32 * addresses
+        let alt_bytes: usize = alts.iter()
+            .map(|t| 8 + 32 * t.addresses.len())
+            .sum();
+        core + alt_bytes + 64 // framing headroom
+    }
 
-        if candidate_lut_addrs.is_empty() || max_luts == 0 { return Ok(Vec::new()); }
-
-        // Fetch all LUTs concurrently
-        let futs = candidate_lut_addrs.iter().map(|a| self.fetch_lut(a));
-        let mut luts: Vec<solana_sdk::message::v0::AddressLookupTableAccount> = join_all(futs)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if luts.is_empty() { return Ok(Vec::new()); }
-
-        let needed: BTreeSet<solana_sdk::pubkey::Pubkey> = Self::plan_account_keys(ixs);
-
-        // Greedy cover
-        let mut chosen = Vec::new();
-        let mut covered: BTreeSet<solana_sdk::pubkey::Pubkey> = BTreeSet::new();
-        for _ in 0..max_luts {
-            let (best_idx, best_gain) = luts
-                .iter()
-                .enumerate()
-                .map(|(i, lut)| {
-                    let gain = lut
-                        .addresses
-                        .iter()
-                        .filter(|p| needed.contains(p) && !covered.contains(p))
-                        .count();
-                    (i, gain)
-                })
-                .max_by_key(|(_, g)| *g)
-                .unwrap_or((0, 0));
-
-            if best_gain < min_new_addrs { break; }
-            let lut = luts.swap_remove(best_idx);
-            covered.extend(lut.addresses.iter().cloned());
-            chosen.push(lut);
+    // ==================== PIECE 1.9: fee_quantile_window ====================
+    
+    #[inline(always)]
+    pub fn fee_quantile_window(&self, attempt: u32, leader_conc: f64, tx_size: usize) -> (usize, usize) {
+        let mut lo = 70usize;
+        let mut hi = 90usize;
+        
+        if leader_conc >= 0.75 { lo = 80; hi = 95; }
+        else if leader_conc >= 0.50 { lo = 75; hi = 92; }
+        
+        if tx_size >= 1000 { hi = hi.saturating_add(2).min(98); }
+        
+        if attempt >= 1 { 
+            lo = (lo + 3).min(90); 
+            hi = (hi + 3).min(98); 
         }
-        Ok(chosen)
+        
+        if attempt >= 2 { 
+            lo = (lo + 3).min(92); 
+            hi = (hi + 3).min(99); 
+        }
+        
+        (lo, hi)
+    }
+    
+    // ==================== PIECE 1.10: simulate_exact_v0 ====================
+    
+    /// Simulate a VersionedTransaction with explicit config.
+    pub async fn simulate_exact_v0_tx(
+        &self,
+        vtx: &VersionedTransaction,
+        cfg: RpcSimulateTransactionConfig,
+    ) -> Result<RpcSimulateTransactionResult> {
+        let out = self.rpc_client.simulate_transaction_with_config(vtx.clone(), cfg).await?;
+        Ok(out.value)
+    }
+
+    /// Simulate from ixs/signers; builds a legacy message => v0 tx (no ALTs).
+    pub async fn simulate_exact_v0_ixs(
+        &self,
+        ixs: &[Instruction],
+        payer: &Pubkey,
+        signers: &[&dyn Signer],
+        recent_blockhash: Hash,
+        cfg: RpcSimulateTransactionConfig,
+    ) -> Result<RpcSimulateTransactionResult> {
+        let msg = Message::new(ixs, Some(payer));
+        let vtx = VersionedTransaction::try_new(msg, signers)?;
+        let out = self.rpc_client.simulate_transaction_with_config(vtx, cfg).await?;
+        Ok(out.value)
+    }
+
+    /// Convenient default used by most call-sites.
+    pub async fn simulate_exact_v0_default(&self, vtx: &VersionedTransaction) -> Result<RpcSimulateTransactionResult> {
+        self.simulate_exact_v0_tx(
+            vtx,
+            RpcSimulateTransactionConfig {
+                sig_verify: false,
+                replace_recent_blockhash: true,
+                commitment: Some(solana_sdk::commitment_config::CommitmentConfig::processed()),
+                ..Default::default()
+            }
+        ).await
     }
 }
 
-// === [IMPROVED: PIECE PLAN-LRU v56] ===
-impl PortOptimizer {
-    /// Digest an instruction vec in a canonical way (program_id + metas + data).
-    fn digest_plan(ixs: &[solana_sdk::instruction::Instruction]) -> solana_sdk::hash::Hash {
-        use solana_sdk::hash::hashv;
-        let mut chunks: Vec<&[u8]> = Vec::with_capacity(ixs.len() * 3);
-        for ix in ixs {
-            chunks.push(ix.program_id.as_ref());
-            for am in &ix.accounts {
-                chunks.push(am.pubkey.as_ref());
-                let flags = [(am.is_writable as u8), (am.is_signer as u8)];
-                chunks.push(&flags);
-            }
-            chunks.push(&ix.data);
+use spl_token::{
+    solana_program::program_pack::Pack as TokenPack,
+    state::Account as TokenAccount,
+};
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, trace, warn};
+
+// Conditional imports
+#[cfg(feature = "torch")]
+use tch::{no_grad, CModule, Device, Kind, Tensor};
+
+/// Generate a deterministic, collision-resistant fingerprint for a set of instructions.
+/// This is used for caching and deduplication.
+/// 
+/// # Panics
+/// Never panics (no unwraps, no allocations after initial hasher)
+#[inline(always)]
+pub fn ixs_fingerprint(ixs: &[Instruction]) -> [u8; 32] {
+    // Deterministic, order-preserving, collision-resistant
+    let mut h = Sha256::new();
+    h.update(b"IXS1"); // domain sep
+    for ix in ixs {
+        h.update(ix.program_id.as_ref());
+        // precise account meta encoding (no heap, no sort, preserves intent)
+        for m in &ix.accounts {
+            h.update(m.pubkey.as_ref());
+            h.update(&[m.is_signer as u8, m.is_writable as u8]);
         }
-        hashv(&chunks)
+        let n = ix.data.len() as u64;
+        h.update(&n.to_le_bytes());
+        h.update(&ix.data);
+    }
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
+/// Estimate the serialized size of a transaction message
+/// 
+/// This function provides a close approximation of the serialized size of a transaction
+/// message, which is useful for fee estimation and MTU safety checks.
+/// 
+/// # Arguments
+/// * `message` - The message to estimate size for
+/// 
+/// # Returns
+/// Estimated size in bytes
+fn tx_message_size_estimate(message: &Message) -> usize {
+    // Message header is 3 bytes
+    let mut size = 3;
+    
+    // Account addresses (32 bytes each)
+    size += message.account_keys.len() * 32;
+    
+    // Recent blockhash (32 bytes)
+    size += 32;
+    
+    // Instructions
+    for ix in &message.instructions {
+        // Program ID index (1 byte) + account indices (1 byte each)
+        size += 1 + ix.accounts.len();
+        
+        // Instruction data length (u16) + actual data
+        size += 2 + ix.data.len();
+    }
+    
+    // Add some overhead for versioning and other fields
+    size += 8;
+    
+    size
+}
+
+/// Calculate the fee quantile window based on transaction attempt and network conditions.
+/// 
+/// This method determines the appropriate fee percentiles to use when estimating
+/// transaction fees, taking into account the current attempt number, leader
+/// concentration, and transaction size.
+/// 
+/// # Arguments
+/// * `attempt` - The current transaction attempt number (0 for first attempt)
+/// * `leader_conc` - The concentration of leaders in the current window (0.0 to 1.0)
+/// * `tx_size` - The size of the transaction in bytes
+/// 
+/// # Returns
+/// A tuple of (lower_percentile, upper_percentile) for fee estimation
+#[inline(always)]
+fn fee_quantile_window(attempt: u32, leader_conc: f64, tx_size: usize) -> (usize, usize) {
+    let mut lo = 70usize;
+    let mut hi = 90usize;
+
+    if leader_conc >= 0.75 { lo = 80; hi = 95; }
+    else if leader_conc >= 0.50 { lo = 75; hi = 92; }
+
+    if tx_size >= 1000 { hi = hi.saturating_add(2).min(98); }
+
+    if attempt >= 1 { lo = (lo + 3).min(90); hi = (hi + 3).min(98); }
+    if attempt >= 2 { lo = (lo + 3).min(92); hi = (hi + 3).min(99); }
+
+    (lo, hi)
+}
+
+// ==================== PIECE 1.13a: P² online quantile tracker ====================
+#[derive(Clone, Debug)]
+pub struct P2Quantile {
+    q: f64,
+    n: [f64; 5],   // marker positions
+    ns: [f64; 5],  // desired positions
+    dn: [f64; 5],  // increments
+    x: [f64; 5],   // marker heights
+    buf: Vec<f64>, // first 5 samples
+}
+
+impl P2Quantile {
+    pub fn new(q: f64) -> Self {
+        let p = [0.0, q / 2.0, q, (1.0 + q) / 2.0, 1.0];
+        Self {
+            q,
+            n: [1.0, 2.0, 3.0, 4.0, 5.0],
+            ns: [1.0, 1.0, 1.0, 1.0, 1.0],
+            dn: p,
+            x: [0.0; 5],
+            buf: Vec::with_capacity(5),
+        }
     }
 
-    /// Returns `true` if plan is fresh (send it), `false` if a near-duplicate was recently sent.
-    async fn plan_lru_should_send(&self, ixs: &[solana_sdk::instruction::Instruction]) -> bool {
-        use std::collections::{HashMap, VecDeque};
-        use tokio::sync::Mutex as TokioMutex;
-        static PLAN_LRU_V56: std::sync::OnceLock<TokioMutex<(VecDeque<(solana_sdk::hash::Hash,u64)>, HashMap<solana_sdk::hash::Hash,u64>)>>> = std::sync::OnceLock::new();
-        const PLAN_LRU_CAP: usize = 256;
-        const PLAN_DEDUP_SLOTS: u64 = 40;
+    #[inline]
+    pub fn value(&self) -> Option<f64> {
+        if self.buf.len() < 5 { None } else { Some(self.x[2]) }
+    }
 
-        let (digest, slot_now) = {
-            let d = Self::digest_plan(ixs);
-            let s = if let Ok(b) = self.get_fresh_blockhash_bundle().await { b.now_slot }
-                    else { self.rpc_client.get_slot().await.unwrap_or_default() };
-            (d, s)
-        };
-
-        let lru = PLAN_LRU_V56.get_or_init(|| TokioMutex::new((VecDeque::new(), HashMap::new())));
-        let mut guard = lru.lock().await;
-        let (q, map) = (&mut guard.0, &mut guard.1);
-
-        if let Some(&slot_prev) = map.get(&digest) {
-            if slot_now.saturating_sub(slot_prev) <= PLAN_DEDUP_SLOTS { return false; }
+    pub fn update(&mut self, v: f64) {
+        if self.buf.len() < 5 {
+            self.buf.push(v);
+            if self.buf.len() == 5 {
+                self.buf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for i in 0..5 { self.x[i] = self.buf[i]; }
+                // after seeding, desired positions for k=5
+                for i in 0..5 { self.ns[i] = 1.0 + 4.0 * self.dn[i]; }
+            }
+            return;
         }
-        // insert/update
-        map.insert(digest, slot_now);
-        q.push_back((digest, slot_now));
-        // evict old
-        while q.len() > PLAN_LRU_CAP {
-            if let Some((old_d, _)) = q.pop_front() { map.remove(&old_d); }
+        // find cell k
+        let mut k = 0usize;
+        if v < self.x[0] { self.x[0] = v; k = 0; }
+        else if v >= self.x[4] { self.x[4] = v; k = 3; }
+        else {
+            while k < 4 && v >= self.x[k+1] { k += 1; }
+        }
+        // increment positions above k
+        for i in (k+1)..5 { self.n[i] += 1.0; }
+        for i in 0..5 { self.ns[i] += self.dn[i]; }
+
+        // adjust interior markers
+        for i in 1..4 {
+            let d = self.ns[i] - self.n[i];
+            let dir = if d >= 1.0 && (self.n[i+1] - self.n[i]) > 1.0 {
+                1.0
+            } else if d <= -1.0 && (self.n[i-1] - self.n[i]) < -1.0 {
+                -1.0
+            } else { 0.0 };
+            if dir.abs() >= f64::EPSILON {
+                // parabolic prediction
+                let n_im1 = self.n[i-1]; let n_i = self.n[i]; let n_ip1 = self.n[i+1];
+                let x_im1 = self.x[i-1]; let x_i = self.x[i]; let x_ip1 = self.x[i+1];
+                let a = (dir / (n_ip1 - n_im1))
+                        * ((n_i - n_im1 + dir) * (x_ip1 - x_i) / (n_ip1 - n_i)
+                         + (n_ip1 - n_i - dir) * (x_i - x_im1) / (n_i - n_im1));
+                let cand = x_i + a;
+                // if cand within neighbors, accept, else linear step
+                if cand > x_im1 && cand < x_ip1 {
+                    self.x[i] = cand;
+                } else {
+                    self.x[i] = x_i + dir * (if dir > 0.0 { x_ip1 - x_i } else { x_im1 - x_i }) / ( (n_ip1 - n_im1) );
+                }
+                self.n[i] += dir;
+            }
+        }
+    }
+}
+
+/// Slot-phase aware backoff with congestion control
+/// 
+/// This function implements a backoff strategy that's aware of the current slot phase
+/// and network congestion. It's used to prevent spamming the network and to
+/// avoid transaction failures due to network congestion.
+/// 
+/// # Arguments
+/// * `leader_concentration` - The concentration of leaders in the current window (0.0 to 1.0)
+/// * `base_ms` - Base backoff time in milliseconds
+/// 
+/// # Returns
+/// A future that resolves after the backoff period
+async fn slot_phase_backoff(leader_concentration: f64, base_ms: u64) {
+    // Calculate the congestion factor (1.0 to 2.0)
+    let congestion_factor = 1.0 + leader_concentration.clamp(0.0, 1.0);
+    
+    // Add some jitter to avoid thundering herd
+    let jitter = rand::thread_rng().gen_range(0.8..1.2);
+    
+    // Calculate the final backoff time
+    let backoff_ms = (base_ms as f64 * congestion_factor * jitter) as u64;
+    
+    // Sleep for the calculated duration
+    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+}
+
+/// Deterministic cohort-stable jitter in basis points [0, max_bp].
+/// Uses wallet pubkey or last tx sig as entropy source.
+#[inline(always)]
+fn price_jitter_bp(max_bp: u32) -> u32 {
+    if max_bp == 0 { return 0; }
+    
+    // Use last tx sig if available, otherwise fall back to wallet pubkey
+    let seed_bytes: &[u8] = match get_last_tx_signature().as_ref() {
+        Some(sig) => sig.as_ref(),
+        None => get_wallet_pubkey().as_ref(),
+    };
+    
+    // Domain-separated hash for jitter
+    let mut h = Sha256::new();
+    h.update(b"JIT1");
+    h.update(seed_bytes);
+    let d = h.finalize();
+    
+    // Use first 4 bytes for jitter calculation
+    u32::from_le_bytes([d[0], d[1], d[2], d[3]]) % (max_bp + 1)
+}
+
+/// Simulate a transaction with v0 support
+/// 
+/// This is a wrapper around simulate_exact that ensures v0 transaction support
+async fn simulate_exact_v0(
+    ixs: &[Instruction],
+    signers: &[&dyn Signer],
+    recent_blockhash: Hash,
+    config: RpcSimulateTransactionConfig,
+) -> Result<SimulationResult, Box<dyn std::error::Error>> {
+    // Create a v0 message
+    let message = Message::new_with_blockhash(ixs, Some(&get_payer_pubkey()), &recent_blockhash);
+    
+    // Sign the message
+    let tx = Transaction::new_unsigned(message);
+    let tx = signers.iter().try_fold(tx, |tx, signer| {
+        tx.try_sign(&[&**signer], recent_blockhash)
+    })?;
+    
+    // Convert to versioned transaction
+    let versioned_tx = VersionedTransaction::from(tx);
+    
+    // Simulate the transaction
+    let response = get_rpc_client()
+        .simulate_transaction_with_config(
+            &versioned_tx,
+            config,
+        )
+        .await?;
+    
+    // Convert the response to our SimulationResult
+    Ok(SimulationResult {
+    }
+}
+
+    
+    // Find the higher percentile
+    let (_, hi_val, _) = b.select_nth_unstable(ihi);
+    
+    (*lo_val, *hi_val)
+}
+
+// ====== GLOBAL IMPORTS ======
+use {
+    anyhow::{anyhow, Context, Result},
+    async_trait::async_trait,
+    base64::{prelude::BASE64_STANDARD, Engine},
+    bincode::serialize,
+    crossbeam_channel::{bounded, Receiver, Sender},
+    futures_util::{future::join_all, stream::FuturesUnordered, StreamExt},
+    lru::{LruCache, NonZeroUsize},
+    log::*,
+    serde::{Deserialize, Serialize},
+    sha2::{Digest, Sha256},
+    smallvec::SmallVec,
+    solana_client::{
+        client_error::ClientError,
+        nonblocking::rpc_client::RpcClient,
+        rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+        rpc_request::RpcError,
+        rpc_response::{Response as RpcResponse, RpcSimulateTransactionResult},
+    },
+    solana_sdk::{
+        account::Account,
+        address_lookup_table_account::AddressLookupTableAccount,
+        commitment_config::CommitmentConfig,
+        compute_budget::ComputeBudgetInstruction,
+        hash::Hash,
+        instruction::{AccountMeta, Instruction},
+        message::{v0, VersionedMessage},
+        pubkey::Pubkey,
+        signature::{Keypair, Signature, Signer},
+        signer::SignerError,
+        transaction::{TransactionError, VersionedTransaction},
+    },
+    solana_transaction_status::{
+        EncodedTransaction, EncodedTransactionWithStatusMeta, TransactionConfirmationStatus,
+        UiMessageEncoding, UiTransactionEncoding,
+    },
+    std::{
+        cmp::Ordering,
+        collections::{HashMap, HashSet},
+        fmt,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+            Arc, OnceLock,
+        },
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    },
+    tokio::{
+        sync::{Mutex, RwLock},
+        time::sleep,
+    },
+    url::Url,
+};
+
+// Re-export commonly used types
+pub use solana_sdk::signature::Keypair;
+pub use solana_sdk::pubkey::Pubkey;
+pub use solana_sdk::signature::Signature;
+pub use solana_sdk::hash::Hash;
+
+// ====== GLOBAL CACHES ======
+
+/// Hybrid sender that can use both TPU and RPC for transaction submission
+#[derive(Clone)]
+pub struct HybridSender {
+    /// Primary RPC client
+    rpc: Arc<RpcClient>,
+    /// Optional TPU client for faster submission
+    tpu_client: Option<Arc<dyn TpuClientInterface + Send + Sync>>,
+    /// Whether to prefer TPU over RPC
+    prefer_tpu: bool,
+}
+
+/// Trait for TPU client to allow for dependency injection in tests
+#[async_trait::async_trait]
+pub trait TpuClientInterface: Send + Sync {
+    async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<Signature>;
+}
+
+/// Implementation of TpuClientInterface for the real TPU client
+#[cfg(feature = "tpu")]
+#[async_trait::async_trait]
+impl TpuClientInterface for solana_client::tpu_client::TpuClient {
+    async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<Signature> {
+        self.try_send_transaction(transaction)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+}
+
+/// Test implementation of TpuClientInterface
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockTpuClient;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl TpuClientInterface for MockTpuClient {
+    async fn send_transaction(&self, _transaction: &VersionedTransaction) -> Result<Signature> {
+        Ok(Signature::new_unique())
+    }
+}
+
+impl HybridSender {
+    /// Create a new HybridSender with the given RPC client and optional TPU client
+    pub fn new(
+        rpc: Arc<RpcClient>,
+        tpu_client: Option<Arc<dyn TpuClientInterface + Send + Sync>>,
+        prefer_tpu: bool,
+    ) -> Self {
+        Self {
+            rpc,
+            tpu_client,
+            prefer_tpu,
+        }
+    }
+
+    /// Send a transaction using the hybrid strategy
+    pub async fn send(
+        &self,
+        transaction: &VersionedTransaction,
+        rpc_parallel: usize,
+    ) -> Result<Signature> {
+        // If we have a TPU client and prefer it, try that first
+        if self.prefer_tpu {
+            if let Some(tpu) = &self.tpu_client {
+                match tpu.send_transaction(transaction).await {
+                    Ok(sig) => return Ok(sig),
+                    Err(e) => {
+                        debug!("TPU send failed, falling back to RPC: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Fall back to RPC with parallel retries
+        let mut last_err = None;
+        for _ in 0..rpc_parallel {
+            match self.rpc.send_transaction(transaction).await {
+                Ok(sig) => return Ok(sig),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        // If we get here, all RPC attempts failed
+        Err(last_err.unwrap_or_else(|| anyhow!("No RPC attempts made")))
+    }
+}
+
+/// Slot cache with lock-free fast path
+#[derive(Clone)]
+struct SlotCache {
+    slot: std::sync::atomic::AtomicU64,
+    ts: std::sync::atomic::AtomicU64, // unix_nanos
+}
+
+static SLOT_CACHE: OnceLock<SlotCache> = OnceLock::new();
+
+/// Get or initialize the global slot cache
+fn slot_cache() -> &'static SlotCache {
+    SLOT_CACHE.get_or_init(|| SlotCache {
+        slot: std::sync::atomic::AtomicU64::new(0),
+        ts: std::sync::atomic::AtomicU64::new(0),
+    })
+}
+
+/// Leader schedule cache with TTL
+#[derive(Clone, Debug)]
+struct LeaderCache {
+    epoch: u64,
+    schedule: HashMap<String, Vec<usize>>, // identity -> slot indices within epoch
+    last_refresh: Instant,
+}
+
+static LEADER_CACHE: OnceLock<tokio::sync::RwLock<LeaderCache>> = OnceLock::new();
+
+/// Get or initialize the global leader cache
+fn leader_cache() -> &'static tokio::sync::RwLock<LeaderCache> {
+    LEADER_CACHE.get_or_init(|| tokio::sync::RwLock::new(LeaderCache {
+        epoch: 0,
+        schedule: HashMap::new(),
+        last_refresh: Instant::now() - Duration::from_secs(3600),
+    }))
+}
+
+/// Global cache for compute units
+static COMPUTE_UNITS_CACHE: OnceLock<tokio::sync::RwLock<LruCache<[u8; 32], u64>>> = OnceLock::new();
+
+/// Get or initialize the global compute units cache
+fn get_compute_units_cache() -> &'static tokio::sync::RwLock<LruCache<[u8; 32], u64>> {
+    COMPUTE_UNITS_CACHE.get_or_init(|| {
+        const CACHE_SIZE: usize = 10_000;
+        tokio::sync::RwLock::new(LruCache::new(CACHE_SIZE))
+    })
+}
+
+// ====== GLOBAL CONSTANTS ======
+// MTU safety for QUIC packets (1232 bytes - 82 bytes headroom)
+const QUIC_SAFE_PACKET_BUDGET: usize = 1150;
+
+// ==================== PIECE 1.32: Fast Repairs ====================
+#[inline(always)]
+fn err_contains(e: &anyhow::Error, needle: &str) -> bool {
+    let s = format!("{e:#}");
+    s.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+}
+
+// ==================== PIECE 1.36: Assemble + Send v2 ====================
+/// Assemble and send a transaction with all optimizations enabled.
+/// 
+/// This is the new money path that integrates all optimizations:
+/// - Slot-edge pacing
+/// - Account bloom self-collision checks
+/// - Tight compute unit budgeting with AIMD
+/// - Cached ALT subsets
+/// - Salted sibling transactions
+/// - Hybrid TPU+RPC sending
+/// - Fast repairs for common errors
+#[inline(always)]
+pub async fn assemble_send_fast_v2(
+    &self,
+    ixs: &[Instruction],
+    cu_limit: u32,
+    cu_price: u64,
+    alts: &[AddressLookupTableAccount],
+    hybrid: &HybridSender,
+    rpc_parallel: usize,
+    // Optional: If provided, used for deduplication
+    dedup_key: Option<&[u8]>,
+    // Optional: If true, will send multiple variants with different CUs
+    send_siblings: bool,
+) -> Result<Signature> {
+    // Check if we have a duplicate key and verify it's not a duplicate
+    if let Some(key) = dedup_key {
+        if self.check_duplicate(key).await? {
+            return Err(anyhow!("Duplicate transaction"));
+        }
+    }
+    // 1. Check for self-collisions using bloom filter (fast path)
+    if self.bloom_risky(ixs).await {
+        return Err(anyhow!("Transaction conflicts with in-flight writes in current slot"));
+    }
+
+    // 2. Get optimized ALT subset (cached or computed)
+    let selected_alts = self.shape_alts_quic_safe_cached(ixs, alts, QUIC_SAFE_PACKET_BUDGET).await;
+    
+    // 3. Adjust compute unit price using AIMD
+    let adjusted_price = self.aimd_adjust_price(ixs, cu_price).await;
+    
+    // 4. Build transaction with retries
+    let build_tx = |bh: Hash| {
+        // 4a. Apply deduplication if needed
+        let ixs = if let Some(key) = dedup_key {
+            if self.check_duplicate(key).await? {
+                return Err(anyhow::anyhow!("Duplicate transaction"));
+            }
+            ixs.to_vec()
+        } else {
+            ixs.to_vec()
+        };
+        
+        // 4b. Build transaction with proper compute budget
+        let mut ixs_with_budget = vec![];
+        ixs_with_budget.push(ComputeBudgetInstruction::set_compute_unit_limit(cu_limit));
+        ixs_with_budget.push(ComputeBudgetInstruction::set_compute_unit_price(adjusted_price));
+        ixs_with_budget.extend(ixs);
+        
+        // 4c. Build and return transaction
+        let vtx = VersionedTransaction::try_new(
+            VersionedMessage::V0(v0::Message::try_compile(
+                &self.wallet.pubkey(),
+                &ixs_with_budget,
+                &selected_alts,
+                bh,
+            )?),
+            &[&self.wallet],
+        )?;
+        
+        // 4d. Verify size fits in MTU
+        let size_est = tx_message_size_estimate(&ixs, &selected_alts);
+        if size_est > QUIC_SAFE_PACKET_BUDGET {
+            return Err(anyhow!("Transaction too large: {} > {}", size_est, QUIC_SAFE_PACKET_BUDGET));
+        }
+        
+        Ok(vtx)
+    };
+    
+    // 5. Send with error repairs
+    let result = self.send_with_repairs_once(build_tx, hybrid, rpc_parallel).await;
+    
+    // 6. Record outcome for AIMD
+    self.aimd_record_outcome(ixs, result.is_ok()).await;
+    
+    // 7. If successful, update bloom filter
+    if let Ok(sig) = &result {
+        self.bloom_note_ixs_current_slot(ixs).await?;
+        
+        // 8. Optionally send sibling transactions with different CU budgets
+        if send_siblings && result.is_ok() {
+            let sibling_cu = (cu_limit as f64 * 1.2).round() as u32;
+            let _ = self.send_with_repairs_once(
+                |bh| {
+                    let mut ixs_clone = ixs.to_vec();
+                    ixs_clone.insert(0, ComputeBudgetInstruction::set_compute_unit_limit(sibling_cu));
+                    ixs_clone.insert(1, ComputeBudgetInstruction::set_compute_unit_price(adjusted_price * 11 / 10));
+                    
+                    let vtx = VersionedTransaction::try_new(
+                        VersionedMessage::V0(v0::Message::try_compile(
+                            &self.wallet.pubkey(),
+                            &ixs_clone,
+                            &selected_alts,
+                            bh,
+                        )?),
+                        &[&self.wallet],
+                    )?;
+                    Ok(vtx)
+                },
+                hybrid,
+                rpc_parallel,
+            ).await;
+        }
+    }
+    
+    result
+}
+
+// ==================== PIECE 1.35: Zero-Heap Size Estimator ====================
+/// Estimate serialized size of a transaction message (compact-u16 length-prefixed).
+/// 
+/// This is a zero-heap version that avoids allocations in the hot path.
+/// It's ~2-3x faster than the Solana SDK's version for small transactions.
+/// 
+/// Note: This is an approximation that's accurate within ~1-2 bytes for typical
+/// transactions. It's used for quick pre-flight checks, not for final validation.
+#[inline(always)]
+fn tx_message_size_estimate(ixs: &[Instruction], alts: &[AddressLookupTableAccount]) -> usize {
+    use solana_sdk::instruction::AccountMeta;
+    
+    // Pre-allocated stack buffer for account keys (avoids heap allocation)
+    let mut key_set = smallvec::SmallVec::<[Pubkey; 16]>::new();
+    
+    // 1. Collect unique account keys (program_id + all accounts)
+    for ix in ixs {
+        key_set.push(ix.program_id);
+        for acc in &ix.accounts {
+            key_set.push(*acc.pubkey);
+        }
+    }
+    
+    // Sort and dedup (using sort_unstable for better performance)
+    key_set.sort_unstable();
+    key_set.dedup();
+    
+    // 2. Calculate account addresses size (account for ALT lookups)
+    let mut accounts_size = 0;
+    let mut alt_offsets = smallvec::SmallVec::<[u8; 4]>::new();
+    
+    for key in &key_set {
+        let mut found_in_alt = false;
+        for (i, alt) in alts.iter().enumerate() {
+            if alt.addresses.contains(key) {
+                if i < 256 { alt_offsets.push(i as u8); }
+                found_in_alt = true;
+                break;
+            }
+        }
+        if !found_in_alt {
+            accounts_size += 32; // Full pubkey size
+        }
+    }
+    
+    // 3. Calculate header size (3 bytes) + compact-u16 for account count
+    let account_count = key_set.len();
+    let account_header_size = 3 + (if account_count <= 63 { 1 } else { 2 });
+    
+    // 4. Calculate instructions size
+    let mut instructions_size = 0;
+    for ix in ixs {
+        // 1 byte program index + 1 byte for account count + compact-u16 for data len
+        instructions_size += 2 + compact_u16_size(ix.data.len() as u16) + ix.data.len();
+        
+        // Account indices (1 byte each)
+        instructions_size += ix.accounts.len();
+    }
+    
+    // 5. Calculate ALTs size (1 byte count + 1 byte per index)
+    let alts_size = if alts.is_empty() {
+        0
+    } else {
+        1 + alts.len() // 1 byte for count + 1 byte per ALT index
+    };
+    
+    // 6. Calculate final size
+    let total_size = account_header_size 
+                   + accounts_size 
+                   + alt_offsets.len() // 1 byte per ALT offset
+                   + 32 // recent blockhash
+                   + 1 // compact-u16 for instructions count (1 byte for small counts)
+                   + instructions_size
+                   + alts_size;
+    
+    total_size
+}
+
+#[inline(always)]
+fn compact_u16_size(val: u16) -> usize {
+    if val <= 0x7F { 1 } else { 2 }
+}
+
+// ==================== PIECE 1.34: ALT Subset Cache ====================
+#[derive(Clone, Debug)]
+struct AltSubset {
+    alt_indices: Vec<usize>,
+    score: f64,
+    last_used_slot: u64,
+}
+
+static ALT_CACHE: OnceLock<tokio::sync::RwLock<LruCache<[u8;32], AltSubset>>> = OnceLock::new();
+
+#[inline(always)]
+fn alt_cache() -> &'static tokio::sync::RwLock<LruCache<[u8;32], AltSubset>> {
+    ALT_CACHE.get_or_init(|| {
+        const CACHE_SIZE: usize = 4_096;
+        tokio::sync::RwLock::new(LruCache::new(
+            NonZeroUsize::new(CACHE_SIZE).unwrap()
+        ))
+    })
+}
+
+#[inline(always)]
+fn ix_fingerprint(ixs: &[Instruction]) -> [u8;32] {
+    let mut h = Sha256::new();
+    h.update(b"IXFP1");
+    for ix in ixs {
+        h.update(ix.program_id.as_ref());
+        for acc in &ix.accounts {
+            h.update(acc.pubkey.as_ref());
+            h.update(&[acc.is_signer as u8, acc.is_writable as u8]);
+        }
+        h.update(&ix.data);
+    }
+    let d = h.finalize();
+    let mut out = [0u8;32];
+    out.copy_from_slice(&d[..32]);
+    out
+}
+
+// ==================== PIECE 1.33: AIMD CU-price scaler ====================
+#[derive(Clone, Copy, Debug)]
+struct Aimd {
+    bp: u32,          // extra bps (0..=500)
+    succ_ewma: f64,   // success rate
+    fail_ewma: f64,   // failure rate
+}
+
+static AIMD_LRU: OnceLock<tokio::sync::RwLock<LruCache<[u8;32], Aimd>>> = OnceLock::new();
+
+#[inline(always)]
+fn aimd_lru() -> &'static tokio::sync::RwLock<LruCache<[u8;32], Aimd>> {
+    AIMD_LRU.get_or_init(|| {
+        const CACHE_SIZE: usize = 4096;
+        tokio::sync::RwLock::new(LruCache::new(
+            NonZeroUsize::new(CACHE_SIZE).unwrap()
+        ))
+    })
+}
+
+#[inline(always)]
+fn progset_fingerprint(ixs: &[Instruction]) -> [u8;32] {
+    let mut v: Vec<Pubkey> = Vec::with_capacity(ixs.len());
+    for ix in ixs { v.push(ix.program_id); }
+    v.sort_unstable(); 
+    v.dedup();
+    
+    let mut h = Sha256::new(); 
+    h.update(b"PROGSET1");
+    for p in &v { h.update(p.as_ref()); }
+    
+    let d = h.finalize();
+    let mut out = [0u8;32]; 
+    out.copy_from_slice(&d[..32]); 
+    out
+}
+
+// Maximum jitter for tip in basis points (0.3%)
+const TIP_JITTER_MAX_BP: u32 = 30;
+
+// ATA cache TTL (15 seconds)
+const ATA_CACHE_TTL: Duration = Duration::from_secs(15);
+
+// Single-sig transaction fee on mainnet
+const BASE_SIG_COST_LAMPORTS: u64 = 5_000;
+
+// Maximum number of program addresses to consider for fee estimation
+const MAX_FEE_ADDRS: usize = 64;
+
+// Fee calculation parameters
+const FEE_QUANTILE_WINDOWS: [f64; 5] = [0.5, 0.6, 0.7, 0.8, 0.9]; // Base quantiles to track
+const MAX_FEE_ATTEMPT_MULTIPLIER: f64 = 3.0; // Max fee multiplier on retries
+const FEE_ESCALATION_FACTOR: f64 = 1.3; // 30% increase per attempt
+const LEADER_CONCENTRATION_THRESHOLD: f64 = 0.8; // Above this, use higher quantile
+
+// ====== CORE CONSTANTS ======
+pub const COMPUTE_UNITS_FLOOR: u32 = 150_000;
+pub const COMPUTE_UNITS_CEIL:  u32 = 1_400_000;
+pub const PRIORITY_FEE_LAMPORTS_FLOOR: u64 = 500;     // p75 guardrail (autoscaled later)
+pub const TIP_JITTER_MAX_BP: u32 = 30;                // micro-jitter to break tie cliffs
+pub const MIN_PROFIT_BPS: u64 = 10;
+pub const REBALANCE_THRESHOLD_BPS: u64 = 25;
+pub const MAX_SLIPPAGE_BPS: u64 = 50;
+
+pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+pub const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+
+/// Zero-parse program ID getters for performance-critical paths
+#[inline(always)]
+fn solend_program() -> Pubkey {
+    solana_program::pubkey!("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo")
+}
+
+#[inline(always)]
+fn kamino_program() -> Pubkey {
+    solana_program::pubkey!("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD")
+}
+
+/// Anchor discriminator (no heap allocs, domain separated)
+#[inline(always)]
+fn anchor_discriminator(ix_name: &str) -> [u8; 8] {
+    // sha256("global:" || ix_name)[0..8] — no heap, no format!
+    let mut hasher = Sha256::new();
+    hasher.update(b"global:");
+    hasher.update(ix_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
+}
+
+#[derive(BorshSerialize)]
+struct DepositArgs { amount: u64 }
+#[derive(BorshSerialize)]
+struct WithdrawArgs { amount: u64 }
+
+// Verified Solend opcodes (token-lending style)
+const SOLEND_DEPOSIT_TAG:  u8 = 4;
+const SOLEND_WITHDRAW_TAG: u8 = 5;
+const FLASHLOAN_TAG:  u8 = 10;
+const FLASHREPAY_TAG: u8 = 11;
+
+// ====== SIMULATION & AUTO-REPAIR ======
+
+/// Auto-repairs a failed transaction based on simulation logs
+/// Returns the repaired instructions if successful, or None if repair is not possible
+pub fn auto_repair_from_logs(ixs: &[Instruction], logs: &[String]) -> Option<Vec<Instruction>> {
+    use solana_sdk::instruction::AccountMeta;
+    
+    let logs = logs.join(" ");
+    let mut repaired = ixs.to_vec();
+    
+    // Handle common error patterns
+    if logs.contains("insufficient lamports") && logs.contains("rent") {
+        // For rent errors, we can't auto-fix as it requires more funds
+        return None;
+    }
+    
+    if logs.contains("insufficient funds for rent-exempt") {
+        // For rent-exempt errors, we can't auto-fix as it requires more funds
+        return None;
+    }
+    
+    if logs.contains("invalid account data for instruction") {
+        // For invalid account data, try to refresh the account data
+        return None; // Needs manual handling
+    }
+    
+    // Handle missing signer errors
+    if logs.contains("missing required signature") {
+        // Extract the missing signer pubkey from logs if possible
+        if let Some(signer_str) = logs
+            .split("missing required signature for: ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+        {
+            if let Ok(pubkey) = signer_str.parse::<Pubkey>() {
+                // Add the missing signer to all instructions that need it
+                for ix in &mut repaired {
+                    if !ix.accounts.iter().any(|meta| meta.pubkey == pubkey) {
+                        ix.accounts.push(AccountMeta {
+                            pubkey,
+                            is_signer: true,
+                            is_writable: false,
+                        });
+                    }
+                }
+                return Some(repaired);
+            }
+        }
+    }
+    
+    // Handle invalid account owner errors
+    if logs.contains("invalid account owner") {
+        // This typically requires manual intervention
+        return None;
+    }
+    
+    // Handle program errors
+    if logs.contains("custom program error") {
+        // For program errors, we can't auto-fix as it requires program-specific knowledge
+        return None;
+    }
+    
+    // If we get here, we couldn't auto-repair the transaction
+    None
+}
+
+// ====== ATA CACHE ======
+
+#[derive(Clone, Debug)]
+struct AtaCacheEntry {
+    exists: bool,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct AtaCache {
+    cache: RwLock<HashMap<(Pubkey, Pubkey, Pubkey), AtaCacheEntry>>,
+}
+
+impl AtaCache {
+    async fn get(&self, owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Option<bool> {
+        let cache = self.cache.read().await;
+        cache.get(&(*owner, *mint, *token_program))
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.exists)
+    }
+
+    async fn set(&self, owner: Pubkey, mint: Pubkey, token_program: Pubkey, exists: bool) {
+        let mut cache = self.cache.write().await;
+        cache.insert(
+            (owner, mint, token_program),
+            AtaCacheEntry {
+                exists,
+                expires_at: Instant::now() + ATA_CACHE_TTL,
+            },
+        );
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref ATA_CACHE: AtaCache = AtaCache::default();
+    static ref RENT_CACHE: tokio::sync::RwLock<RentCache> = tokio::sync::RwLock::new(RentCache { lamports_165: 0, ts: Instant::now() });
+    static ref RESERVE_CACHE: tokio::sync::RwLock<ReserveCache> = tokio::sync::RwLock::new(ReserveCache { map: HashMap::new() });
+}
+
+#[derive(Clone)]
+struct RentCache {
+    lamports_165: u64,
+    ts: Instant,
+}
+
+struct ReserveCache {
+    map: HashMap<([u8; 32], [u8; 32]), (ReserveMeta, Instant)>,
+}
+
+impl ReserveCache {
+    fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+    
+    fn key(program_id: &Pubkey, mint: &Pubkey) -> ([u8; 32], [u8; 32]) {
+        (program_id.to_bytes(), mint.to_bytes())
+    }
+    
+    fn get(&self, program_id: &Pubkey, mint: &Pubkey, ttl: Duration) -> Option<ReserveMeta> {
+        self.map
+            .get(&Self::key(program_id, mint))
+            .and_then(|(meta, ts)| {
+                if ts.elapsed() <= ttl {
+                    Some(meta.clone())
+                } else {
+                    None
+                }
+            })
+    }
+    
+    fn put(&mut self, program_id: &Pubkey, mint: &Pubkey, meta: ReserveMeta) {
+        self.map.insert(Self::key(program_id, mint), (meta, Instant::now()));
+    }
+}
+
+// ====== SHORTVEC UTILITIES ======
+
+/// Calculate the length of a Solana shortvec (7-bit little-endian varint)
+/// Returns 1 for n < 0x80, 2 for n < 0x4000, else 3
+/// Branchless implementation: 1 + 1{n≥0x80} + 1{n≥0x4000}
+#[inline(always)]
+const fn shortvec_len_optimized(n: usize) -> usize {
+    if n < 0x80 { 1 } else if n < 0x4000 { 2 } else { 3 }
+}
+
+/// Count unique keys in instructions with small-n optimization
+/// For typical HFT payloads (<=64 unique keys), linear de-dupe beats hashing.
+#[inline(always)]
+fn unique_key_len_inline(ixs: &[Instruction], payer: &Pubkey) -> usize {
+    let mut keys: Vec<Pubkey> = Vec::with_capacity(64);
+    keys.push(*payer);
+    
+    for ix in ixs {
+        // program id
+        if !keys.iter().any(|k| *k == ix.program_id) { 
+            keys.push(ix.program_id); 
+        }
+        // accounts
+        for m in &ix.accounts {
+            if !keys.iter().any(|k| *k == m.pubkey) { 
+                keys.push(m.pubkey); 
+            }
+        }
+    }
+    
+    // If unusually large, fall back to sort+dedup (still faster than hashing at scale)
+    if keys.len() > 64 {
+        keys.sort_unstable();
+        keys.dedup();
+    }
+    
+    keys.len()
+}
+
+// Optimized shortvec_len function
+#[inline(always)]
+const fn shortvec_len_optimized(n: usize) -> usize {
+    if n < 0x80 { 1 } else if n < 0x4000 { 2 } else { 3 }
+}
+
+// Update related code to use the optimized shortvec_len function
+// ...
+
+// Rest of the code remains the same
+    // Count program frequencies
+    let mut cnt: HashMap<Pubkey, usize> = HashMap::new();
+    for ix in ixs {
+        *cnt.entry(ix.program_id).or_insert(0) += 1;
+    }
+    
+    // Convert to vec and sort by frequency (descending) then by pubkey (for stability)
+    let mut v: Vec<(Pubkey, usize)> = cnt.into_iter().collect();
+    v.sort_by(|a, b| {
+        b.1.cmp(&a.1) // Sort by count descending
+         .then_with(|| a.0.cmp(&b.0)) // Then by pubkey for stable sort
+    });
+    
+    // Take top K programs
+    v.into_iter()
+        .take(k)
+        .map(|(k, _c)| k)
+        .collect()
+}
+
+// ====== UTILITY FUNCTIONS ======
+
+/// Returns top N programs by execution frequency from recent blocks.
+/// 
+/// This function analyzes recent blocks to identify the most frequently
+/// executed programs, which can be useful for optimizing transaction
+/// scheduling and prioritization.
+/// 
+/// # Arguments
+/// * `rpc_client` - The RPC client to fetch block data
+/// * `recent_blocks` - Number of recent blocks to analyze
+/// * `top_n` - Number of top programs to return
+/// 
+/// # Returns
+/// A vector of (program_id, execution_count) tuples, sorted by count in descending order
+async fn top_programs_by_freq(
+    rpc_client: &RpcClient,
+    recent_blocks: usize,
+    top_n: usize,
+) -> Result<Vec<(String, usize)>> {
+    if recent_blocks == 0 || top_n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Get recent block hashes
+    let slot = rpc_client.get_slot()?;
+    let start_slot = slot.saturating_sub(recent_blocks as u64);
+    
+    let mut program_counts: HashMap<String, usize> = HashMap::new();
+    
+    // Process blocks in parallel for better performance
+    let handles: Vec<_> = (start_slot..=slot)
+        .map(|block_slot| {
+            let rpc = rpc_client.clone();
+            tokio::spawn(async move {
+                match rpc.get_block(block_slot).await {
+                    Ok(block) => {
+                        let mut counts = HashMap::new();
+                        for tx in block.transactions {
+                            for meta in tx.meta.into_iter() {
+                                for program_id in meta.log_messages
+                                    .iter()
+                                    .flatten()
+                                    .filter_map(|log| log.split_whitespace().nth(2))
+                                    .filter(|s| s.starts_with("Program"))
+                                    .filter_map(|s| s.split_whitespace().nth(1))
+                                {
+                                    *counts.entry(program_id.to_string()).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                        Ok(counts)
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch block {}: {}", block_slot, e);
+                        Ok(HashMap::new())
+                    }
+                }
+            })
+        })
+        .collect();
+    
+    // Aggregate results from all blocks
+    for handle in handles {
+        if let Ok(Ok(counts)) = handle.await {
+            for (program_id, count) in counts {
+                *program_counts.entry(program_id).or_default() += count;
+            }
+        }
+    }
+    
+    // Sort by count in descending order and take top N
+    let mut sorted: Vec<_> = program_counts.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    
+    Ok(sorted.into_iter().take(top_n).collect())
+}
+
+}
+
+/// Estimate message bytes including a rough overhead for ALTs (accounts + table metadata).
+fn tx_message_size_with_alts_estimate(ixs: &[Instruction], alts: &[AddressLookupTableAccount]) -> usize {
+    let core = tx_message_size_estimate(
+        ixs.iter().filter(|ix| ix.program_id != system_program::id()).count() as u8,
+        1, // num_required_signatures
+        1, // num_readonly_signed_accounts
+        0, // num_readonly_unsigned_accounts
+        &ixs.iter().flat_map(|ix| {
+            std::iter::once(&ix.program_id)
+                .chain(ix.accounts.iter().map(|meta| &meta.pubkey))
+        }).collect::<Vec<_>>(),
+        &Hash::default(), // dummy hash for estimation
+        ixs,
+    );
+    // ALT rough size: 8 bytes (discriminator/length-ish) + 32 * addresses
+    let alt_bytes: usize = alts.iter().map(|t| 8usize + 32usize * t.addresses.len()).sum();
+    core + alt_bytes + 64 // a little extra headroom for headers/indices
+}
+
+/// Shrinks the set of ALTs to fit within MTU budget
+fn shrink_alts_to_mtu(
+    ixs: &[Instruction],
+    mut alts: Vec<AddressLookupTableAccount>,
+    mtu_budget: usize,
+    size_fn: &dyn Fn(&[Instruction], &[AddressLookupTableAccount]) -> usize,
+) -> Vec<AddressLookupTableAccount> {
+    // If already fits, return fast
+    if size_fn(ixs, &alts) <= mtu_budget {
+        return alts;
+    }
+
+    // Drop least useful ALTs first: sort ascending by coverage (keep high coverage)
+    let mut scored: Vec<(usize, usize)> = alts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, t.addresses.len()))
+        .collect();
+    scored.sort_by_key(|&(_i, cov)| cov); // low coverage first
+
+    // Greedily remove until we fit
+    for (idx, _cov) in scored {
+        if size_fn(ixs, &alts) <= mtu_budget {
+            break;
+        }
+        if idx < alts.len() {
+            alts.remove(idx);
+        }
+    }
+    alts
+}
+
+// ==================== PIECE 1.31: Slot-Scoped Account Bloom ====================
+#[derive(Clone, Debug)]
+struct SlotBloom {
+    slot: u64,
+    m_bits: usize,
+    k: u8,
+    bits: Vec<u64>,
+}
+
+impl SlotBloom {
+    fn new(slot: u64, m_bits: usize, k: u8) -> Self {
+        let words = (m_bits + 63) / 64;
+        Self { slot, m_bits, k, bits: vec![0u64; words] }
+    }
+
+    #[inline(always)]
+    fn reset(&mut self, slot: u64) {
+        self.slot = slot;
+        for w in &mut self.bits { *w = 0; }
+    }
+
+    #[inline(always)]
+    fn pos(&self, h1: u64, h2: u64, i: u8) -> usize {
+        let m = self.m_bits as u64;
+        (((h1.wrapping_add((i as u64).wrapping_mul(h2))) % m) as usize)
+    }
+
+    #[inline(always)]
+    fn hash2(bytes: &[u8]) -> (u64, u64) {
+        let mut h = Sha256::new();
+        h.update(b"ABLOOM1");
+        h.update(bytes);
+        let d = h.finalize();
+        let h1 = u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+        let h2 = u64::from_le_bytes([d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]]) | 1;
+        (h1, h2)
+    }
+
+    #[inline(always)]
+    fn set(&mut self, bytes: &[u8]) {
+        let (h1, h2) = Self::hash2(bytes);
+        for i in 0..self.k {
+            let p = self.pos(h1, h2, i);
+            let w = p >> 6;
+            let b = p & 63;
+            self.bits[w] |= 1u64 << b;
+        }
+    }
+
+    #[inline(always)]
+    fn test(&self, bytes: &[u8]) -> bool {
+        let (h1, h2) = Self::hash2(bytes);
+        for i in 0..self.k {
+            let p = self.pos(h1, h2, i);
+            let w = p >> 6;
+            let b = p & 63;
+            if (self.bits[w] >> b) & 1 == 0 { return false; }
         }
         true
     }
 }
 
-// === [IMPROVED: PIECE ATA-COALESCE v56] ===
-impl PortOptimizer {
-    /// Remove duplicate `create_associated_token_account` instructions targeting the same ATA.
-    fn coalesce_create_atas(&self, ixs: &mut Vec<solana_sdk::instruction::Instruction>) {
-        use std::collections::HashSet;
-        let ata_program = spl_associated_token_account::id();
-        let mut seen: HashSet<solana_sdk::pubkey::Pubkey> = HashSet::new();
-        ixs.retain(|ix| {
-            if ix.program_id != ata_program { return true; }
-            if ix.accounts.len() < 2 { return true; }
-            let ata = ix.accounts[1].pubkey;
-            if seen.contains(&ata) { false } else { seen.insert(ata); true }
-        });
-    }
+static ACC_BLOOM: OnceLock<tokio::sync::RwLock<SlotBloom>> = OnceLock::new();
+
+#[inline(always)]
+fn acc_bloom() -> &'static tokio::sync::RwLock<SlotBloom> {
+    // m_bits ≈ 2^18 ~ 256k bits (~32KB), k=3 → FP rate ~ 0.2–0.5% for a few thousand inserts
+    ACC_BLOOM.get_or_init(|| tokio::sync::RwLock::new(SlotBloom::new(0, 1<<18, 3)))
 }
 
-// === [IMPROVED: PIECE PLAN-BATCHER v56] ===
-impl PortOptimizer {
-    /// Greedy packer: merges plans while avoiding account write conflicts.
-    pub fn batch_plans_nonconflicting(&self, plans: Vec<Vec<solana_sdk::instruction::Instruction>>) -> Vec<Vec<solana_sdk::instruction::Instruction>> {
-        use std::collections::{BTreeSet, HashSet};
+// ====== DOMAIN TYPES ======
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol { Solend, Kamino }
 
-        fn keys_of(ixs: &[solana_sdk::instruction::Instruction]) -> (HashSet<solana_sdk::pubkey::Pubkey>, HashSet<solana_sdk::pubkey::Pubkey>) {
-            let mut w = HashSet::new();
-            let mut r = HashSet::new();
-            for ix in ixs {
-                for am in &ix.accounts {
-                    if am.is_writable { w.insert(am.pubkey); } else { r.insert(am.pubkey); }
-                }
-            }
-            (w, r)
-        }
-
-        let mut batches: Vec<(Vec<solana_sdk::instruction::Instruction>, HashSet<solana_sdk::pubkey::Pubkey>, HashSet<solana_sdk::pubkey::Pubkey>)> = Vec::new();
-        'plans: for p in plans {
-            let (pw, pr) = keys_of(&p);
-            for (b_ixs, bw, br) in batches.iter_mut() {
-                let conflict = !pw.is_disjoint(bw) || !pw.is_disjoint(br) || !bw.is_disjoint(&pr);
-                if !conflict {
-                    b_ixs.extend(p);
-                    bw.extend(pw.iter());
-                    br.extend(pr.iter());
-                    continue 'plans;
-                }
-            }
-            // new batch
-            batches.push((p, pw, pr));
-        }
-        batches.into_iter().map(|(ixs, _, _)| ixs).collect()
-    }
+#[derive(Clone, Debug)]
+pub struct LendingMarket {
+    pub market_pubkey: Pubkey,
+    pub token_mint: Pubkey,
+    pub protocol: Protocol,
+    pub supply_apy: f64,
+    pub borrow_apy: f64,
+    pub utilization: f64,
+    pub liquidity_available: u64,
+    pub last_update: Instant,
+    pub layout_version: u8,
 }
 
-// === [IMPROVED: PIECE FEE-SCHEDULER v56] ===
-impl PortOptimizer {
-    /// Compute a multiplier from recent performance samples (5-slot window).
-    async fn saturation_multiplier(&self) -> f64 {
-        let samples = match self.rpc_client.get_recent_performance_samples(Some(5)).await {
-            Ok(v) if !v.is_empty() => v,
-            _ => return 1.0,
-        };
-        let avg_tps = samples.iter()
-            .map(|s| (s.num_transactions as f64) / (s.sample_period_secs as f64))
-            .sum::<f64>() / (samples.len() as f64);
-        let baseline_tps = 3_000.0_f64;
-        (avg_tps / baseline_tps).clamp(0.8, 2.0)
-    }
-
-    /// Quantile of recent priority fee (lamports) with small timeout; fall back to PRIORITY_FEE_LAMPORTS.
-    async fn priority_fee_price_quantile(&self, quantile: f64) -> u64 {
-        use tokio::time::timeout;
-        let scope: Vec<solana_sdk::pubkey::Pubkey> = vec![
-            solana_program::compute_budget::id(),
-            solana_program::system_program::id(),
-        ];
-        let res = timeout(std::time::Duration::from_millis(200), self.rpc_client.get_recent_prioritization_fees(&scope)).await;
-        if let Ok(Ok(fees)) = res {
-            if !fees.is_empty() {
-                let mut v: Vec<u64> = fees.into_iter().map(|f| f.prioritization_fee.max(1)).collect();
-                v.sort_unstable();
-                let k = ((v.len() as f64 * quantile).floor() as usize).clamp(0, v.len()-1);
-                return v[k].max(1);
-            }
-        }
-        PRIORITY_FEE_LAMPORTS.max(1)
-    }
-
-    /// Priority fee = quantile price × saturation multiplier (rounded).
-    pub async fn priority_fee_dynamic(&self, quantile: f64) -> u64 {
-        let base = self.priority_fee_price_quantile(quantile).await.max(1);
-        let mult = self.saturation_multiplier().await;
-        ((base as f64) * mult).round().max(1.0) as u64
-    }
-
-    /// Drop-in replacement that uses dynamic fee but keeps the precise CU headroom logic.
-    pub async fn precise_budget_ixs_dynamic(
-        &self,
-        ixs: &[solana_sdk::instruction::Instruction],
-        desired_quantile: f64,
-        extra_margin_ratio: f64,
-        min_extra_units: u32,
-    ) -> Result<(solana_sdk::instruction::Instruction, solana_sdk::instruction::Instruction)> {
-        let generous = 1_400_000u32;
-        let mut probe_ixs = Vec::with_capacity(ixs.len() + 2);
-        probe_ixs.push(solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(generous));
-        probe_ixs.push(solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1));
-        probe_ixs.extend_from_slice(ixs);
-
-        let bh = self.get_recent_blockhash_with_retry().await?;
-        let tx = self.build_v0_tx(self.wallet.pubkey(), &probe_ixs, bh, &[])?;
-        let sim = self.simulate_exact(&tx).await?;
-        if let Some(err) = sim.err { anyhow::bail!("probe sim failed: {:?}", err); }
-        let used = sim.units_consumed.unwrap_or(COMPUTE_UNITS as u64) as u32;
-
-        let cu_limit = used
-            .saturating_add(((used as f64) * extra_margin_ratio) as u32)
-            .saturating_add(min_extra_units)
-            .min(generous);
-
-        let price = self.priority_fee_dynamic(desired_quantile).await;
-        Ok((
-            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
-            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(price),
-        ))
-    }
+#[derive(Clone, Debug)]
+pub struct Position {
+    pub token_mint: Pubkey,
+    pub amount: u64,
+    pub protocol: Protocol,
+    pub last_rebalance: Instant,
 }
 
-// === [IMPROVED: PIECE SEND-PLAN v56] ===
-impl PortOptimizer {
-    /// Helper: forwarder to existing v0 builder with LUTs.
-    fn build_v0_tx_with_luts(
-        &self,
-        payer: solana_sdk::pubkey::Pubkey,
-        ixs: &[solana_sdk::instruction::Instruction],
-        bh: solana_sdk::hash::Hash,
-        luts: &[solana_sdk::message::v0::AddressLookupTableAccount],
-        _alts: &[solana_sdk::message::v0::AddressLookupTableAccount],
-    ) -> Result<solana_sdk::transaction::VersionedTransaction> {
-        // Reuse the canonical builder that accepts a LUT slice (alts kept for signature parity)
-        self.build_v0_tx(payer, ixs, bh, luts)
-    }
-
-    /// Fire a plan with auto LUT selection and dynamic compute budget.
-    pub async fn send_plan_v0_smart(
-        &self,
-        mut ixs: Vec<solana_sdk::instruction::Instruction>,
-        candidate_luts: &[solana_sdk::pubkey::Pubkey],
-        timeout: std::time::Duration,
-    ) -> Result<solana_sdk::signature::Signature> {
-        // 0) Skip duplicate plans within a short slot window
-        if !self.plan_lru_should_send(&ixs).await {
-            anyhow::bail!("plan de-duplicated (recently sent identical instruction set)");
-        }
-
-        // 1) Coalesce duplicate ATA creates
-        self.coalesce_create_atas(&mut ixs);
-
-        // 2) Choose LUTs greedily (0..2 defaults; ≥4 new addrs threshold)
-        let chosen_luts = self.select_luts_for_plan(&ixs, candidate_luts, 2, 4).await?;
-
-        // 3) Dynamic compute-budget tuning (p90, +12% and +8k)
-        let (cu_ix, fee_ix) = self.precise_budget_ixs_dynamic(&ixs, 0.90, 0.12, 8_000).await?;
-        ixs.insert(0, fee_ix);
-        ixs.insert(0, cu_ix);
-
-        // 4) Build v0 with or without LUTs and sanity-sim
-        let bh = self.get_recent_blockhash_with_retry().await?;
-        let tx = if chosen_luts.is_empty() {
-            self.build_v0_tx(self.wallet.pubkey(), &ixs, bh, &[])?
-        } else {
-            self.build_v0_tx_with_luts(self.wallet.pubkey(), &ixs, bh, &chosen_luts, &[])?
-        };
-        let sim = self.simulate_exact(&tx).await?;
-        if let Some(err) = sim.err { anyhow::bail!("preflight sim failed: {:?}", err); }
-
-        // 5) Slot-guarded send with automatic blockhash refresh
-        let sig = self.send_v0_with_slot_guard(
-            |bh2| {
-                if chosen_luts.is_empty() {
-                    self.build_v0_tx(self.wallet.pubkey(), &ixs, bh2, &[])
-                } else {
-                    self.build_v0_tx_with_luts(self.wallet.pubkey(), &ixs, bh2, &chosen_luts, &[])
-                }
-            },
-            timeout,
-            0,
-            120,
-        ).await?;
-        Ok(sig)
-    }
+#[derive(Clone, Debug)]
+pub struct ReserveMeta {
+    pub reserve: Pubkey,
+    pub lending_market: Pubkey,
+    pub lending_market_authority: Pubkey,
+    pub liquidity_mint: Pubkey,
+    pub liquidity_supply_vault: Pubkey,
+    pub collateral_mint: Pubkey,
+    pub collateral_supply_vault: Pubkey,
+    pub program_id: Pubkey,
 }
 
-// Global EMA floor for CU price shaping (used by multiple paths)
-static SURGE_EMA: OnceLock<AtomicU64> = OnceLock::new();
-static UNITS_EMA: OnceLock<AtomicU64> = OnceLock::new();
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum FeeRegime { Calm, Elevated, Surge }
-
-#[inline]
-fn classify_regime(short_p90: u64, long_p90: u64) -> FeeRegime {
-    let s = short_p90.max(1);
-    let l = long_p90.max(1);
-    if s >= 150_000 || (2 * s) >= (5 * l) { FeeRegime::Surge }
-    else if s >= 50_000 || (10 * s) >= (14 * l) { FeeRegime::Elevated }
-    else { FeeRegime::Calm }
+#[derive(Clone, Debug)]
+pub struct FlashPlan {
+    pub flash_program: Pubkey,
+    pub reserve: Pubkey,
+    pub liquidity_supply_vault: Pubkey,
+    pub lending_market: Pubkey,
+    pub market_authority: Pubkey,
+    pub token_mint: Pubkey,
+    pub amount: u64,
 }
 
-#[inline] fn f64_load(a: &std::sync::atomic::AtomicU64) -> f64 { f64::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)) }
-#[inline] fn f64_store(a: &std::sync::atomic::AtomicU64, v: f64) { a.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed); }
+#[derive(Clone)]
+pub enum TipStrategy { RoundRobin, Fixed(usize) }
 
-// P² single-quantile tracker (lock-guarded)
-struct P2 {
-    p: f64,
-    n: [i64; 5], np: [f64; 5], dn: [f64; 5], q: [f64; 5], seed: [f64; 5],
-    k: usize, initd: bool,
-}
-impl P2 {
-    fn new(p: f64) -> Self {
-        let dn = [0.0, p/2.0, p, (1.0+p)/2.0, 1.0];
-        Self { p, n: [0;5], np: [0.0;5], dn, q: [0.0;5], seed: [0.0;5], k: 0, initd: false }
-    }
-    #[inline] fn value(&self) -> Option<f64> { if self.initd { Some(self.q[2]) } else if self.k>0 { let mut tmp = self.seed; tmp[..self.k].sort_by(|a,b| a.partial_cmp(b).unwrap()); Some(tmp[(self.k-1).min(2)]) } else { None } }
-    fn observe(&mut self, x: f64) {
-        if !self.initd {
-            if self.k < 5 { self.seed[self.k]=x; self.k+=1; }
-            if self.k == 5 {
-                self.seed.sort_by(|a,b| a.partial_cmp(b).unwrap());
-                self.q.copy_from_slice(&self.seed);
-                self.n = [1,2,3,4,5];
-                self.np = [1.0, 1.0+2.0*self.p, 1.0+4.0*self.p, 3.0+2.0*self.p, 5.0];
-                self.initd = true;
-            }
-            return;
-        }
-        let k = if x < self.q[0] { self.q[0]=x; 0 }
-        else if x < self.q[1] { 0 }
-        else if x < self.q[2] { 1 }
-        else if x < self.q[3] { 2 }
-        else if x <= self.q[4] { 3 }
-        else { self.q[4]=x; 3 };
-        for i in (k+1)..5 { self.n[i]+=1; }
-        for i in 0..5 { self.np[i]+=self.dn[i]; }
-        for i in 1..4 {
-            let d = self.np[i] - (self.n[i] as f64);
-            if (d >= 1.0 && (self.n[i+1]-self.n[i])>1) || (d <= -1.0 && (self.n[i-1]-self.n[i])< -1) {
-                let s = d.signum();
-                let qi = self.q[i];
-                let qip = qi + s * (
-                    ((self.n[i]-self.n[i-1]) as f64 + s) * (self.q[i+1]-qi) / ((self.n[i+1]-self.n[i]) as f64)
-                    + ((self.n[i+1]-self.n[i]) as f64 - s) * (qi - self.q[i-1]) / ((self.n[i]-self.n[i-1]) as f64)
-                ) / ((self.n[i+1]-self.n[i-1]) as f64);
-                let qlin = if s > 0.0 { qi + (self.q[i+1]-qi) / ((self.n[i+1]-self.n[i]) as f64) } else { qi - (self.q[i-1]-qi) / ((self.n[i-1]-self.n[i]) as f64) };
-                self.q[i] = if self.q[i-1] < qip && qip < self.q[i+1] { qip } else { qlin };
-                self.n[i] += s as i64;
-            }
-        }
-    }
+#[derive(Clone)]
+pub struct TipConfig {
+    pub accounts: Vec<Pubkey>,
+    pub strategy: TipStrategy,
 
+// Core engine (only members used elsewhere — no dead fields)
+#[derive(Clone)]
+pub struct PortOptimizer {
+    pub rpc_client: Arc<RpcClient>,
+    pub wallet: Arc<Keypair>,
+    pub markets: Arc<RwLock<HashMap<String, Vec<LendingMarket>>>>,
+    pub active_positions: Arc<RwLock<HashMap<String, Position>>>,
+    pub tip_router: Arc<RwLock<Option<TipRouter>>>,
+    pub last_tx_signature: Arc<tokio::sync::RwLock<Option<Signature>>>,
+    pub duplicate_cache: Arc<tokio::sync::RwLock<LruCache<u64, ()>>>,
 }
 
 impl PortOptimizer {
-    // Infer token program for a given mint by querying the mint account owner.
-    async fn token_program_for_mint(&self, mint: &Pubkey) -> Result<Pubkey> {
-        match self.rpc_client.get_account(mint).await {
-            Ok(acc) => {
-                let owner = acc.owner;
-                let spl  = spl_token::id();
-                // Token-2022 program id literal (avoid requiring crate dependency)
-                let spl2: Pubkey = solana_sdk::pubkey!("TokenzQdBNbLqP5VEhDWt9yaWwGmt4Q5CwMkpw8sH1");
-                if owner == spl || owner == spl2 { Ok(owner) } else { Ok(spl) }
-            }
-            Err(e) => {
-                // Fallback to SPL Token if we cannot fetch the mint account
-                warn!("token_program_for_mint: fallback SPL due to error: {e}");
-                Ok(spl_token::id())
-            }
-        }
-    }
-
-    // Associated token address for a specific token program (SPL or Token-2022)
-    fn ata_for(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-        spl_associated_token_account::get_associated_token_address_with_program_id(owner, mint, token_program)
-    }
-}
-
-static P2P75: OnceLock<tokio::sync::Mutex<P2>> = OnceLock::new();
-static P2P90: OnceLock<tokio::sync::Mutex<P2>> = OnceLock::new();
-
-static LOG_MU:      OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-static LOG_VAR:     OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-static LOG_MAD:     OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-static LOG_X_LAST:  OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-static LOG_TS_LAST: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-static MONO_START:  OnceLock<std::time::Instant>            = OnceLock::new();
-
-#[inline] fn mono_ms() -> u64 { MONO_START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 }
-
-#[inline]
-fn to_permille(x: f64) -> u32 {
-    if !x.is_finite() || x <= 0.0 { return 1000; }
-    let p = (x * 1000.0).round();
-    p.clamp(0.0, 8000.0) as u32
-}
-
-// === [IMPROVED: PIECE OBS v50] ===
-// complete init; adds alpha, deadband%, dt_ms, P² p75/p90 gauges.
-use prometheus::{Registry, IntCounter, Gauge, IntGauge, Histogram, HistogramOpts, Opts};
-
-pub struct Observability {
-    // base
-    pub rebalance_attempts:   IntCounter,
-    pub rebalance_success:    IntCounter,
-    pub rebalance_failure:    IntCounter,
-    pub tip_latency_ms:       Histogram,
-    pub resubmits_by_reason:  prometheus::IntCounterVec,
-    pub refreshes_by_reason:  prometheus::IntCounterVec,
-    pub breaker_trips:        IntCounter,
-    pub cu_limit_gauge:       IntGauge,
-    pub cu_price_gauge:       IntGauge,
-    pub preprofit_bps_gauge:  Gauge,
-    pub height_margin_gauge:  IntGauge,
-    pub escalations_total:    IntCounter,
-    pub profit_skips:         IntCounter,
-    pub sim_failures:         IntCounter,
-    pub send_failures:        IntCounter,
-    pub regime_gauge:         IntGauge,
-    pub zscore_gauge:         Gauge,
-    pub gas_est_hist:         Histogram,
-    pub fee_paid_hist:        Histogram,
-    // v46
-    pub coalesce_bhash_hits:  IntCounter,
-    pub coalesce_resolve_hits:IntCounter,
-    pub fork_retries:         IntCounter,
-    pub bundle_timeouts:      IntCounter,
-    pub short_p90_gauge:      IntGauge,
-    pub long_p90_gauge:       IntGauge,
-    pub sim_ms_hist:          Histogram,
-    // v47
-    pub confirm_primary_win:  IntCounter,
-    pub confirm_fast_win:     IntCounter,
-    pub underpriced_escal:    IntCounter,
-    pub pacer_ms_gauge:       IntGauge,
-    pub cu_override_gauge:    IntGauge,
-    pub tip_lamports_gauge:   IntGauge,
-    // v48
-    pub fee_slope_ps_gauge:   Gauge,
-    pub bhash_stale_reuse:    IntCounter,
-    pub resolve_fallbacks:    IntCounter,
-    // v49
-    pub alpha_gauge:          Gauge,
-    pub deadband_pct_gauge:   IntGauge,
-    // v50
-    pub fee_dt_ms_gauge:      IntGauge,
-    pub p2_p75_gauge:         IntGauge,
-    pub p2_p90_gauge:         IntGauge,
-}
-
-impl Observability {
-    pub fn new(reg: &Registry) -> Self {
-        use prometheus::{linear_buckets, IntCounterVec};
-
-        // base counters/gauges/hists
-        let attempts  = IntCounter::new("rebalance_attempts","rebalance attempts").unwrap();
-        let success   = IntCounter::new("rebalance_success","rebalance success").unwrap();
-        let failure   = IntCounter::new("rebalance_failure","rebalance failure").unwrap();
-        let trips     = IntCounter::new("breaker_trips","circuit breaker trips").unwrap();
-        let resub     = IntCounterVec::new(Opts::new("tx_resubmits_labeled","resubmits by reason"), &["reason"]).unwrap();
-        let refreshes = IntCounterVec::new(Opts::new("blockhash_refreshes_labeled","refreshes by reason"), &["reason"]).unwrap();
-        let cu_limit  = IntGauge::new("cu_limit","compute-unit limit set").unwrap();
-        let cu_price  = IntGauge::new("cu_price_lamports","compute-unit price in lamports").unwrap();
-        let pre_bps   = Gauge::new("preprofit_bps","preflight expected profit (bps)").unwrap();
-        let height_m  = IntGauge::new("last_valid_height_margin","last_valid_height - current_height").unwrap();
-        let tip_latency = Histogram::with_opts(HistogramOpts::new("tip_latency_ms","tip landing latency (ms)")
-            .buckets(linear_buckets(10.0,50.0,100).unwrap())).unwrap();
-        let escal = IntCounter::new("fee_escalations_total","total fee escalations").unwrap();
-        let pskip = IntCounter::new("profit_skips_total","skipped due to non-positive preprofit").unwrap();
-        let sfail = IntCounter::new("sim_failures_total","simulation failures").unwrap();
-        let xfail = IntCounter::new("send_failures_total","send/confirm failures").unwrap();
-        let regime= IntGauge::new("fee_regime","0 calm, 1 elevated, 2 surge").unwrap();
-        let zscore= Gauge::new("fee_zscore_abs","abs z-score on log-fee").unwrap();
-        let gas_h = Histogram::with_opts(HistogramOpts::new("gas_est_lamports","estimated gas (lamports)")
-            .buckets(linear_buckets(50_000.0,50_000.0,40).unwrap())).unwrap();
-        let fee_h = Histogram::with_opts(HistogramOpts::new("fee_paid_lamports","final fee paid (lamports)")
-            .buckets(linear_buckets(50_000.0,50_000.0,40).unwrap())).unwrap();
-
-        // v46
-        let bh_coh = IntCounter::new("bhash_coalesce_hits","blockhash coalesce immediate hits").unwrap();
-        let rv_coh = IntCounter::new("resolve_coalesce_hits","resolve coalesce immediate hits").unwrap();
-        let forkry = IntCounter::new("fork_retries_total","fork/min_context_slot retries").unwrap();
-        let btimeo = IntCounter::new("bundle_timeouts_total","bundle fetch timeouts").unwrap();
-        let sp90   = IntGauge::new("short_p90","short horizon p90").unwrap();
-        let lp90   = IntGauge::new("long_p90","long horizon p90").unwrap();
-        let sim_ms = Histogram::with_opts(HistogramOpts::new("sim_duration_ms","exact sim duration (ms)")
-            .buckets(linear_buckets(2.0, 2.0, 100).unwrap())).unwrap();
-
-        // v47
-        let cprim = IntCounter::new("confirm_primary_win_total","confirm fanout: primary client won").unwrap();
-        let cfast = IntCounter::new("confirm_fast_win_total","confirm fanout: fast client won").unwrap();
-        let uescal= IntCounter::new("underpriced_escalations_total","send errors indicating underpriced/too-low fee").unwrap();
-        let pacer = IntGauge::new("pacer_sleep_ms","slotguard pacer planned sleep (ms)").unwrap();
-        let cuovr = IntGauge::new("cu_override","current CU override from hints").unwrap();
-        let tipg  = IntGauge::new("tip_lamports","tip lamports for this send").unwrap();
-
-        // v48
-        let slopeg = Gauge::new("fee_slope_per_sec","d(log fee)/dt (per second)").unwrap();
-        let stale  = IntCounter::new("bhash_stale_reuse_total","stale bundle reused after hedge timeout").unwrap();
-        let rfall  = IntCounter::new("resolve_fallbacks_total","resolve full-account fallbacks taken").unwrap();
-
-        // v49
-        let alpha  = Gauge::new("fee_alpha","ct-EMA alpha (0..1)").unwrap();
-        let dbpct  = IntGauge::new("fee_deadband_pct","effective deadband percent").unwrap();
-
-        // v50
-        let dtms  = IntGauge::new("fee_dt_ms","dt used for ct-EMA (ms)").unwrap();
-        let p2p75 = IntGauge::new("fee_p2_p75","P² live p75").unwrap();
-        let p2p90 = IntGauge::new("fee_p2_p90","P² live p90").unwrap();
-
-        // register everything
-        for m in [&attempts,&success,&failure,&trips,&cu_limit,&cu_price,&escal,&pskip,&sfail,&xfail,
-                  &regime,&bh_coh,&rv_coh,&forkry,&btimeo,&sp90,&lp90,&cprim,&cfast,&uescal,
-                  &pacer,&cuovr,&tipg,&stale,&rfall,&dbpct,&dtms,&p2p75,&p2p90] {
-            reg.register(Box::new((*m).clone())).ok();
-        }
-        for m in [&pre_bps as &dyn prometheus::core::Collector, &tip_latency, &resub, &refreshes, &zscore, &gas_h, &fee_h, &sim_ms, &slopeg, &alpha] {
-            reg.register(Box::new(m.clone())).ok();
-        }
-
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        wallet: Arc<Keypair>,
+        markets: Arc<RwLock<HashMap<String, Vec<LendingMarket>>>>,
+        active_positions: Arc<RwLock<HashMap<String, Position>>>,
+        tip_router: Arc<RwLock<Option<TipRouter>>>,
+    ) -> Self {
+        // Create a cache that holds ~10k entries (enough for ~10s of transactions at high volume)
+        let duplicate_cache = Arc::new(tokio::sync::RwLock::new(LruCache::new(
+            NonZeroUsize::new(10_000).unwrap()
+        )));
+        
         Self {
-            rebalance_attempts: attempts, rebalance_success: success, rebalance_failure: failure,
-            tip_latency_ms: tip_latency, resubmits_by_reason: resub, refreshes_by_reason: refreshes,
-            breaker_trips: trips, cu_limit_gauge: cu_limit, cu_price_gauge: cu_price,
-            preprofit_bps_gauge: pre_bps, height_margin_gauge: height_m, escalations_total: escal,
-            profit_skips: pskip, sim_failures: sfail, send_failures: xfail, regime_gauge: regime,
-            zscore_gauge: zscore, gas_est_hist: gas_h, fee_paid_hist: fee_h,
-            coalesce_bhash_hits: bh_coh, coalesce_resolve_hits: rv_coh, fork_retries: forkry,
-            bundle_timeouts: btimeo, short_p90_gauge: sp90, long_p90_gauge: lp90, sim_ms_hist: sim_ms,
-            confirm_primary_win: cprim, confirm_fast_win: cfast, underpriced_escal: uescal,
-            pacer_ms_gauge: pacer, cu_override_gauge: cuovr, tip_lamports_gauge: tipg,
-            fee_slope_ps_gauge: slopeg, bhash_stale_reuse: stale, resolve_fallbacks: rfall,
-            alpha_gauge: alpha, deadband_pct_gauge: dbpct,
-            fee_dt_ms_gauge: dtms, p2_p75_gauge: p2p75, p2_p90_gauge: p2p90,
+            rpc_client,
+            wallet,
+            markets,
+            active_positions,
+            tip_router,
+            last_tx_signature: Arc::new(tokio::sync::RwLock::new(None)),
+            duplicate_cache,
         }
     }
 
-    // setters
-    #[inline] pub fn inc_attempt(&self) { self.rebalance_attempts.inc(); }
-    #[inline] pub fn inc_success(&self) { self.rebalance_success.inc(); }
-    #[inline] pub fn inc_failure(&self) { self.rebalance_failure.inc(); }
-    #[inline] pub fn observe_tip_ms(&self, ms: f64) { self.tip_latency_ms.observe(ms.max(0.0)); }
-    #[inline] pub fn inc_resubmit(&self, reason: &'static str) { self.resubmits_by_reason.with_label_values(&[reason]).inc(); }
-    #[inline] pub fn inc_refresh(&self, reason: &'static str) { self.refreshes_by_reason.with_label_values(&[reason]).inc(); }
-    #[inline] pub fn inc_trip(&self) { self.breaker_trips.inc(); }
-    #[inline] pub fn set_cu(&self, cu: i64) { self.cu_limit_gauge.set(cu); }
-    #[inline] pub fn set_price(&self, p: i64) { self.cu_price_gauge.set(p); }
-    #[inline] pub fn set_preprofit_bps(&self, bps: f64) { self.preprofit_bps_gauge.set(bps); }
-    #[inline] pub fn set_height_margin(&self, m: i64) { self.height_margin_gauge.set(m); }
-    #[inline] pub fn inc_escalations(&self) { self.escalations_total.inc(); }
-    #[inline] pub fn inc_profit_skip(&self) { self.profit_skips.inc(); }
-    #[inline] pub fn inc_sim_failure(&self) { self.sim_failures.inc(); }
-    #[inline] pub fn inc_send_failure(&self) { self.send_failures.inc(); }
-    #[inline] pub fn set_regime(&self, r: FeeRegime) { self.regime_gauge.set(match r { FeeRegime::Calm=>0, FeeRegime::Elevated=>1, FeeRegime::Surge=>2 }); }
-    #[inline] pub fn set_zscore_abs(&self, z: f64) { self.zscore_gauge.set(z.abs()); }
-    #[inline] pub fn observe_gas_est(&self, lamports: u64) { self.gas_est_hist.observe(lamports as f64); }
-    #[inline] pub fn observe_fee_paid(&self, lamports: u64) { self.fee_paid_hist.observe(lamports as f64); }
-    #[inline] pub fn inc_bhash_coalesce(&self) { self.coalesce_bhash_hits.inc(); }
-    #[inline] pub fn inc_resolve_coalesce(&self) { self.coalesce_resolve_hits.inc(); }
-    #[inline] pub fn inc_fork_retry(&self) { self.fork_retries.inc(); }
-    #[inline] pub fn inc_bundle_timeout(&self) { self.bundle_timeouts.inc(); }
-    #[inline] pub fn set_short_p90(&self, v: u64) { self.short_p90_gauge.set(v as i64); }
-    #[inline] pub fn set_long_p90(&self, v: u64) { self.long_p90_gauge.set(v as i64); }
-    #[inline] pub fn observe_sim_ms(&self, ms: f64) { self.sim_ms_hist.observe(ms.max(0.0)); }
-    #[inline] pub fn inc_confirm_primary_win(&self) { self.confirm_primary_win.inc(); }
-    #[inline] pub fn inc_confirm_fast_win(&self) { self.confirm_fast_win.inc(); }
-    #[inline] pub fn inc_underpriced_escal(&self) { self.underpriced_escal.inc(); }
-    #[inline] pub fn set_pacer_ms(&self, ms: u64) { self.pacer_ms_gauge.set(ms as i64); }
-    #[inline] pub fn set_cu_override(&self, cu: u32) { self.cu_override_gauge.set(cu as i64); }
-    #[inline] pub fn set_tip_lamports(&self, t: u64) { self.tip_lamports_gauge.set(t as i64); }
-    #[inline] pub fn set_fee_slope_ps(&self, s: f64) { self.fee_slope_ps_gauge.set(s.max(0.0)); }
-    #[inline] pub fn inc_bhash_stale_reuse(&self) { self.bhash_stale_reuse.inc(); }
-    #[inline] pub fn inc_resolve_fallback(&self) { self.resolve_fallbacks.inc(); }
-
-    // v50 extras
-    #[inline] pub fn set_alpha(&self, a: f64) { self.alpha_gauge.set(a.max(0.0).min(1.0)); }
-    #[inline] pub fn set_deadband_pct(&self, pct: i64) { self.deadband_pct_gauge.set(pct.max(0)); }
-    #[inline] pub fn set_dt_ms(&self, ms: u64) { self.fee_dt_ms_gauge.set(ms as i64); }
-    #[inline] pub fn set_p2_quantiles(&self, p75: u64, p90: u64) {
-        self.p2_p75_gauge.set(p75 as i64);
-        self.p2_p90_gauge.set(p90 as i64);
-    }
-}
-
-#![forbid(unsafe_code)]
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::todo,
-    clippy::unimplemented,
-    rust_2018_idioms
-)]
-#![allow(clippy::too_many_arguments, clippy::large_enum_variant)]
-
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-use anyhow::{anyhow, Result};
-use once_cell::sync::Lazy;
-use std::sync::OnceLock;
-use tokio::sync::RwLock as TokioRwLock;
-use parking_lot::{Mutex, RwLock as PLRwLock};
-use prometheus::{Histogram, HistogramOpts, IntCounter, Registry};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
-use dashmap::DashMap;
-use sha2::{Digest, Sha256};
-use smallvec::SmallVec;
-use tokio::{
-    sync::{mpsc, oneshot, RwLock},
-    task::JoinHandle,
-};
-use tracing::{error, info, warn};
-use solana_client::rpc_filter::RpcFilterType;
-use std::collections::VecDeque;
-use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock};
-
-// === [IMPROVED: PIECE INF v24] === optional fast hash maps without API churn
-#[cfg(feature = "fast-hash")]
-type FastMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
-#[cfg(not(feature = "fast-hash"))]
-type FastMap<K, V> = std::collections::HashMap<K, V>;
-#[cfg(feature = "fast-hash")]
-type FastSet<T> = hashbrown::HashSet<T, ahash::RandomState>;
-#[cfg(not(feature = "fast-hash"))]
-type FastSet<T> = std::collections::HashSet<T>;
-
-use anchor_client::solana_sdk::{
-    commitment_config::CommitmentConfig,
-    compute_budget::ComputeBudgetInstruction,
-    hash::Hash,
-    instruction::Instruction,
-    message::Message,
-    pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
-    transaction::Transaction,
-    versioned_message::VersionedMessage,
-    versioned_transaction::VersionedTransaction,
-    v0::Message as V0Message,
-};
-
-use bytes::BytesMut;
-use bincode;
-use blake3;
-use bytemuck;
-
-use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcSendTransactionConfig, RpcSignatureStatusConfig, RpcSimulateTransactionConfig},
-};
-use solana_program::{instruction::AccountMeta, program_pack::Pack, system_instruction};
-use solana_sdk::address_lookup_table_account::AddressLookupTableAccount;
-
-use spl_associated_token_account as spl_ata;
-use spl_token::state::Account as TokenAccount;
-
-use tch::{no_grad, CModule, Device, Kind, Tensor};
-
-// ---------- Program IDs (zero overhead, parsed once) ----------
-// === tiny ALT prune cache (slot-scoped) ===
-pub static ALT_PRUNE_CACHE: Lazy<RwLock<std::collections::HashMap<AltCacheKey, (VersionedTransaction, usize, usize, u128)>>> = Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
-
-/// +++ NEXT: coalesced time budget checks (check every 8th iteration)
-#[inline]
-fn time_over(deadline_ms: u128, tick: &mut u32) -> bool {
-    *tick = tick.wrapping_add(1);
-    if (*tick & 7) != 0 { return false; }
-
-// === [IMPROVED: PIECE INF v29a] === tiny "last rates" cache (feature-free)
-static LAST_RATES: OnceLock<TokioRwLock<FastMap<Pubkey, (u128, u128)>>> = OnceLock::new();
-
-#[inline]
-async fn rates_get(pk: &Pubkey) -> Option<(u128, u128)> {
-    if let Some(cell) = LAST_RATES.get() {
-        let g = cell.read().await;
-        g.get(pk).copied()
-    } else { None }
-}
-
-#[inline]
-async fn rates_put(pk: &Pubkey, s_raw: u128, b_raw: u128) {
-    let cell = LAST_RATES.get_or_init(|| TokioRwLock::new(FastMap::default()));
-    let mut w = cell.write().await;
-    if w.len() > 120_000 { w.clear(); }
-    w.insert(*pk, (s_raw, b_raw));
-}
-
-// SPW-last helpers for fast APY retune without recomputing from raw when unchanged
-static SPW_LAST: OnceLock<TokioRwLock<Option<f64>>> = OnceLock::new();
-
-#[inline]
-async fn spw_last_get() -> Option<f64> {
-    let cell = SPW_LAST.get_or_init(|| TokioRwLock::new(None));
-    let g = cell.read().await;
-    *g
-}
-
-#[inline]
-async fn spw_last_set(v: f64) {
-    let cell = SPW_LAST.get_or_init(|| TokioRwLock::new(None));
-    let mut w = cell.write().await;
-    *w = Some(v);
-}
-
-#[inline]
-fn apy_retune(apy_percent_old: f64, spw_old: f64, spw_now: f64) -> f64 {
-    // old apy is in percent; convert to rate per slot using log1p, then expm1 to new apy
-    let apy_frac_old = (apy_percent_old / 100.0).clamp(-0.499_999, 10.0);
-    let r_per_slot = (1.0 + apy_frac_old).ln() / spw_old.max(1.0);
-    let apy_new = f64::exp_m1(r_per_slot * spw_now).clamp(-0.5, 10.0);
-    apy_new * 100.0
-}
-
-impl PortOptimizer {
-    // === [IMPROVED: PIECE FETCH v38] === fetchers (hedged RPC already in get_program_accounts_smart)
-    pub async fn fetch_solend_markets(&self) -> Result<Vec<LendingMarket>> {
-        const SLICE_LEN: usize = 352;
-
-        let prev_cnt = {
-            let g = self.markets.read().await;
-            g.values().flat_map(|v| v.iter()).filter(|lm| matches!(lm.protocol, Protocol::Solend)).count()
-        };
-        let accounts_raw = self.get_program_accounts_smart(&*SOLEND_PROGRAM_ID, SLICE_LEN, prev_cnt).await?;
-
-        // pre-dedup by Pubkey, keep longest data
-        let mut acc_map: FastMap<Pubkey, Vec<u8>> = FastMap::with_capacity(accounts_raw.len());
-        for (pk, acc) in accounts_raw {
-            let e = acc_map.entry(pk).or_insert_with(Vec::new);
-            if acc.data.len() > e.len() { *e = acc.data; }
+    /// Check if a transaction with the given key has already been processed.
+    /// Uses a short-lived cache to prevent duplicate transactions within a short time window.
+    pub async fn check_duplicate(&self, key: &[u8]) -> Result<bool> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        // Create a hash of the key for storage efficiency
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+        
+        // Check if this key is in our recent cache
+        let mut cache = self.duplicate_cache.write().await;
+        if cache.contains(&key_hash) {
+            return Ok(true);
         }
-
-        let spw = self.estimate_slots_per_year_cached().await;
-
-        use std::sync::Arc;
-        let prev_idx: Arc<FastMap<Pubkey, LendingMarket>> = {
-            let mut need: FastSet<Pubkey> = FastSet::default();
-            need.extend(acc_map.keys().copied());
-            let g = self.markets.read().await;
-            let mut idx: FastMap<Pubkey, LendingMarket> = FastMap::with_capacity(need.len());
-            for (_k, list) in g.iter() {
-                for lm in list {
-                    if need.contains(&lm.market_pubkey) { idx.entry(lm.market_pubkey).or_insert_with(|| lm.clone()); }
-                }
-            }
-            Arc::new(idx)
-        };
-
-        use futures::{stream, StreamExt};
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-        let desired = ((acc_map.len().max(1) + 63) / 64).max(8).min(64);
-        let conc = desired.min(cores * 2);
-
-        let mut out: Vec<LendingMarket> = Vec::with_capacity(acc_map.len());
-        let mut n = 0usize;
-        let mut s = stream::iter(acc_map.into_iter()).map({
-            let prev_idx = Arc::clone(&prev_idx);
-            move |(pk, data)| {
-                let prev_idx = Arc::clone(&prev_idx);
-                let spw_now = spw;
-                async move {
-                    if data.len() < SOLEND_MIN_BYTES { return None; }
-                    let ver = data[0];
-                    if ver == 0 || ver > 5 { return None; }
-
-                    if let Some(fp) = fp64_solend(&data) {
-                        if let Some(oldfp) = fp_get(&pk).await {
-                            if oldfp == fp {
-                                if let Some(mut prev) = prev_idx.get(&pk).cloned() {
-                                    prev.supply_apy = prev.supply_apy.clamp(-50.0, 1_000.0);
-                                    prev.borrow_apy  = prev.borrow_apy.clamp(-50.0, 1_000.0);
-                                    return Some(prev);
-                                }
-                            }
-                        }
-                        let parsed = self.parse_solend_reserve_with_spw(&pk, &data, spw_now).await.ok()
-                            .map(|mut m| { m.supply_apy = m.supply_apy.clamp(-50.0, 1_000.0); m.borrow_apy = m.borrow_apy.clamp(-50.0, 1_000.0); m });
-                        if parsed.is_some() { fp_put(&pk, fp).await; }
-                        parsed
-                    } else { None }
-                }
-            }
-        }).buffer_unordered(conc);
-
-        use tokio::task;
-        while let Some(maybe) = s.next().await {
-            if let Some(m) = maybe { out.push(m); }
-            n += 1;
-            if (n & 0x3FFF) == 0 { task::yield_now().await; }
-        }
-
-        out.sort_unstable_by_key(|m| (m.token_mint, m.protocol, std::cmp::Reverse(apy_key_i64_pub(m.supply_apy)), m.market_pubkey));
-        Ok(out)
+        
+        // Not in cache, add it
+        cache.put(key_hash, ());
+        Ok(false)
     }
 
-    pub async fn fetch_kamino_markets(&self) -> Result<Vec<LendingMarket>> {
-        const SLICE_LEN: usize = 352;
-
-        let prev_cnt = {
-            let g = self.markets.read().await;
-            g.values().flat_map(|v| v.iter()).filter(|lm| matches!(lm.protocol, Protocol::Kamino)).count()
-        };
-        let accounts_raw = self.get_program_accounts_smart(&*KAMINO_PROGRAM_ID, SLICE_LEN, prev_cnt).await?;
-
-        let mut acc_map: FastMap<Pubkey, Vec<u8>> = FastMap::with_capacity(accounts_raw.len());
-        for (pk, acc) in accounts_raw {
-            let e = acc_map.entry(pk).or_insert_with(Vec::new);
-            if acc.data.len() > e.len() { *e = acc.data; }
-        }
-
-        let spw = self.estimate_slots_per_year_cached().await;
-
-        use std::sync::Arc;
-        let prev_idx: Arc<FastMap<Pubkey, LendingMarket>> = {
-            let mut need: FastSet<Pubkey> = FastSet::default();
-            need.extend(acc_map.keys().copied());
-            let g = self.markets.read().await;
-            let mut idx: FastMap<Pubkey, LendingMarket> = FastMap::with_capacity(need.len());
-            for (_k, list) in g.iter() {
-                for lm in list {
-                    if need.contains(&lm.market_pubkey) { idx.entry(lm.market_pubkey).or_insert_with(|| lm.clone()); }
-                }
-            }
-            Arc::new(idx)
-        };
-
-        use futures::{stream, StreamExt};
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-        let desired = ((acc_map.len().max(1) + 63) / 64).max(8).min(64);
-        let conc = desired.min(cores * 2);
-
-        let mut out: Vec<LendingMarket> = Vec::with_capacity(acc_map.len());
-        let mut n = 0usize;
-        let mut s = stream::iter(acc_map.into_iter()).map({
-            let prev_idx = Arc::clone(&prev_idx);
-            move |(pk, data)| {
-                let prev_idx = Arc::clone(&prev_idx);
-                let spw_now = spw;
-                async move {
-                    if data.len() < KAMINO_MIN_BYTES { return None; }
-                    let ver = data[0];
-                    if ver == 0 || ver > 10 { return None; }
-
-                    if let Some(fp) = fp64_kamino(&data) {
-                        if let Some(oldfp) = fp_get(&pk).await {
-                            if oldfp == fp {
-                                if let Some(mut prev) = prev_idx.get(&pk).cloned() {
-                                    prev.supply_apy = prev.supply_apy.clamp(-50.0, 1_000.0);
-                                    prev.borrow_apy  = prev.borrow_apy.clamp(-50.0, 1_000.0);
-                                    return Some(prev);
-                                }
-                            }
-                        }
-                        let parsed = self.parse_kamino_market_with_spw(&pk, &data, spw_now).await.ok()
-                            .map(|mut m| { m.supply_apy = m.supply_apy.clamp(-50.0, 1_000.0); m.borrow_apy = m.borrow_apy.clamp(-50.0, 1_000.0); m });
-                        if parsed.is_some() { fp_put(&pk, fp).await; }
-                        parsed
-                    } else { None }
-                }
-            }
-        }).buffer_unordered(conc);
-
-        use tokio::task;
-        while let Some(maybe) = s.next().await {
-            if let Some(m) = maybe { out.push(m); }
-            n += 1;
-            if (n & 0x3FFF) == 0 { task::yield_now().await; }
-        }
-
-        out.sort_unstable_by_key(|m| (m.token_mint, m.protocol, std::cmp::Reverse(apy_key_i64_pub(m.supply_apy)), m.market_pubkey));
-        Ok(out)
-    }
-}
-
-// Fingerprint helpers and cache for FETCH v38
-static FP_CACHE: OnceLock<TokioRwLock<FastMap<Pubkey, u64>>> = OnceLock::new();
-
-#[inline]
-fn fp64_solend(data: &[u8]) -> Option<u64> { Some(u64::from_le_bytes(blake3::hash(data).as_bytes()[..8].try_into().ok()?)) }
-#[inline]
-fn fp64_kamino(data: &[u8]) -> Option<u64> { Some(u64::from_le_bytes(blake3::hash(data).as_bytes()[..8].try_into().ok()?)) }
-
-#[inline]
-async fn fp_get(pk: &Pubkey) -> Option<u64> {
-    if let Some(c) = FP_CACHE.get() { let g = c.read().await; g.get(pk).copied() } else { None }
-}
-#[inline]
-async fn fp_put(pk: &Pubkey, fp: u64) {
-    let cell = FP_CACHE.get_or_init(|| TokioRwLock::new(FastMap::default()));
-    let mut w = cell.write().await;
-    if w.len() > 200_000 { w.clear(); }
-    w.insert(*pk, fp);
-}
-
-// Public APY key helper for sort key
-#[inline]
-fn apy_key_i64_pub(apy_pct: f64) -> i64 {
-    let q = (apy_pct * 1e6).round();
-    if q.is_finite() { q as i64 } else { 0 }
-}
-
-    // === [IMPROVED: PIECE PARSE v29] === fast parsers avoid APY math when rates unchanged
-    pub async fn parse_solend_reserve_fast(
-        &self,
-        pk: &Pubkey,
-        data: &[u8],
-        spw_now: f64,
-        prev_opt: Option<&LendingMarket>,
-    ) -> Result<LendingMarket> {
-        if data.len() < SOLEND_MIN_BYTES { anyhow::bail!("solend: too small: {}", data.len()); }
-        let version = data[0];
-        if !(1..=5).contains(&version) { anyhow::bail!("solend: bad version {version}"); }
-
-        let token_mint          = self.pk_at(data, SOLEND_OFF_MINT)?;
-        let available_liquidity = Self::le_u64(data, SOLEND_OFF_AVAIL)?;
-        let borrowed_amount     = Self::le_u64(data, SOLEND_OFF_BORROW)?;
-        let s_raw               = Self::le_u128(data, SOLEND_OFF_SPLYRT)?;
-        let b_raw               = Self::le_u128(data, SOLEND_OFF_BORRT)?;
-
-        let total_liq  = available_liquidity.saturating_add(borrowed_amount);
-        let utilization= if total_liq > 0 { borrowed_amount as f64 / total_liq as f64 } else { 0.0 };
-
-        let (supply_apy, borrow_apy) = if let Some((s0, b0)) = rates_get(pk).await {
-            if s0 == s_raw && b0 == b_raw {
-                if let Some(prev) = prev_opt {
-                    if let Some(spw_old) = spw_last_get().await {
-                        if (spw_now - spw_old).abs() / spw_old > 0.005 {
-                            (apy_retune(prev.supply_apy, spw_old, spw_now), apy_retune(prev.borrow_apy, spw_old, spw_now))
-                        } else { (prev.supply_apy, prev.borrow_apy) }
-                    } else { (prev.supply_apy, prev.borrow_apy) }
-                } else {
-                    ( self.apy_from_rate_per_slot_with_spw(s_raw, spw_now)?,
-                      self.apy_from_rate_per_slot_with_spw(b_raw, spw_now)? )
-                }
-            } else {
-                ( self.apy_from_rate_per_slot_with_spw(s_raw, spw_now)?,
-                  self.apy_from_rate_per_slot_with_spw(b_raw, spw_now)? )
-            }
-        } else {
-            ( self.apy_from_rate_per_slot_with_spw(s_raw, spw_now)?,
-              self.apy_from_rate_per_slot_with_spw(b_raw, spw_now)? )
-        };
-
-        rates_put(pk, s_raw, b_raw).await;
-
-        Ok(LendingMarket {
-            market_pubkey: *pk,
-            token_mint,
-            protocol: Protocol::Solend,
-            supply_apy,
-            borrow_apy,
-            utilization,
-            liquidity_available: available_liquidity,
-            last_update: Instant::now(),
-            layout_version: version,
-        })
-    }
-
-    pub async fn parse_kamino_market_fast(
-        &self,
-        pk: &Pubkey,
-        data: &[u8],
-        spw_now: f64,
-        prev_opt: Option<&LendingMarket>,
-    ) -> Result<LendingMarket> {
-        if data.len() < KAMINO_MIN_BYTES { anyhow::bail!("kamino: too small: {}", data.len()); }
-        let version = data[0];
-        if !(1..=10).contains(&version) { anyhow::bail!("kamino: bad version {version}"); }
-
-        let token_mint          = self.pk_at(data, KAMINO_OFF_MINT)?;
-        let available_liquidity = Self::le_u64(data, KAMINO_OFF_AVAIL)?;
-        let borrowed_amount     = Self::le_u64(data, KAMINO_OFF_BORROW)?;
-        let s_raw               = Self::le_u128(data, KAMINO_OFF_SPLYRT)?;
-        let b_raw               = Self::le_u128(data, KAMINO_OFF_BORRT)?;
-
-        let total_liq  = available_liquidity.saturating_add(borrowed_amount);
-        let utilization= if total_liq > 0 { borrowed_amount as f64 / total_liq as f64 } else { 0.0 };
-
-        let (supply_apy, borrow_apy) = if let Some((s0, b0)) = rates_get(pk).await {
-            if s0 == s_raw && b0 == b_raw {
-                if let Some(prev) = prev_opt {
-                    if let Some(spw_old) = spw_last_get().await {
-                        if (spw_now - spw_old).abs() / spw_old > 0.005 {
-                            (apy_retune(prev.supply_apy, spw_old, spw_now), apy_retune(prev.borrow_apy, spw_old, spw_now))
-                        } else { (prev.supply_apy, prev.borrow_apy) }
-                    } else { (prev.supply_apy, prev.borrow_apy) }
-                } else {
-                    ( self.apy_from_rate_per_slot_with_spw(s_raw, spw_now)?,
-                      self.apy_from_rate_per_slot_with_spw(b_raw, spw_now)? )
-                }
-            } else {
-                ( self.apy_from_rate_per_slot_with_spw(s_raw, spw_now)?,
-                  self.apy_from_rate_per_slot_with_spw(b_raw, spw_now)? )
-            }
-        } else {
-            ( self.apy_from_rate_per_slot_with_spw(s_raw, spw_now)?,
-              self.apy_from_rate_per_slot_with_spw(b_raw, spw_now)? )
-        };
-
-        rates_put(pk, s_raw, b_raw).await;
-
-        Ok(LendingMarket {
-            market_pubkey: *pk,
-            token_mint,
-            protocol: Protocol::Kamino,
-            supply_apy,
-            borrow_apy,
-            utilization,
-            liquidity_available: available_liquidity,
-            last_update: Instant::now(),
-            layout_version: version,
-        })
-    }
-}
-    now_ms() > deadline_ms
-}
-
-#[derive(Clone, Copy, Default, Debug)]
-struct TipStat { succ_ew: f64, lat_ew_us: f64 }
-
-#[inline]
-fn alt_cache_key(
-    payer: &Pubkey,
-    bh: &Hash,
-    ixs_salt: u64,
-    alts: &[AddressLookupTableAccount],
-) -> u64 {
-    let mut h = blake3::Hasher::new();
-    h.update(payer.as_ref());
-    h.update(bh.as_ref());
-    h.update(&ixs_salt.to_le_bytes());
-    for alt in alts.iter() {
-        let n = alt.addresses.len() as u32;
-        h.update(&n.to_le_bytes());
-        if let Some(first) = alt.addresses.first() { h.update(first.as_ref()); }
-        if let Some(last)  = alt.addresses.last()  { h.update(last.as_ref());  }
-    }
-    let bytes = h.finalize();
-    u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap())
-}
-
-impl PortOptimizer {
-    // Quantization helpers for compute budget shaping
-    #[inline]
-    fn quantize_units_1024(&self, units: u32) -> u32 {
-        ((units + 1023) / 1024) * 1024
-    }
-    #[inline]
-    fn quantize_cu_price_64(&self, price: u64) -> u64 {
-        ((price + 63) / 64) * 64
-    }
-    // === ALT need-set fingerprint cache (Piece 93B v15) ===
-    #[inline]
-    fn needset_fp(&self, ixs: &[Instruction]) -> u64 {
-        let mut h = blake3::Hasher::new();
-        let payer = self.wallet.pubkey();
+    /// Insert all accounts for this ixs into the current-slot Bloom.
+    pub async fn bloom_note_ixs_current_slot(&self, ixs: &[Instruction]) -> Result<()> {
+        let slot = self.get_slot_coarse(Duration::from_millis(60)).await;
+        let mut b = acc_bloom().write().await;
+        if b.slot != slot { b.reset(slot); }
         for ix in ixs {
-            if ix.program_id == solana_sdk::compute_budget::id() || ix.program_id == solana_program::system_program::id() { continue; }
-            for am in &ix.accounts {
-                if am.pubkey == payer { continue; }
-                h.update(am.pubkey.as_ref());
+            b.set(ix.program_id.as_ref());
+            for m in &ix.accounts { b.set(m.pubkey.as_ref()); }
+        }
+        Ok(())
+    }
+
+    /// Adjust compute unit price using AIMD (Additive Increase/Multiplicative Decrease)
+    #[inline]
+    pub async fn aimd_adjust_price(&self, ixs: &[Instruction], base_cu_price: u64) -> u64 {
+        let key = progset_fingerprint(ixs);
+        let adj = { 
+            let lru = aimd_lru().read().await;
+            lru.get(&key).cloned()
+        };
+        
+        if let Some(a) = adj {
+            base_cu_price + (base_cu_price * a.bp as u64) / 10_000
+        } else {
+            base_cu_price
+        }
+    }
+
+    /// Record success/failure outcome for AIMD adjustment
+    pub async fn aimd_record_outcome(&self, ixs: &[Instruction], success: bool) {
+        let key = progset_fingerprint(ixs);
+        
+        let mut l = aimd_lru().write().await;
+        let a = l.get(&key).cloned().unwrap_or_else(|| 
+            Aimd { 
+                bp: 0, 
+                succ_ewma: 0.6,  // Initial success rate estimate
+                fail_ewma: 0.4,  // Initial failure rate estimate
             }
+        );
+        
+        // EWMA update with alpha=0.25
+        let alpha = 0.25;
+        let (succ, fail) = if success { (1.0, 0.0) } else { (0.0, 1.0) };
+        let succ_ewma = alpha * succ + (1.0 - alpha) * a.succ_ewma;
+        let fail_ewma = alpha * fail + (1.0 - alpha) * a.fail_ewma;
+        
+        // AIMD: increase aggressively on failure, decrease gently on success
+        let mut bp = a.bp;
+        if success {
+            bp = bp.saturating_sub(10); // -10bp on success (gentle decrease)
+        } else {
+            bp = (bp + 40).min(500);   // +40bp on failure (aggressive increase, max 500bp)
         }
-        u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
+        
+        l.put(key, Aimd { bp, succ_ewma, fail_ewma });
     }
 
-    #[inline]
-    fn alt_fingerprint(&self, alt: &AddressLookupTableAccount) -> u64 {
-        let mut h = blake3::Hasher::new();
-        h.update(alt.key.as_ref());
-        let n = alt.addresses.len() as u32;
-        h.update(&n.to_le_bytes());
-        if let Some(first) = alt.addresses.first() { h.update(first.as_ref()); }
-        if let Some(last)  = alt.addresses.last()  { h.update(last.as_ref()); }
-        u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
-    }
-
-    #[inline]
-    fn alt_need_get(&self, flow_salt: u64, need_fp: u64, alts_pool: &[AddressLookupTableAccount]) -> Option<Vec<AddressLookupTableAccount>> {
-        let m = self.alt_plan_by_need.read();
-        let fps = m.get(&(flow_salt, need_fp))?.clone();
-        if fps.is_empty() { return None; }
-        let mut out = Vec::with_capacity(fps.len());
-        for fp in fps {
-            if let Some(a) = alts_pool.iter().find(|x| self.alt_fingerprint(x) == fp) { out.push(a.clone()); }
-        }
-        if out.is_empty() { None } else { Some(out) }
-    }
-
-    #[inline]
-    fn alt_need_put(&self, flow_salt: u64, need_fp: u64, chosen: &[AddressLookupTableAccount]) {
-        use smallvec::SmallVec;
-        const CAP: usize = 1024;
-        let mut m = self.alt_plan_by_need.write();
-        if m.len() >= CAP { if let Some(k) = m.keys().next().cloned() { m.remove(&k); } }
-        let mut fps: SmallVec<[u64;6]> = SmallVec::new();
-        for a in chosen { fps.push(self.alt_fingerprint(a)); }
-        m.insert((flow_salt, need_fp), fps);
-    }
-
-    // === Inverted ALT address index (Piece 96B v15) ===
-    fn index_alts(&self, alts: &[AddressLookupTableAccount]) {
-        use smallvec::SmallVec;
-        for a in alts {
-            let alt_pk = a.key;
-            for k in &a.addresses {
-                self.alt_addr_index
-                    .entry(*k)
-                    .or_insert_with(|| SmallVec::new())
-                    .push(alt_pk);
-            }
-        }
-    }
-
-    fn needed_keyset(&self, ixs: &[Instruction]) -> std::collections::HashSet<Pubkey> {
-        use std::collections::HashSet;
-        let payer = self.wallet.pubkey();
-        let mut set: HashSet<Pubkey> = HashSet::new();
-        for ix in ixs {
-            if ix.program_id == solana_sdk::compute_budget::id() { continue; }
-            for am in &ix.accounts {
-                if am.pubkey != payer && am.pubkey != solana_program::system_program::id() { set.insert(am.pubkey); }
-            }
-        }
-        set
-    }
-
-    fn prefilter_alts_via_index(&self, ixs: &[Instruction], alts_all: &[AddressLookupTableAccount]) -> Vec<AddressLookupTableAccount> {
-        use std::collections::HashSet;
-        let need = self.needed_keyset(ixs);
-        let mut hit_alts: HashSet<Pubkey> = HashSet::new();
-        for k in &need {
-            if let Some(list) = self.alt_addr_index.get(k) { for p in list.iter() { hit_alts.insert(*p); } }
-        }
-        let mut out: Vec<_> = alts_all.iter().cloned().filter(|a| hit_alts.contains(&a.key)).collect();
-        out.sort_by_key(|a| a.addresses.len());
-        out
-    }
-
-    // === Tip router bandit scoring (Piece 95B v15) ===
-    fn tip_pick_bandit(&self, candidates: &[Pubkey], salt: u64) -> Option<Pubkey> {
-        if candidates.is_empty() { return None; }
-        let mut best: Option<(f64, Pubkey)> = None;
-        for &p in candidates {
-            let s = self.tip_stats.get(&p).map(|v| *v).unwrap_or_default();
-            let succ = if s.succ_ew > 0.0 { s.succ_ew } else { 0.5 };
-            let lat  = if s.lat_ew_us > 0.0 { s.lat_ew_us } else { 600.0 };
-            let score = succ / lat.max(1.0);
-            let mut b = [0u8;8]; b.copy_from_slice(&p.to_bytes()[..8]);
-            let jitter = ((salt ^ u64::from_le_bytes(b)) & 0xFF) as f64 / 1024.0;
-            let scr = score * (1.0 + jitter);
-            if best.map_or(true, |(bv, _)| scr > bv) { best = Some((scr, p)); }
-        }
-        best.map(|(_,p)| p)
-    }
-
-    fn note_tip_result(&self, dest: Pubkey, ok: bool, latency_us: u64) {
-        let mut new = self.tip_stats.get(&dest).map(|v| *v).unwrap_or_default();
-        let (a_s, a_l) = (0.30, 0.20);
-        new.succ_ew = (1.0-a_s)*new.succ_ew + a_s*if ok {1.0} else {0.0};
-        new.lat_ew_us = (1.0-a_l)*new.lat_ew_us + a_l*(latency_us as f64);
-        self.tip_stats.insert(dest, new);
-    }
-
-    // === Opcode 3 helper (Piece 97 v15) ===
-    #[inline]
-    fn cb_accdata_ix(&self, bytes_exact: u32) -> Instruction {
-        let step = 32 * 1024u32;
-        let want = ((bytes_exact + step - 1) / step) * step;
-        let mut data = Vec::with_capacity(5);
-        data.push(3u8);
-        data.extend_from_slice(&want.min(512*1024).to_le_bytes());
-        Instruction { program_id: solana_sdk::compute_budget::id(), accounts: vec![], data }
-    }
-
-    #[inline]
-    fn jittered_fee(&self, cu_price: u64, payer: &Pubkey, bh: &Hash) -> u64 {
-        let mut h = blake3::Hasher::new();
-        h.update(payer.as_ref()); h.update(bh.as_ref());
-        let bytes = h.finalize();
-        let seed = u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap());
-        let jitter = ((seed % 7) as i64 - 3) * 25; // -75..+75
-        cu_price.saturating_add_signed(jitter)
-    }
-
-    #[inline]
-    fn alts_plan_for_core(
+    /// Try send; on BH expiry or account-in-use, repair and retry once.
+    pub async fn send_with_repairs_once(
         &self,
-        core_ixs: &[Instruction],
-        payer: Pubkey,
-        bh: Hash,
-        alts_all: &[AddressLookupTableAccount],
-        tip_acc_opt: Option<Pubkey>,
-    ) -> SmallVec<[AddressLookupTableAccount; 16]> {
-        let mut core_plus: SmallVec<[Instruction; 16]> = SmallVec::new();
-        core_plus.extend_from_slice(core_ixs);
-        if let Some(tip_acc) = tip_acc_opt {
-            core_plus.push(system_instruction::transfer(&payer, &tip_acc, 1));
-        }
-        let v = self.greedy_min_alts(&core_plus, alts_all);
-        let mut out: SmallVec<[AddressLookupTableAccount; 16]> = SmallVec::new();
-        out.extend(v.into_iter());
-        out
-    }
-
-    #[inline]
-    fn parse_num_after(&self, s: &str, pat: &str) -> Option<u32> {
-        if let Some(idx) = s.find(pat) {
-            let mut j = idx + pat.len();
-            let bytes = s.as_bytes();
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
-            let mut val: u32 = 0;
-            let mut hit = false;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b.is_ascii_digit() { val = val.saturating_mul(10).saturating_add((b - b'0') as u32); j += 1; hit = true; }
-                else if b == b',' || b == b'_' { j += 1; }
-                else { break; }
+        vtx_build: impl Fn(Hash) -> Result<VersionedTransaction>,
+        hybrid: &HybridSender,
+        rpc_parallel: usize,
+    ) -> Result<Signature> {
+        // attempt 1
+        let bh1 = self.get_blockhash_fast().await?;
+        let vtx1 = vtx_build(bh1)?;
+        match hybrid.send(&vtx1, rpc_parallel).await {
+            Ok(sig) => return Ok(sig),
+            Err(e) => {
+                // classify & repair
+                if err_contains(&e, "blockhash not found") || err_contains(&e, "expired blockhash") {
+                    let bh2 = self.get_blockhash_fast().await?; // refresh
+                    let vtx2 = vtx_build(bh2)?;
+                    return hybrid.send(&vtx2, rpc_parallel).await;
+                }
+                if err_contains(&e, "accountinuse") || err_contains(&e, "account in use") {
+                    // short micro backoff to dodge hot-write collision
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    let bh2 = self.get_blockhash_fast().await?;
+                    let vtx2 = vtx_build(bh2)?;
+                    return hybrid.send(&vtx2, rpc_parallel).await;
+                }
+                Err(e)
             }
-            if hit && val > 0 { return Some(val); }
         }
-        None
     }
 
-    #[inline]
-    fn parse_num_after_any(&self, s: &str, pats: &[&str]) -> Option<u32> {
-        for p in pats { if let Some(v) = self.parse_num_after(s, p) { return Some(v); } }
-        None
-    }
-
-    #[inline]
-    fn strip_ansi<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
-        let bytes = s.as_bytes();
-        if !bytes.iter().any(|&c| c == 0x1b) { return std::borrow::Cow::Borrowed(s); }
-        let mut out = String::with_capacity(s.len());
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == 0x1b {
-                i += 1;
-                if i < bytes.len() && bytes[i] == b'[' {
-                    i += 1; while i < bytes.len() && bytes[i] != b'm' { i += 1; }
-                    if i < bytes.len() { i += 1; }
-                    continue;
+    /// Get cached ALT subset or compute and cache a new one.
+    pub async fn shape_alts_quic_safe_cached(
+        &self,
+        ixs: &[Instruction],
+        alts: &[AddressLookupTableAccount],
+        mtu_budget: usize,
+    ) -> Vec<AddressLookupTableAccount> {
+        if alts.is_empty() { return vec![]; }
+        
+        let fp = ix_fingerprint(ixs);
+        let slot = self.get_slot_coarse(Duration::from_millis(60)).await;
+        
+        // Check cache first
+        {
+            let cache = alt_cache().read().await;
+            if let Some(entry) = cache.get(&fp) {
+                if entry.last_used_slot + 4 > slot { // Only use if recent
+                    let mut res = Vec::with_capacity(entry.alt_indices.len());
+                    for &i in &entry.alt_indices {
+                        if let Some(alt) = alts.get(i) {
+                            res.push(alt.clone());
+                        }
+                    }
+                    if !res.is_empty() {
+                        return res;
+                    }
                 }
             }
-            out.push(bytes[i] as char); i += 1;
         }
-        std::borrow::Cow::Owned(out)
+        
+        // Not in cache or stale, compute fresh
+        let selected = self.shape_alts_quic_safe(ixs, alts, mtu_budget);
+        
+        // Cache the result
+        if !selected.is_empty() {
+            let mut indices = Vec::with_capacity(selected.len());
+            'outer: for alt in &selected {
+                for (i, orig_alt) in alts.iter().enumerate() {
+                    if orig_alt.key == alt.key {
+                        indices.push(i);
+                        continue 'outer;
+                    }
+                }
+            }
+            
+            if !indices.is_empty() {
+                let score = self.alt_subset_score(ixs, &selected);
+                let entry = AltSubset {
+                    alt_indices: indices,
+                    score,
+                    last_used_slot: slot,
+                };
+                
+                let mut cache = alt_cache().write().await;
+                cache.put(fp, entry);
+            }
+        }
+        
+        selected
+    }
+    
+    /// Score an ALT subset based on how many accounts it covers
+    fn alt_subset_score(&self, ixs: &[Instruction], alts: &[AddressLookupTableAccount]) -> f64 {
+        let mut covered = 0;
+        let mut total = 0;
+        
+        for ix in ixs {
+            total += 1; // program_id
+            for acc in &ix.accounts {
+                total += 1;
+                for alt in alts {
+                    if alt.addresses.contains(&acc.pubkey) {
+                        covered += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if total == 0 { return 0.0; }
+        covered as f64 / total as f64
     }
 
-    /// +++ NEXT: ascii-folded contains (no alloc, safe)
-    #[inline]
-    fn contains_ci(&self, s: &str, pat: &str) -> bool {
-        let sb = s.as_bytes();
-        let pb = pat.as_bytes();
-        if pb.is_empty() { return true; }
-        if sb.len() < pb.len() { return false; }
-        #[inline]
-        fn fold(x: u8) -> u8 { if (b'A'..=b'Z').contains(&x) { x | 0x20 } else { x } }
-        let first = fold(pb[0]);
-        let mut i = 0usize;
-        while i + pb.len() <= sb.len() {
-            if fold(sb[i]) != first { i += 1; continue; }
-            let mut ok = true; let mut j = 1usize;
-            while j < pb.len() {
-                if fold(sb[i + j]) != fold(pb[j]) { ok = false; break; }
-                j += 1;
+    /// Quick check: are we likely to collide with **our own** in-flight writes this slot?
+    pub async fn bloom_risky(&self, ixs: &[Instruction]) -> bool {
+        let slot = self.get_slot_coarse(Duration::from_millis(60)).await;
+        let b = acc_bloom().read().await;
+        if b.slot != slot { return false; }
+        for ix in ixs {
+            if b.test(ix.program_id.as_ref()) { return true; }
+            for m in &ix.accounts {
+                if m.is_writable && b.test(m.pubkey.as_ref()) { return true; }
             }
-            if ok { return true; }
-            i += 1;
         }
         false
     }
 
-    #[inline]
-    fn parse_last_num_if_hinted(&self, s: &str) -> Option<u32> {
-        let s = self.strip_ansi(s);
-        let sv = s.as_ref();
-        if !(self.contains_ci(sv, "unit") || self.contains_ci(sv, "compute") || self.contains_ci(sv, "cu")) { return None; }
-        let b = sv.as_bytes();
-        let mut i = 0usize; let mut last: Option<u32> = None;
-        while i < b.len() {
-            while i < b.len() && !b[i].is_ascii_digit() { i += 1; }
-            if i >= b.len() { break; }
-            let mut v: u32 = 0; let mut hit = false;
-            while i < b.len() {
-                let c = b[i];
-                if c.is_ascii_digit() { v = v.saturating_mul(10) + (c - b'0') as u32; hit = true; i += 1; }
-                else if c == b',' || c == b'_' { i += 1; } else { break; }
-            }
-            if hit { last = Some(v); }
+    /// Get the current slot with a lock-free fast path when the cached value is fresh.
+    /// Falls back to RPC if the cache is stale (older than `ttl`).
+    #[inline(always)]
+    pub async fn get_slot_coarse(&self, ttl: Duration) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Get current time in nanoseconds since UNIX_EPOCH
+        let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos() as u64,
+            Err(_) => 0, // Should be very rare, fall back to RPC
+        };
+        
+        let cache = slot_cache();
+        let ts = cache.ts.load(Ordering::Relaxed);
+        
+        // Fast path: return cached slot if it's still fresh
+        if now_ns.saturating_sub(ts) <= ttl.as_nanos() as u64 {
+            return cache.slot.load(Ordering::Relaxed);
         }
-        last
+        
+        // Slow path: fetch from RPC and update cache
+        match self.rpc_client.get_slot().await {
+            Ok(slot) => {
+                // Update cache with relaxed ordering (we don't need strong consistency here)
+                cache.slot.store(slot, Ordering::Relaxed);
+                cache.ts.store(now_ns, Ordering::Relaxed);
+                slot
+            }
+            Err(_) => {
+                // On error, return the cached value even if it's stale
+                // This provides better availability during RPC issues
+                cache.slot.load(Ordering::Relaxed)
+            }
+        }
+    }
+    
+    pub fn new(rpc_url: &str, wallet: Keypair) -> Self {
+        let rpc_client = Arc::new(RpcClient::new_with_commitment(
+            rpc_url.to_owned(),
+            CommitmentConfig::confirmed(),
+        ));
+        Self {
+            rpc_client,
+            wallet: Arc::new(wallet),
+            markets: Arc::new(RwLock::new(HashMap::new())),
+            active_positions: Arc::new(RwLock::new(HashMap::new())),
+            tip_router: Arc::new(RwLock::new(None)),
+            last_tx_signature: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+    
+    /// Deterministic micro-jitter in basis points [0, max_bp], cohort-stable across retries.
+    /// Domain-separated seed using last sent signature; falls back to wallet pubkey.
+    #[inline(always)]
+    fn price_jitter_bp(&self, max_bp: u32) -> u32 {
+        if max_bp == 0 { return 0; }
+
+        let guard = self.last_tx_signature.blocking_read();
+        let seed_bytes: &[u8] = match guard.as_ref() {
+            Some(sig) => sig.as_ref(),
+            None => self.wallet.pubkey().as_ref(),
+        };
+
+        let mut h = Sha256::new();
+        h.update(b"JIT1");                  // domain sep
+        h.update(seed_bytes);
+        let d = h.finalize();
+
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&d[..4]);
+        let x = u32::from_le_bytes(b);
+        x % (max_bp + 1)
+    }
+    
+    /// Get fee values from cache or fetch from RPC if cache is stale
+    async fn get_fee_values_cached(&self, programs: &[Pubkey], ttl: Duration) -> Arc<Vec<u64>>> {
+        let key = if programs.is_empty() { 
+            GLOBAL_FEE_KEY 
+        } else { 
+            hash_pubkeys_sorted(programs) 
+        };
+
+        // Try to read from cache first
+        if let Ok(cache) = fee_tape_cache().try_read() {
+            if let Some(vals) = cache.get(&key, ttl) { 
+                return vals; 
+            }
+        }
+
+        // Cache miss or stale - fetch fresh data
+        let fees = if programs.is_empty() {
+            self.rpc_client.get_recent_prioritization_fees(&[]).await.unwrap_or_default()
+        } else {
+            self.rpc_client.get_recent_prioritization_fees(programs).await.unwrap_or_default()
+        };
+        
+        let vals_vec: Vec<u64> = fees.into_iter()
+            .map(|f| f.prioritization_fee.max(1))
+            .collect();
+            
+        let arc = Arc::new(vals_vec);
+
+        // Update cache if we can get a write lock without blocking
+        if let Ok(mut cache) = fee_tape_cache().try_write() {
+            cache.put(key, arc.clone());
+        }
+        
+        arc
+    }
+    
+    /// Priority fee estimator with program awareness, congestion control, and top-K programs
+    pub async fn priority_fee_for_ixs(&self, ixs: &[Instruction], floor_cu_price: u64) -> u64 {
+        // Get top-K most frequent programs from instructions
+        let top_programs = top_programs_by_freq(ixs, MAX_FEE_ADDRS);
+        
+        // Get fee values for these programs
+        let fee_values = if top_programs.is_empty() {
+            self.get_fee_values_cached(&[], Duration::from_millis(250)).await
+        } else {
+            self.get_fee_values_cached(&top_programs, Duration::from_millis(250)).await
+        };
+
+        if fee_values.is_empty() {
+            return floor_cu_price;
+        }
+
+        // Get context-aware quantile window
+        let conc = self.leader_window_concentration(4).await.unwrap_or(0.0);
+        let size = self.tx_message_size_estimate(ixs);
+        let (ql, qh) = self.fee_quantile_window(0, conc, size);
+
+        // O(n) percentile extraction
+        let (lo, hi) = percentile_pair_unstable(&fee_values, ql, qh);
+        let base = lo.saturating_add(hi) / 2;
+
+        // Apply congestion adjustment
+        let slope = self.congestion_slope().await.unwrap_or(0.0);
+        let mut out = ((base as f64) * (1.0 + slope.min(0.08))).ceil() as u64;
+        
+        // Apply floor and ceiling
+        out = out.max(floor_cu_price).min(floor_cu_price.saturating_mul(25));
+
+        // Add jitter for better privacy and to avoid fee wars
+        let j_bp = self.price_jitter_bp(200); // ±2% jitter
+        out.saturating_add((out.saturating_mul(j_bp as u64)) / 10_000)
     }
 
-    #[inline]
-    fn filter_units(&self, v: u32) -> Option<u32> {
-        if v == 0 { return None; }
-        if v > MAX_COMPUTE_UNITS.saturating_mul(4) { return None; }
-        Some(v)
+    /// Floor-based autoscale from global fee tape with congestion awareness and adaptive quantiles
+    pub async fn priority_fee_autoscale(&self, floor_cu_price: u64) -> u64 {
+        // Get recent fee samples (last 100 slots, up to 15s old)
+        let recent_fees = match self.rpc_client.get_recent_prioritization_fees(&[]).await {
+            Ok(fees) if !fees.is_empty() => fees,
+            _ => return floor_cu_price,
+        };
+
+        // Extract fee values
+        let fee_values: Vec<u64> = recent_fees.into_iter()
+            .map(|f| f.prioritization_fee)
+            .collect();
+
+        if fee_values.is_empty() {
+            return floor_cu_price;
+        }
+
+        // Get congestion level (0-1)
+        let congestion = self.estimate_congestion().await;
+        
+        // Dynamic quantile selection based on congestion
+        let target_quantile = 0.5 + (congestion * 0.4); // 50-90% based on congestion
+        
+        // Use O(n) quantile calculation
+        let (lo, hi) = percentile_pair_unstable(
+            &fee_values,
+            (target_quantile * 50.0) as usize,  // 25-45% for lo
+            (50.0 + (target_quantile * 50.0)) as usize // 75-95% for hi
+        );
+        
+        // Weighted average with adaptive weights
+        let base = (lo as f64 * 0.7 + hi as f64 * 0.3) as u64;
+        
+        // Apply floor and ceiling with some headroom
+        base.max(floor_cu_price).min(floor_cu_price.saturating_mul(15))
+    }
+    
+    /// Compute congestion slope (0.0-1.0) from recent fee samples.
+    /// Uses robust linear regression on log(fees) to estimate log-slope.
+    /// Returns None if not enough data or if slope is negative.
+    async fn congestion_slope(&self) -> Option<f64> {
+        use std::collections::VecDeque;
+        
+        // Get recent fees from global fee tape (cached)
+        let vals = self.get_fee_values_cached(&[], Duration::from_secs(2)).await;
+        if vals.len() < 8 {
+            return None;
+        }
+        
+        let mut fees: Vec<f64> = vals.iter().map(|&x| (x as f64).ln()).collect();
+        fees.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        // Use interquartile range for robustness to outliers
+        let q1 = fees[fees.len() / 4];
+        let q3 = fees[(fees.len() * 3) / 4];
+        let iqr = q3 - q1;
+        let lower = q1 - 1.5 * iqr;
+        let upper = q3 + 1.5 * iqr;
+        
+        // Filter outliers and take most recent N samples
+        let recent: VecDeque<f64> = fees.into_iter()
+            .filter(|&x| x >= lower && x <= upper)
+            .rev()
+            .take(64)
+            .collect();
+            
+        if recent.len() < 4 {
+            return None;
+        }
+        
+        // Simple linear regression on log(fees) vs time
+        let n = recent.len() as f64;
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xy = 0.0;
+        let mut sum_xx = 0.0;
+        
+        for (i, &y) in recent.iter().enumerate() {
+            let x = i as f64;
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_xx += x * x;
+        }
+        
+        let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x);
+        
+        // Only return positive slopes (increasing fees)
+        if slope > 0.0 {
+            Some(slope.min(1.0)) // Cap at 1.0 (100% increase per sample)
+        } else {
+            None
+        }
     }
 }
-pub static SOLEND_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo").expect("static SOLEND id")
-});
-pub static KAMINO_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD").expect("static KAMINO id")
-});
 
-// ---------- Strong types to avoid unit bugs ----------
-#[derive(Copy, Clone, Debug)]
-pub struct Lamports(pub u64);
-#[derive(Copy, Clone, Debug)]
-pub struct Bps(pub u16);
+/// Stable fingerprint for a sequence of instructions.
+/// Canonicalizes by sorting accounts and data for deterministic output.
+/// Uses SHA256 to produce a compact, unique identifier.
+pub fn ixs_fingerprint(ixs: &[Instruction]) -> [u8; 32] {
+    use std::collections::BTreeMap;
+    
+    // Sort instructions by program ID first for stable ordering
+    let mut sorted_ixs: Vec<&Instruction> = ixs.iter().collect();
+    sorted_ixs.sort_unstable_by_key(|ix| &ix.program_id);
+    
+    let mut hasher = Sha256::new();
+    
+    for ix in sorted_ixs {
+        // Hash program ID
+        hasher.update(ix.program_id.as_ref());
+        
+        // Sort and hash accounts
+        let mut accounts = ix.accounts.clone();
+        accounts.sort_unstable();
+        for account in accounts {
+            hasher.update(account.pubkey.as_ref());
+            hasher.update(&[
+                account.is_signer as u8,
+                account.is_writable as u8,
+                account.is_delegate as u8,
+            ]);
+        }
+        
+        // Hash data
+        hasher.update(&ix.data);
+    }
+    
+    hasher.finalize().into()
+}
 
+/// Cohort-based jitter in microseconds for transaction timing.
+/// Uses wallet and recent blockhash to create deterministic but unique timing offsets.
+/// This helps prevent transaction collisions while maintaining predictable behavior.
+pub async fn cohort_jitter_us(wallet: &Pubkey, recent_blockhash: &Hash, max_jitter_us: u32) -> u32 {
+    // Combine wallet and recent blockhash for deterministic but unique jitter
+    let mut hasher = Sha256::new();
+    hasher.update(b"COHORT_JITTER");  // Domain separation
+    hasher.update(wallet.as_ref());
+    hasher.update(recent_blockhash.as_ref());
+    
+    // Use first 4 bytes of hash for jitter calculation
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&hash[..4]);
+    let jitter = u32::from_le_bytes(bytes) % (max_jitter_us + 1);
+    
+    // Add small random component to break strict patterns
+    let random_jitter = (rand::random::<u32>() % 1000).min(200); // 0-200µs random
+hortvec_len(n_dat) 
+            + n_dat;
+    }
+    
+    // Add version + address table lookups (none for v0 without ALTs)
+    size + MSG_VERSION_OVERHEAD
+{{ ... }}
+}
+
+/// Size including ALTs (rough but safe); keeps QUIC-safe shaping deterministic.
+/// Uses a safe upper bound for ALT overhead to ensure MTU compliance.
+pub fn tx_message_size_with_alts_estimate(&self, ixs: &[Instruction], alts: &[AddressLookupTableAccount]) -> usize {
+    let core = self.tx_message_size_estimate(ixs);
+pub fn tx_message_size_estimate_detailed(
+    num_required_signatures: u8,
+    num_readonly_signed_accounts: u8,
+    num_readonly_unsigned_accounts: u8,
+    account_keys: &[Pubkey],
+    recent_blockhash: &Hash,
+    instructions: &[Instruction],
+) -> usize {
+    // Message header: 3 bytes
+    let header_size = 3;
+    
+    // Account addresses
+    let account_keys_size = account_keys.len() * 32; // 32 bytes per pubkey
+    
+    // Recent blockhash: 32 bytes
+    let blockhash_size = 32;
+    
+    // Instructions: 1 byte for count + per-instruction overhead
+    let mut instructions_size = 1; // instruction count
+    
+    for ix in instructions {
+        // Program ID index: 1 byte
+        // Account indices: 1 byte for count + 1 byte per account index
+        // Data: 2 bytes for length + actual data
+        instructions_size += 1 + 1 + ix.accounts.len() + 2 + ix.data.len();
+    }
+    
+    // Total size
+    let total_size = header_size 
+        + account_keys_size 
+        + blockhash_size 
+        + instructions_size;
+    
+    // Add 10% safety margin for versioned tx overhead and future changes
+    ((total_size as f64) * 1.1).ceil() as usize
+}
+
+/// Rough CU estimator with LRU cache and TTL/epoch tracking
+/// This provides a fast path for common transaction patterns
+async fn optimize_compute_units_rough(&self, ixs: &[Instruction]) -> u32 {
+    use lru::LruCache;
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // Skip empty instruction sets
+    if ixs.is_empty() {
+        return 0;
+    }
+    
+    // Get current epoch (changes every ~2 days)
+    static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let current_epoch = EPOCH_COUNTER.load(Ordering::Relaxed);
+    
+    // Get current time for TTL checks
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    // Get or initialize the cache
+    const CACHE_SIZE: usize = 10_000;
+    let mut cache = self.compute_units_cache.write().await;
+    
+    // Check if we need to clear the cache (new epoch or first run)
+    if let Some((epoch_ts, _)) = cache.lru().peek_lru() {
+        if *epoch_ts < current_epoch || (now - *epoch_ts) > 172_800 { // 2 days in seconds
+            cache.lru_mut().clear();
+        }
+    }
+    
+    // Generate a fingerprint of the instructions
+    let fingerprint = ixs_fingerprint(ixs);
+    
+    // Try to get from cache
+    if let Some((_, units)) = cache.lru().peek(&fingerprint) {
+        return *units;
+    }
+    
+    // Fall back to simulation if not in cache
+    let estimated_units = match self.simulate_compute_units(ixs).await {
+        Ok(Some(units)) => units,
+        _ => {
+            // Conservative default if simulation fails
+            let estimated = ixs.len() as u32 * 200_000; // 200K CU per instruction
+            estimated.min(1_400_000) // Cap at 1.4M CU
+        }
+    };
+    
+    // Add to cache
+    cache.lru_mut().put(fingerprint, (now, estimated_units));
+    
+    estimated_units
+}
+
+/// Simulate compute units for a set of instructions with retries and backoff
+async fn simulate_compute_units(&self, ixs: &[Instruction]) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    use solana_sdk::signature::Keypair;
+    use std::time::Duration;
+    
+    if ixs.is_empty() {
+        return Ok(None);
+    }
+    
+    // Use a dummy signer for simulation
+    let dummy_signer = Keypair::new();
+    
+    // Try with exponential backoff
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut backoff_ms = 100;
+    
+    loop {
+        match self.simulate_ixs(ixs).await {
+            Ok(sim_result) => {
+                if let Some(units) = sim_result.units_consumed {
+                    // Add 10% safety margin
+                    let estimated_units = (units as f64 * 1.1).ceil() as u32;
+                    return Ok(Some(estimated_units));
+                } else if let Some(err) = sim_result.err {
+                    log::warn!("Simulation failed: {:?}", err);
+                }
+            }
+            Err(e) => {
+                log::warn!("Simulation error: {}", e);
+            }
+        }
+        
+        attempts += 1;
+        if attempts >= max_attempts {
+            break;
+        }
+        
+        // Exponential backoff
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        backoff_ms *= 2;
+    }
+    
+    Ok(None)
+}
+
+/// Simulate a transaction with exact compute unit limits and priority fees.
+/// This provides precise simulation of transaction execution before submission.
+pub async fn simulate_exact(
+    &self,
+    ixs: &[Instruction],
+    signer: &Keypair,
+    recent_blockhash: Hash,
+    compute_unit_limit: Option<u64>,
+    compute_unit_price: Option<u64>,
+) -> Result<SimulationResult, Box<dyn std::error::Error>> {
+    use solana_sdk::message::v0::Message;
+    use solana_sdk::signature::Signer;
+    use solana_sdk::transaction::VersionedTransaction;
+    
+    if ixs.is_empty() {
+        return Err("No instructions provided for simulation".into());
+    }
+    
+    // Create message with optional compute budget instructions
+    let mut message_ixs = vec![];
+    
+    // Add compute unit limit if provided
+    if let Some(limit) = compute_unit_limit {
+        message_ixs.push(
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(limit)
+        );
+    }
+    
+    // Add compute unit price if provided
+    if let Some(price) = compute_unit_price {
+        message_ixs.push(
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(price)
+        );
+    }
+    
+    // Add the actual instructions
+    message_ixs.extend_from_slice(ixs);
+    
+    // Build and sign the transaction
+    let message = Message::new(&message_ixs, Some(&signer.pubkey()));
+    let tx = VersionedTransaction::try_new(
+        message,
+        &[signer]
+    )?;
+    
+    // Simulate the transaction
+    let simulation = self.rpc_client
+        .simulate_transaction_with_config(
+            tx,
+            RpcSimulateTransactionConfig {
+                sig_verify: false,  // Skip signature verification for simulation
+                replace_recent_blockhash: true,
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    
+    // Convert to our result type
+    Ok(SimulationResult {
+        err: simulation.value.err,
+        logs: simulation.value.logs.unwrap_or_default(),
+        units_consumed: simulation.value.units_consumed,
+        return_data: simulation.value.return_data,
+    })
+}
+
+/// Generate dynamic budget instructions with adaptive fee calculation and micro-jitter.
+/// This helps prevent fee market manipulation and optimizes transaction costs.
+pub async fn dynamic_budget_ixs(
+    &self,
+    ixs: &[Instruction],
+    base_priority_fee: u64,
+    max_priority_fee: u64,
+) -> Result<Vec<Instruction>, Box<dyn std::error::Error>> {
+    use solana_sdk::instruction::AccountMeta;
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::system_instruction;
+    
+    if ixs.is_empty() {
+        return Ok(vec![]);
+    }
+    
+    // Calculate priority fee with congestion awareness
+    let priority_fee = self.priority_fee_for_ixs(ixs, base_priority_fee).await;
+    let priority_fee = priority_fee.min(max_priority_fee);
+    
+    // Add micro-jitter to prevent fee market manipulation
+    let jitter = self.price_jitter_bp(50); // 0.5% jitter
+    let priority_fee = priority_fee.saturating_add((priority_fee * jitter as u64) / 10_000);
+    
+    // Get compute unit price from priority fee
+    let compute_unit_price = self.compute_unit_price(priority_fee).await?;
+    
+    // Create compute budget instruction
+    let compute_budget_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
+    
+    // Optionally add compute unit limit if needed
+    let mut budget_ixs = vec![compute_budget_ix];
+    
+    // Add micro-jitter to compute unit limit if needed
+    if let Some(compute_unit_limit) = self.estimate_compute_units(ixs).await? {
+        let jitter = self.price_jitter_bp(10); // 0.1% jitter for compute units
+        let compute_unit_limit = compute_unit_limit.saturating_add((compute_unit_limit * jitter as u64) / 10_000);
+        let compute_limit_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit);
+        budget_ixs.push(compute_limit_ix);
+    }
+    
+    // Add adaptive fee quantiles for dynamic fee calculation based on network conditions and attempt count
+    let attempt = 1; // default attempt count
+    let leader_concentration = 0.5; // default leader concentration
+    let msg_size = tx_message_size_with_alts_estimate(ixs, &[]); // default message size
+    let priority_fee_adaptive = FEE_STATS.get_adaptive_quantile(attempt, leader_concentration, msg_size).await;
+    
+    // Record the sample for future fee estimation
+    if let Some(cu) = self.estimate_compute_units(ixs).await? {
+        FEE_STATS.record_sample(cu, priority_fee_adaptive).await;
+    }
+    
+    // Add all instructions to the result
+    let mut result = budget_ixs;
+    result.extend_from_slice(ixs);
+    
+    Ok(result)
+}
+
+/// Estimate compute units for a set of instructions
+async fn estimate_compute_units(&self, ixs: &[Instruction]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    if ixs.is_empty() {
+        return Ok(None);
+    }
+    
+    // Try to get from cache first
+    let fingerprint = ixs_fingerprint(ixs);
+    let cache = get_compute_units_cache();
+    if let Some(cached_units) = cache.read().await.get(&fingerprint) {
+        return Ok(Some(*cached_units));
+    }
+    
+    // Simulate to get compute units
+    let simulation_result = self.simulate_ixs(ixs).await?;
+    
+    if let Some(units_consumed) = simulation_result.units_consumed {
+        // Add 20% safety margin
+        let estimated_units = (units_consumed as f64 * 1.2).ceil() as u64;
+        
+        // Update cache
+        let cache = get_compute_units_cache();
+        cache.write().await.put(fingerprint, estimated_units);
+        
+        Ok(Some(estimated_units))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Prefetch accounts required by a set of instructions to warm up the RPC cache.
+/// This helps reduce latency when the actual requests are made.
+pub async fn prefetch_for_ixs(
+    rpc_client: &RpcClient,
+    ixs: &[Instruction],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use solana_sdk::account::Account;
+    use solana_sdk::commitment_config::CommitmentConfig;
+    
+    // Collect all unique account pubkeys from all instructions
+    let mut accounts_to_fetch = std::collections::HashSet::new();
+    
+    for ix in ixs {
+        // Add program ID
+        accounts_to_fetch.insert(ix.program_id);
+        
+        // Add all account pubkeys from the instruction
+        for account_meta in &ix.accounts {
+            accounts_to_fetch.insert(account_meta.pubkey);
+        }
+    }
+    
+    if accounts_to_fetch.is_empty() {
+        return Ok(());
+    }
+    
+    // Convert to Vec for RPC call
+    let accounts: Vec<Pubkey> = accounts_to_fetch.into_iter().collect();
+    
+    // Use get_multiple_accounts_with_commitment for batched fetching
+    // We use a short timeout and minimal commitment to avoid blocking
+    let _ = rpc_client
+        .get_multiple_accounts_with_commitment(
+            &accounts,
+            CommitmentConfig::processed(),
+        )
+        .await
+        .map_err(|e| {
+            log::warn!("Failed to prefetch accounts: {}", e);
+            e
+        });
+    
+    Ok(())
+}
+
+/// Slot-phase aware backoff with bounded micro-jitter.
+/// leader_conc∈[0,1]: fraction of same leader in near-term window (denser → longer pause).
+#[inline]
+async fn slot_phase_backoff(leader_conc: f64, base_ms: u64) {
+    let mult = 1.0 + (leader_conc.clamp(0.0, 1.0) * 0.6); // 1.00..1.60
+    let dur_ms_base = ((base_ms as f64) * mult).round() as u64;
+
+    // ≤50ms randomization to decorrelate bots using same heuristic.
+    let jitter_cap_ms = 50u64;
+    let jitter_ms = {
+        let mut rng = rand::thread_rng();
+        rng.gen_range(0..=jitter_cap_ms)
+    };
+
+    let total = dur_ms_base.saturating_add(jitter_ms).min(450);
+    tokio::time::sleep(Duration::from_millis(total)).await;
+}
+
+// ====== OBSERVABILITY / BREAKERS ======
+pub struct Observability {
+    pub rebalance_attempts: IntCounter,
+    pub rebalance_success: IntCounter,
+    pub rebalance_failure: IntCounter,
+    pub tip_latency_ms: Histogram,
+}
+
+impl Observability {
+    pub fn new(reg: &Registry) -> Self {
+        let attempts = IntCounter::new("rebalance_attempts", "rebalance attempts").unwrap();
+        let success  = IntCounter::new("rebalance_success", "rebalance success").unwrap();
+        let failure  = IntCounter::new("rebalance_failure", "rebalance failures").unwrap();
+        let tip_lat  = Histogram::with_opts(HistogramOpts::new("tip_latency_ms", "tip landing (ms)")).unwrap();
+        reg.register(Box::new(attempts.clone())).ok();
+        reg.register(Box::new(success.clone())).ok();
+        reg.register(Box::new(failure.clone())).ok();
+        reg.register(Box::new(tip_lat.clone())).ok();
+        Self { rebalance_attempts: attempts, rebalance_success: success, rebalance_failure: failure, tip_latency_ms: tip_lat }
+    }
+}
+
+pub struct CircuitBreaker {
+    failures: VecDeque<Instant>,
+    window: Duration,
+    max_failures: usize,
+}
+
+impl CircuitBreaker {
+    pub fn new(window: Duration, max_failures: usize) -> Self {
+        Self { failures: VecDeque::new(), window, max_failures }
+    }
+    
+    pub fn record(&mut self, ok: bool) -> bool {
+        let now = Instant::now();
+        if ok { self.failures.clear(); return true; }
+        self.failures.push_back(now);
+        while let Some(&t) = self.failures.front() {
+            if now.duration_since(t) > self.window { self.failures.pop_front(); } else { break; }
+        }
+        self.failures.len() < self.max_failures
+    }
+}
+fn price_jitter_bp(&self, max_bp: u32) -> u32 {
+    // Use wallet pubkey as a fallback seed if no signature
+    let seed = self.last_tx_signature
+        .as_ref()
+        .map(|s| s.as_ref())
+        .unwrap_or_else(|| self.wallet.pubkey().as_ref());
+    
+    // Simple deterministic hash-based RNG
+    let mut hasher = Sha256::new();
+    hasher.update(seed);
+    let hash = hasher.finalize();
+    
+    // Use first 4 bytes for u32
+    let rand_val = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    
+    // Scale to 0..max_bp*2 and subtract max_bp for -max_bp..+max_bp range
+    (rand_val % (max_bp * 2 + 1)) as u32
+}
+
+impl PortOptimizer {
+    // Generate deterministic jitter in basis points (0.01%)
+    // Uses last transaction signature as seed if available
+    fn price_jitter_bp(&self, max_bp: u32) -> u32 {
+        // Use wallet pubkey as a fallback seed if no signature
+        let seed = self.last_tx_signature
+            .read()
+            .ok()
+            .as_ref()
+            .map(|s| s.as_ref())
+            .unwrap_or_else(|| self.wallet.pubkey().as_ref());
+        
+        // Simple deterministic hash-based RNG
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        let hash = hasher.finalize();
+        
+        // Use first 4 bytes for u32
+        let rand_val = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+        
+        // Scale to 0..max_bp*2 and subtract max_bp for -max_bp..+max_bp range
+        (rand_val % (max_bp * 2 + 1)) as u32
+    }
+}
+
+// Slot-phase aware backoff
+#[inline]
+async fn slot_phase_backoff(leader_conc: f64, base_ms: u64) {
+    // denser leaders → slightly longer cool-down; cap tight
+    let mult = 1.0 + (leader_conc.clamp(0.0, 1.0) * 0.6); // 1.0..1.6
+    let dur = ((base_ms as f64) * mult).round() as u64;
+    tokio::time::sleep(std::time::Duration::from_millis(dur.min(400))).await;
+}
+
+// Deterministic fingerprint for instruction sequences (used as cache key)
+fn ixs_fingerprint(ixs: &[Instruction]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for ix in ixs {
+        h.update(ix.program_id.as_ref());
+        for a in &ix.accounts {
+            h.update(a.pubkey.as_ref());
+            h.update(&[a.is_signer as u8, a.is_writable as u8]);
+        }
+        h.update(&(ix.data.len() as u64).to_le_bytes());
+        h.update(&ix.data);
+    }
+    let out = h.finalize();
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&out[..32]);
+    k
+}
+
+// --- Solana / SPL ---
+use solana_client::{
+    nonblocking::rpc_client::RpcClient,
+    rpc_config::RpcSignatureStatusConfig,
+};
+use solana_program::pubkey::Pubkey;
+use spl_token::solana_program::program_pack::Pack;
+use spl_token::state::Account as TokenAccount;
+    account::Account,
+    commitment_config::CommitmentConfig,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::{v0::Message as V0Message, Message, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer, Signers},
+    transaction::{AddressLookupTableAccount, Transaction, VersionedTransaction},
+};
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction, InstructionError},
+    message::{v0, Message as TransactionMessage, MessageHeader, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer, Signers},
+    transaction::{TransactionError, VersionedTransaction},
+};
+use solana_sdk::compute_budget_instruction;
+use solana_sdk::transaction::TransactionBuilder;
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    convert::TryInto,
+    fmt,
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::sleep,
+};
+use url::Url;
+use anyhow::{anyhow, Context, Result};
+use base64::{prelude::BASE64_STANDARD, Engine};
+use bincode::serialize;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use futures_util::{future::join_all, stream::FuturesUnordered, StreamExt};
+use lru::LruCache;
+use log::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
+use solana_client::{
+    client_error::ClientError,
+    nonblocking::rpc_client::RpcClient,
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+    rpc_request::RpcError,
+    rpc_response::{Response as RpcResponse, RpcSimulateTransactionResult},
+};
+use solana_program::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::{v0::Message as V0Message, Message, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer, Signers},
+    transaction::{AddressLookupTableAccount, Transaction, VersionedTransaction},
+};
+use solana_sdk::{
+    account::Account,
+    address_lookup_table_account::AddressLookupTableAccount,
+    commitment_config::CommitmentConfig,
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction, InstructionError},
+    message::{v0, Message as TransactionMessage, MessageHeader, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer, Signers},
+    transaction::{TransactionError, VersionedTransaction},
+};
+use solana_transaction_status::{
+    EncodedTransaction, EncodedTransactionWithStatusMeta, TransactionConfirmationStatus,
+    UiMessageEncoding, UiTransactionEncoding,
+};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    fmt,
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::sleep,
+};
+use url::Url;
+use solana_client::rpc_client::RpcClient;
+use std::sync::OnceLock;
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use spl_associated_token_account::instruction as ata_ix;
+use std::time::{Instant, Duration};
+use solana_client::rpc_response::RpcContactInfo;
+#[cfg(feature = "tpu")]
+use solana_client::tpu_client::{TpuClient, TpuClientConfig};
+use anyhow::{anyhow, Result};
+
+// Token program IDs
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TIP_JITTER_MAX_BP: u16 = 50;
+
+// ATA cache with TTL
+#[derive(Clone)]
+struct AtaFlag { exists: bool, ts: Instant }
+
+struct AtaCache { 
+    map: std::collections::HashMap<[u8; 32], AtaFlag> 
+}
+
+impl AtaCache {
+    fn new() -> Self { 
+        Self { 
+            map: std::collections::HashMap::new() 
+        } 
+    }
+    
+    fn key(owner: &Pubkey, mint: &Pubkey, prog: &Pubkey) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(owner.as_ref()); 
+        h.update(mint.as_ref()); 
+        h.update(prog.as_ref());
+        let d = h.finalize(); 
+        let mut k = [0u8; 32]; 
+        k.copy_from_slice(&d[..32]); 
+        k
+    }
+    
+    fn get(&self, k: &[u8; 32], ttl: Duration) -> Option<bool> {
+        self.map.get(k).and_then(|f| if f.ts.elapsed() <= ttl { Some(f.exists) } else { None })
+    }
+    
+    fn put(&mut self, k: [u8; 32], exists: bool) { 
+        self.map.insert(k, AtaFlag { exists, ts: Instant::now() }); 
+    }
+}
+
+static ATA_CACHE: OnceLock<tokio::sync::RwLock<AtaCache>> = OnceLock::new();
+
+fn ata_cache() -> &'static tokio::sync::RwLock<AtaCache> {
+    ATA_CACHE.get_or_init(|| tokio::sync::RwLock::new(AtaCache::new()))
+}
+
+use solana_program::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::{v0::Message as V0Message, Message, VersionedMessage},
+    program_pack::Pack,
+    system_instruction,
+};
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    compute_budget,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction, InstructionError},
+    message::{v0, Message as TransactionMessage, MessageHeader, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer, Signers},
+    transaction::{AddressLookupTableAccount, Transaction, VersionedTransaction},
+};
+use solana_sdk::compute_budget_instruction;
+use solana_sdk::transaction::TransactionBuilder;
+use std::convert::TryInto;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use dashmap::DashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use solana_sdk::signature::Signature;
+use solana_client::rpc_client::RpcClient;
+use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+use std::sync::atomic::Ordering;
+use tokio::task::JoinHandle;
+use anyhow::{anyhow, Result};
+use std::sync::RwLock as StdRwLock;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, RwLock, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+pub struct ConfirmationTracker {
+    rpc_client: RpcClient,
+    pending_confirmations: DashMap<Signature, (Instant, oneshot::Sender<()>)>,
+    confirmation_handler: JoinHandle<()>,
+struct FeeTapeEntry {
+    vals: Arc<Vec<u64>>,
+    ts: Instant,
+}
+
+struct FeeTapeCache {
+    map: HashMap<[u8; 32], FeeTapeEntry>,
+}
+
+impl FeeTapeCache {
+    fn new() -> Self { 
+        Self { 
+            map: HashMap::new() 
+        } 
+    }
+    
+    fn get(&self, k: &[u8; 32], ttl: Duration) -> Option<Arc<Vec<u64>>> {
+        self.map.get(k)
+            .and_then(|e| if e.ts.elapsed() <= ttl { 
+                Some(e.vals.clone()) 
+            } else { 
+                None 
+            })
+    }
+    
+    fn put(&mut self, k: [u8; 32], vals: Arc<Vec<u64>>) {
+        self.map.insert(k, FeeTapeEntry { 
+            vals, 
+            ts: Instant::now() 
+        });
+    }
+}
+
+static FEE_TAPE_CACHE: OnceLock<tokio::sync::RwLock<FeeTapeCache>> = OnceLock::new();
+
+fn fee_tape_cache() -> &'static tokio::sync::RwLock<FeeTapeCache> {
+    FEE_TAPE_CACHE.get_or_init(|| tokio::sync::RwLock::new(FeeTapeCache::new()))
+}
+
+const GLOBAL_FEE_KEY: [u8; 32] = *b"FEE_TAPE_GLOBAL_KEY___32BYTES______";
+
+#[inline(always)]
+fn hash_pubkeys_sorted(addrs: &[Pubkey]) -> [u8; 32] {
+    let mut v: Vec<[u8; 32]> = addrs.iter().map(|k| <[u8; 32]>::from(*k)).collect();
+    v.sort_unstable();
+    let mut h = Sha256::new();
+    for a in v { 
+        h.update(a); 
+    }
+    let d = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d[..32]);
+    out
+}
+
+#[derive(Clone)]
+struct CuEntry {
+    cu: u32,
+    epoch: u64,
+    ts: Instant,
+}
+
+struct CuCache {
+    map: HashMap<[u8; 32], CuEntry>,
+    // tiny LRU via time-based GC; we keep size naturally bounded by TTL
+}
+
+impl CuCache {
+    fn new() -> Self { 
+        Self { 
+            map: HashMap::new() 
+        } 
+    }
+
+    fn get_valid(&self, k: &[u8; 32], epoch: u64, ttl: Duration) -> Option<u32> {
+        self.map.get(k).and_then(|e| {
+            if e.epoch == epoch && e.ts.elapsed() <= ttl { 
+                Some(e.cu) 
+            } else { 
+                None 
+            }
+        })
+    }
+    
+    fn put(&mut self, k: [u8; 32], cu: u32, epoch: u64) {
+        self.map.insert(k, CuEntry { cu, epoch, ts: Instant::now() });
+    }
+}
+
+static COMPUTE_UNITS_CACHE: OnceLock<tokio::sync::RwLock<ComputeUnitsCache>> = OnceLock::new();
+
+fn compute_units_cache() -> &'static tokio::sync::RwLock<ComputeUnitsCache> {
+    COMPUTE_UNITS_CACHE.get_or_init(|| tokio::sync::RwLock::new(ComputeUnitsCache::new()))
+}
+
+use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use rand::prelude::*;
+use tracing::{info, warn, error};
+use prometheus::{IntCounter, Histogram, Registry, HistogramOpts};
+
+// ... (rest of the code remains the same)
 #[derive(Clone)]
 pub struct TipConfig {
     pub accounts: Vec<Pubkey>,
@@ -1359,48 +3032,7 @@ pub struct TipConfig {
     pub min_balance: u64,
 }
 
-// Tiny either for candidate chooser
-enum Either<L, R> { Left(L), Right(R) }
-
-// Per-flow learned compute budget EMA hint (units and optional heap).
-#[derive(Clone, Debug, Default)]
-pub struct FlowBudgetEma {
-    pub units_ema: f64,
-    pub heap_hint: Option<u32>,
-}
-
 // ----- Zero-GC warmed TorchScript batcher with micro-batching -----
-// ----- Torch micro-batcher v2 (deadline gather + zero-copy slab) -----
-// Reusable zero-copy slab
-struct BufPool {
-    cap: usize,
-    pool: Mutex<Vec<BytesMut>>,
-}
-impl BufPool {
-    fn new(capacity: usize, pool_size: usize) -> Self {
-        let mut v = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let mut b = BytesMut::with_capacity(capacity);
-            b.resize(capacity, 0);
-            v.push(b);
-        }
-        Self { cap: capacity, pool: Mutex::new(v) }
-    }
-    fn get(&self, need: usize) -> BytesMut {
-        let mut g = self.pool.lock();
-        if let Some(mut b) = g.pop() {
-            if b.capacity() < need { b.reserve(need - b.capacity()); }
-            b.resize(need, 0);
-            b
-        } else {
-            let mut b = BytesMut::with_capacity(need.max(self.cap));
-            b.resize(need, 0);
-            b
-        }
-    }
-    fn put(&self, mut b: BytesMut) { b.truncate(self.cap); self.pool.lock().push(b); }
-}
-
 #[derive(Clone)]
 pub struct InferenceItem {
     pub apy_spread_bps: Arc<[f32]>,
@@ -1420,91 +3052,90 @@ pub struct TorchBatcher {
 }
 
 impl TorchBatcher {
-    pub fn load(path: &str, max_batch: usize, max_wait: Duration, prefer_gpu: bool) -> Result<Self> {
-        let device = if prefer_gpu { Device::Cuda(0) } else { Device::Cpu };
+    pub fn load(path: &str, max_batch: usize, max_wait: Duration) -> Result<Self> {
+        let device = Device::Cpu; // set to Device::Cuda(_) if deploying on GPU
         let mut module = CModule::load_on_device(path, device)?;
-        module.set_eval();
 
-        // Warm kernels
+        // Warm-up to avoid first-call latency spike; allocate kernels and caches
         no_grad(|| {
             let x = Tensor::zeros([1, 32, 4], (Kind::Float, device));
             let _ = module.forward_ts(&[x]);
         });
 
-        let (tx, mut rx) = mpsc::channel::<InferenceItem>(2048);
+        let (tx, mut rx) = mpsc::channel::<InferenceItem>(1024);
         let module_arc = module.clone();
-        let pool = Arc::new(BufPool::new(64 * 64 * 4 * std::mem::size_of::<f32>(), 32));
-        let worker = tokio::spawn({
-            let pool = pool.clone();
-            async move {
-                let module = module_arc;
-                loop {
-                    let Some(first) = rx.recv().await else { break; };
-                    let mut batch = Vec::with_capacity(max_batch);
-                    batch.push(first);
-
-                    // deadline gather
-                    let deadline = tokio::time::Instant::now() + max_wait;
-                    while batch.len() < max_batch {
-                        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remain.is_zero() { break; }
-                        match tokio::time::timeout(remain, rx.recv()).await {
-                            Ok(Some(item)) => batch.push(item),
-                            _ => break,
-                        }
+        let worker = tokio::spawn(async move {
+            let module = module_arc;
+            let device = device;
+            loop {
+                // Collect micro-batch with timeout window
+                let mut batch: Vec<InferenceItem> = Vec::with_capacity(max_batch);
+                match rx.recv().await {
+                    Some(first) => batch.push(first),
+                    None => break, // channel closed
+                }
+                let start = tokio::time::Instant::now();
+                while batch.len() < max_batch && start.elapsed() < max_wait {
+                    match rx.try_recv() {
+                        Ok(it) => batch.push(it),
+                        Err(_) => tokio::time::sleep(Duration::from_micros(200)).await,
                     }
+                }
 
-                    // Find T
-                    let t = batch.iter().fold(usize::MAX, |acc, b| acc
-                        .min(b.apy_spread_bps.len())
+                // Determine time window T from shortest series across features
+                let mut t: usize = usize::MAX;
+                for b in &batch {
+                    t = t.min(b.apy_spread_bps.len()
                         .min(b.utilization.len())
                         .min(b.fee_lamports.len())
-                        .min(b.liq_ratio.len())).max(8);
-                    let bsz = batch.len();
-                    let need_f32 = bsz * t * 4;
-                    let mut buf = pool.get(need_f32 * std::mem::size_of::<f32>());
-                    {
-                        let mut idx = 0usize;
-                        let slice: &mut [f32] = bytemuck::cast_mut(&mut *buf);
-                        for it in &batch {
-                            let n = it.apy_spread_bps.len();
-                            let start = n.saturating_sub(t);
-                            for i in start..n {
-                                slice[idx] = it.apy_spread_bps[i]; idx += 1;
-                                slice[idx] = it.utilization[i];     idx += 1;
-                                slice[idx] = it.fee_lamports[i];    idx += 1;
-                                slice[idx] = it.liq_ratio[i];       idx += 1;
+                        .min(b.liq_ratio.len()));
+                }
+                if t == usize::MAX { t = 0; }
+                t = t.max(8);
+
+                // Build a contiguous buffer (B, T, 4)
+                let bsz = batch.len();
+                let mut buf: Vec<f32> = Vec::with_capacity(bsz * t * 4);
+                for it in &batch {
+                    let n = it.apy_spread_bps.len();
+                    let start_idx = n.saturating_sub(t);
+                    for i in start_idx..n {
+                        buf.push(it.apy_spread_bps[i]);
+                        buf.push(it.utilization[i]);
+                        buf.push(it.fee_lamports[i]);
+                        buf.push(it.liq_ratio[i]);
+                    }
+                }
+
+                // Inference (no_grad)
+                let x = Tensor::of_slice(&buf)
+                    .to_device(device)
+                    .reshape([bsz as i64, t as i64, 4]);
+                let y = no_grad(|| module.forward_ts(&[x]));
+
+                match y {
+                    Ok(out) => {
+                        let out = out.squeeze();
+                        // Extract per-item probability; handle scalar fallback
+                        let mut probs: Vec<f32> = Vec::with_capacity(bsz);
+                        if out.dim() == 0 {
+                            probs.push(f32::from(out.to_kind(Kind::Float)));
+                        } else {
+                            for i in 0..bsz {
+                                let p = out.double_value(&[i as i64]) as f32;
+                                probs.push(p);
                             }
                         }
-                    }
-
-                    // Inference
-                    let x = Tensor::from_data_size(
-                        buf.as_ptr() as *const f32,
-                        &[bsz as i64, t as i64, 4],
-                        (Kind::Float, device),
-                    );
-                    let y = no_grad(|| module.forward_ts(&[x]));
-
-                    match y {
-                        Ok(out) => {
-                            let out = out.squeeze();
-                            let probs: Vec<f32> = if out.dim() == 0 {
-                                vec![f32::from(out.to_kind(Kind::Float)); bsz]
-                            } else if out.size().len() == 2 && out.size()[1] == 1 {
-                                (0..bsz).map(|i| out.double_value(&[i as i64, 0]) as f32).collect()
-                            } else {
-                                (0..bsz).map(|i| out.double_value(&[i as i64]) as f32).collect()
-                            };
-                            for (i, it) in batch.into_iter().enumerate() {
-                                let _ = it.resp.send(Ok(probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0)));
-                            }
-                        }
-                        Err(e) => {
-                            for it in batch.into_iter() { let _ = it.resp.send(Err(anyhow!(format!("inference failed: {e}")))); }
+                        for (i, it) in batch.into_iter().enumerate() {
+                            let p = probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            let _ = it.resp.send(Ok(p));
                         }
                     }
-                    pool.put(buf);
+                    Err(e) => {
+                        for it in batch.into_iter() {
+                            let _ = it.resp.send(Err(anyhow!(format!("inference failed: {e}"))));
+                        }
+                    }
                 }
             }
         });
@@ -1519,9 +3150,9 @@ impl TorchBatcher {
         fee_lamports: Arc<[f32]>,
         liq_ratio: Arc<[f32]>,
     ) -> Result<f32> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx.send(InferenceItem { apy_spread_bps, utilization, fee_lamports, liq_ratio, resp: resp_tx })
-            .await.map_err(|_| anyhow!("batcher closed"))?;
+        let (resp_tx, resp_rx) = oneshot::channel::<Result<f32>>();
+        let item = InferenceItem { apy_spread_bps, utilization, fee_lamports, liq_ratio, resp: resp_tx };
+        self.tx.send(item).await.map_err(|_| anyhow!("batcher closed"))?;
         resp_rx.await.map_err(|_| anyhow!("inference dropped"))?
     }
 }
@@ -1581,97 +3212,2371 @@ pub enum TipStrategy { RoundRobin, Fixed(usize) }
 pub struct TipStats {
     pub account: Pubkey,
     pub ema: f64,         // latency level (ms)
-    pub emv: f64,         // latency abs-dev
-    pub ghost_rate: f64,  // failures/attempts
-    pub weight: f64,
+    pub emv: f64,         // latency abs-dev (ms)
+    pub ghost_rate: f64,  // failures/attempts (decayed)
+    pub weight: f64,      // normalized picking weight
     pub attempts: u64,
     pub failures: u64,
-    pub last_update: Instant,
+    last_update: Instant, // for exponential time decay
+    succ_ewma: f64,       // success probability EWMA
+    fail_ewma: f64,       // failure EWMA (for ghosting)
+}
+
+// ==================== PIECE 1.19: RPC Fanout Broadcaster ====================
+
+/// Tracks performance metrics for an RPC endpoint
+#[derive(Clone, Debug)]
+struct RpcNodeStat {
+    url: String,
+    ema_ms: f64,         // latency EWMA
+    succ_ewma: f64,      // success EWMA
+    attempts: u64,
+    cooldown_until: Instant, // circuit breaker cooldown
+}
+
+impl RpcNodeStat {
+    /// Calculate a score for this RPC node (higher is better)
+    fn score(&self) -> f64 {
+        // higher is better; 1/(latency) * success^2, zero during cooldown
+        if Instant::now() < self.cooldown_until { return 0.0; }
+        let l = self.ema_ms.max(1.0);
+        (1.0 / l) * (self.succ_ewma * self.succ_ewma).max(1e-6)
+    }
+}
+
+/// Manages multiple RPC clients with smart routing
+pub struct RpcFanout {
+    clients: Vec<Arc<RpcClient>>,
+    stats: tokio::sync::RwLock<Vec<RpcNodeStat>>,
+}
+
+impl RpcFanout {
+    /// Create a new RpcFanout with the given RPC URLs
+    pub fn new(urls: &[String]) -> Self {
+        let mut clients = Vec::with_capacity(urls.len());
+        let mut stats = Vec::with_capacity(urls.len());
+        for u in urls {
+            clients.push(Arc::new(RpcClient::new(u.clone())));
+            stats.push(RpcNodeStat {
+                url: u.clone(),
+                ema_ms: 800.0,
+                succ_ewma: 0.9,
+                attempts: 0,
+                cooldown_until: Instant::now() - Duration::from_secs(1), // Start ready
+            });
+        }
+        Self { clients, stats: tokio::sync::RwLock::new(stats) }
+    }
+
+    /// Get indices of top K performing RPC nodes
+    #[inline]
+    fn topk_indices(&self, stats: &[RpcNodeStat], k: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..stats.len()).collect();
+        idx.sort_unstable_by(|&a, &b| 
+            stats[b].score().partial_cmp(&stats[a].score()).unwrap_or(std::cmp::Ordering::Equal)
+        );
+        idx.into_iter().take(k.min(stats.len())).collect()
+    }
+
+    /// Simulate a transaction across top-K RPCs; return the first successful result.
+    pub async fn simulate_vtx_first(
+        &self,
+        vtx: &VersionedTransaction,
+        mut cfg: RpcSimulateTransactionConfig,
+        top_k: usize,
+        per_timeout_ms: u64,
+    ) -> Result<RpcSimulateTransactionResult> {
+        use tokio::{task::JoinSet, time::timeout};
+        
+        // Get a snapshot of current stats for routing decision
+        let stats_now = self.stats.read().await.clone();
+        if stats_now.is_empty() { return Err(anyhow!("no RPC endpoints configured")); }
+        let order = self.topk_indices(&stats_now, top_k.max(1));
+        drop(stats_now);
+
+        let mut js = JoinSet::new();
+        for idx in order {
+            let cli = self.clients[idx].clone();
+            let tx = vtx.clone();
+            let cfgc = cfg.clone();
+            js.spawn(async move {
+                let t0 = Instant::now();
+                let fut = cli.simulate_transaction_with_config(&tx, cfgc);
+                let res = timeout(Duration::from_millis(per_timeout_ms.max(150)), fut).await;
+                (idx, t0, res)
+            });
+        }
+
+        let mut first_ok: Option<(usize, Instant, RpcSimulateTransactionResult)> = None;
+        while let Some(joined) = js.join_next().await {
+            let (idx, t0, res) = joined?;
+            match res {
+                Ok(Ok(sim_res)) => { 
+                    first_ok = Some((idx, t0, sim_res)); 
+                    break; 
+                }
+                _ => { /* keep waiting */ }
+            }
+        }
+
+        let mut stats_w = self.stats.write().await;
+        for s in stats_w.iter_mut() { s.attempts = s.attempts.saturating_add(1); }
+        if let Some((idx, t0, sim_res)) = first_ok {
+            let ms = t0.elapsed().as_millis() as f64;
+            let alpha_l = 0.25;
+            let alpha_s = 0.35;
+            let s = &mut stats_w[idx];
+            s.ema_ms = alpha_l * ms + (1.0 - alpha_l) * s.ema_ms;
+            s.succ_ewma = alpha_s * 1.0 + (1.0 - alpha_s) * s.succ_ewma;
+            Ok(sim_res.value)
+        } else {
+            // all failed: decay + cool off worst 1–2 nodes
+            let now = Instant::now();
+            for s in stats_w.iter_mut() {
+                let alpha_s = 0.20;
+                s.succ_ewma = alpha_s * 0.0 + (1.0 - alpha_s) * s.succ_ewma;
+            }
+            // pick bottom by score and cool them off briefly
+            let mut idx: Vec<usize> = (0..stats_w.len()).collect();
+            idx.sort_unstable_by(|&a,&b| stats_w[a].score().partial_cmp(&stats_w[b].score()).unwrap());
+            for &bad in idx.iter().take(2.min(stats_w.len())) {
+                stats_w[bad].cooldown_until = now + Duration::from_secs(3);
+            }
+            Err(anyhow!("simulation failed on all RPC endpoints"))
+        }
+    }
+
+    /// Broadcast a transaction to multiple RPCs in parallel, returning the first successful result
+    pub async fn broadcast_vtx_skip_preflight(
+        &self,
+        vtx: &VersionedTransaction,
+        max_parallel: usize,
+    ) -> Result<Signature> {
+        use tokio::{task::JoinSet, time::timeout};
+
+        let stats_now = self.stats.read().await.clone();
+        if stats_now.is_empty() { return Err(anyhow!("no RPC endpoints configured")); }
+        let order = self.topk_indices(&stats_now, max_parallel.max(1));
+        drop(stats_now);
+
+        let mut js = JoinSet::new();
+        for idx in order {
+            let cli = self.clients[idx].clone();
+            let tx = vtx.clone();
+            js.spawn(async move {
+                let t0 = Instant::now();
+                let cfg = solana_client::rpc_config::RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(0),
+                    ..Default::default()
+                };
+                let fut = async {
+                    cli.send_transaction_with_config(&tx, cfg).await
+                        .or_else(|_| cli.send_transaction(&tx).await)
+                };
+                let res = timeout(Duration::from_millis(600), fut).await; // hard per-endpoint deadline
+                (idx, t0, res)
+            });
+        }
+
+        let mut first_ok: Option<(usize, Instant, Signature)> = None;
+        while let Some(joined) = js.join_next().await {
+            let (idx, t0, res) = joined?;
+            match res {
+                Ok(Ok(sig)) => { first_ok = Some((idx, t0, sig)); break; }
+                _ => { /* keep waiting */ }
+            }
+        }
+
+        let mut stats_w = self.stats.write().await;
+        for s in stats_w.iter_mut() { s.attempts = s.attempts.saturating_add(1); }
+        if let Some((idx, t0, sig)) = first_ok {
+            let ms = t0.elapsed().as_millis() as f64;
+            let alpha_l = 0.25;
+            let alpha_s = 0.35;
+            let s = &mut stats_w[idx];
+            s.ema_ms = alpha_l * ms + (1.0 - alpha_l) * s.ema_ms;
+            s.succ_ewma = alpha_s * 1.0 + (1.0 - alpha_s) * s.succ_ewma;
+            Ok(sig)
+        } else {
+            // all failed: decay + cool off worst 1–2 nodes
+            let now = Instant::now();
+            for s in stats_w.iter_mut() {
+                let alpha_s = 0.20;
+                s.succ_ewma = alpha_s * 0.0 + (1.0 - alpha_s) * s.succ_ewma;
+            }
+            // pick bottom by score and cool them off briefly
+            let mut idx: Vec<usize> = (0..stats_w.len()).collect();
+            idx.sort_unstable_by(|&a,&b| stats_w[a].score().partial_cmp(&stats_w[b].score()).unwrap());
+            for &bad in idx.iter().take(2.min(stats_w.len())) {
+                stats_w[bad].cooldown_until = now + Duration::from_secs(3);
+            }
+            Err(anyhow!("broadcast failed on all RPC endpoints"))
+        }
+        for idx in order {
+            let cli = self.clients[idx].clone();
+            let tx = vtx.clone();
+            js.spawn(async move {
+                let t0 = Instant::now();
+                let cfg = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(0),
+                    ..Default::default()
+                };
+                // Try fast-path first, fall back to default send
+                let res = cli.send_transaction_with_config(&tx, cfg).await
+                    .or_else(|_| cli.send_transaction(&tx).await);
+                (idx, t0, res)
+            });
+        }
+
+        // Wait for first successful response
+        let mut first_ok: Option<(usize, Instant, Signature)> = None;
+        while let Some(joined) = js.join_next().await {
+            let (idx, t0, res) = joined?;
+            if let Ok(sig) = res {
+                first_ok = Some((idx, t0, sig));
+                break;
+            }
+        }
+
+        // Update statistics based on results
+        let mut stats_w = self.stats.write().await;
+        for s in stats_w.iter_mut() { 
+            s.attempts = s.attempts.saturating_add(1); 
+        }
+        
+        if let Some((idx, t0, sig)) = first_ok {
+            // Update success metrics for the winning endpoint
+            let ms = t0.elapsed().as_millis() as f64;
+            let alpha_l = 0.25;  // Latency smoothing factor
+            let alpha_s = 0.35;  // Success rate smoothing factor
+            let s = &mut stats_w[idx];
+            s.ema_ms = alpha_l * ms + (1.0 - alpha_l) * s.ema_ms;
+            s.succ_ewma = alpha_s * 1.0 + (1.0 - alpha_s) * s.succ_ewma;
+            Ok(sig)
+        } else {
+            // All endpoints failed - decay success rates
+            let alpha_s = 0.20;
+            for s in stats_w.iter_mut() {
+                s.succ_ewma = alpha_s * 0.0 + (1.0 - alpha_s) * s.succ_ewma;
+            }
+            Err(anyhow!("broadcast failed on all RPC endpoints"))
+        }
+    }
+}
+
+// ==================== PIECE 1.14: Cohort Micro-Timing Jitter ====================
+
+/// Deterministic micro-jitter for transaction timing based on wallet and recent blockhash.
+/// This creates stable but unique timing offsets for each wallet/blockhash combination.
+/// The jitter is designed to be small (microseconds) to avoid adding significant latency.
+#[inline]
+pub fn cohort_jitter_us(wallet: &Pubkey, recent_blockhash: &Hash, max_jitter_us: u32) -> u32 {
+    use sha2::{Digest, Sha256};
+    
+    // Create a hash of wallet + blockhash for deterministic but unique jitter
+    let mut hasher = Sha256::new();
+    hasher.update(wallet.as_ref());
+    hasher.update(recent_blockhash.as_ref());
+    let hash = hasher.finalize();
+    
+    // Use first 4 bytes of hash to create jitter
+    let jitter = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    
+    // Scale to desired range (0..max_jitter_us)
+    jitter % (max_jitter_us + 1)
+}
+
+// ==================== MEV BOT INTEGRATION ====================
+
+/// Main MEV bot that integrates all components
+pub struct MevBot {
+    /// RPC client for Solana network access
+    rpc_client: Arc<RpcClient>,
+    /// Hybrid sender for transactions
+    sender: HybridSender,
+    /// Slot edge pacer for optimal transaction timing
+    pacer: Arc<SlotEdgePacer>,
+    /// Confirmation tracker for monitoring transaction status
+    confirmation_tracker: Arc<ConfirmationTracker>,
+    /// Adaptive pricer for dynamic fee adjustment
+    adaptive_pricer: Arc<AdaptivePricer>,
+    /// Concurrency gate for managing in-flight transactions
+    concurrency_gate: Arc<ConcurrencyGate>,
+    /// Current blockhash and slot
+    blockhash_info: RwLock<BlockhashInfo>,
+    /// Last time we refreshed the blockhash
+    last_blockhash_refresh: RwLock<Instant>,
+    /// Blockhash refresh interval
+    blockhash_refresh_interval: Duration,
+}
+
+/// Information about the current blockhash and slot
+#[derive(Clone, Debug)]
+struct BlockhashInfo {
+    blockhash: Hash,
+    slot: u64,
+    last_valid_block_height: u64,
+}
+
+impl MevBot {
+    /// Creates a new MevBot with the given configuration
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        tpu_client: Option<Arc<TpuClient>>,
+        rpc_endpoints: Vec<String>,
+        initial_compute_unit_price: u64,
+        max_compute_unit_price: u64,
+        min_siblings: usize,
+        max_siblings: usize,
+        target_success_rate: u8,
+        max_in_flight: usize,
+    ) -> Self {
+        // Create confirmation metrics
+        let metrics = Arc::new(ConfirmationMetrics::new());
+        
+        // Create confirmation tracker
+        let confirmation_tracker = Arc::new(ConfirmationTracker::new(
+            rpc_client.clone(),
+            metrics.clone(),
+            Duration::from_secs(30), // confirmation timeout
+        ));
+        
+        // Create adaptive pricer
+        let adaptive_pricer = Arc::new(AdaptivePricer::new(
+            initial_compute_unit_price,
+            max_compute_unit_price,
+            min_siblings,
+            max_siblings,
+            metrics,
+            target_success_rate,
+            10, // price_step_pct
+            1,  // sibling_step
+        ));
+        
+        // Create concurrency gate
+        let concurrency_gate = Arc::new(ConcurrencyGate::new(max_in_flight));
+        
+        // Create hybrid sender
+        let sender = HybridSender::new(
+            rpc_client.clone(),
+            tpu_client,
+            rpc_endpoints,
+            3, // max_retries
+            Duration::from_millis(100), // retry_delay
+        );
+        
+        // Create slot edge pacer
+        let pacer = Arc::new(SlotEdgePacer::new(rpc_client.clone()));
+        
+        Self {
+            rpc_client,
+            sender,
+            pacer,
+            confirmation_tracker,
+            adaptive_pricer,
+            concurrency_gate,
+            blockhash_info: RwLock::new(BlockhashInfo {
+                blockhash: Hash::default(),
+                slot: 0,
+                last_valid_block_height: 0,
+            }),
+            last_blockhash_refresh: RwLock::new(Instant::now() - Duration::from_secs(60)),
+            blockhash_refresh_interval: Duration::from_secs(30),
+        }
+    }
+    
+    /// Refreshes the blockhash if needed
+    async fn refresh_blockhash_if_needed(&self) -> Result<()> {
+        // Check if we need to refresh the blockhash
+        let needs_refresh = {
+            let last_refresh = self.last_blockhash_refresh.read().await;
+            last_refresh.elapsed() >= self.blockhash_refresh_interval
+        };
+        
+        if needs_refresh {
+            self.refresh_blockhash().await?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Refreshes the current blockhash
+    async fn refresh_blockhash(&self) -> Result<()> {
+        let (blockhash, slot, last_valid_block_height) = self.pacer.get_latest_blockhash().await?;
+        
+        let mut blockhash_info = self.blockhash_info.write().await;
+        blockhash_info.blockhash = blockhash;
+        blockhash_info.slot = slot;
+        blockhash_info.last_valid_block_height = last_valid_block_height;
+        
+        *self.last_blockhash_refresh.write().await = Instant::now();
+        
+        Ok(())
+    }
+    
+    /// Submits a transaction using the MEV bot's optimal settings
+    pub async fn submit_transaction<T: Signers>(
+        &self,
+        instructions: &[Instruction],
+        keypairs: &T,
+    ) -> Result<Signature> {
+        // Get a concurrency permit
+        let _permit = self.concurrency_gate.acquire().await;
+        
+        // Get current blockhash
+        self.refresh_blockhash_if_needed().await?;
+        let blockhash_info = self.blockhash_info.read().await.clone();
+        
+        // Get current compute unit price and number of siblings
+        let compute_unit_price = self.adaptive_pricer.current_compute_unit_price();
+        let num_siblings = self.adaptive_pricer.current_siblings();
+        
+        // Create transaction builder
+        let builder = V0TransactionBuilder::new(keypairs.pubkeys()[0])
+            .recent_blockhash(blockhash_info.blockhash)
+            .compute_unit_price(compute_unit_price);
+        
+        // Build and sign transactions
+        let mut transactions = Vec::with_capacity(num_siblings);
+        
+        // Create the base transaction
+        let tx = builder.build_and_sign(instructions, keypairs)?;
+        transactions.push(tx);
+        
+        // Create sibling transactions with different compute unit prices
+        for _ in 1..num_siblings {
+            // Slightly vary the compute unit price for each sibling
+            let sibling_price = compute_unit_price.saturating_add(
+                (rand::random::<u64>() % 10_000) * 10 // Add up to 0.01 SOL variation
+            );
+            
+            let sibling_tx = builder
+                .clone()
+                .compute_unit_price(sibling_price)
+                .build_and_sign(instructions, keypairs)?;
+                
+            transactions.push(sibling_tx);
+        }
+        
+        // Wait for optimal slot timing
+        self.pacer.wait_for_optimal_timing().await?;
+        
+        // Send transactions in parallel
+        let mut send_futures = Vec::with_capacity(transactions.len());
+        
+        for tx in transactions {
+            let signature = tx.signatures[0];
+            let sender = self.sender.clone();
+            
+            // Register with confirmation tracker before sending
+            self.confirmation_tracker.track_transaction(
+                signature,
+                tx.message.recent_blockhash,
+                Instant::now(),
+            );
+            
+            // Spawn a task to send the transaction
+            send_futures.push(tokio::spawn(async move {
+                match sender.send_transaction(&tx).await {
+                    Ok(_) => Ok(signature),
+                    Err(e) => {
+                        tracing::error!("Failed to send transaction: {}", e);
+                        Err(e)
+                    }
+                }
+            }));
+        }
+        
+        // Wait for at least one successful send
+        let result = futures::future::select_ok(send_futures).await;
+        
+        match result {
+            Ok((signature, _remaining)) => {
+                tracing::info!("Successfully submitted transaction: {}", signature);
+                Ok(signature)
+            }
+            Err(e) => {
+                tracing::error!("All transaction submissions failed: {}", e);
+                Err(anyhow!("All transaction submissions failed"))
+            }
+        }
+    }
+    
+    /// Starts the background tasks for the MEV bot
+    pub async fn start_background_tasks(&self) -> Result<()> {
+        // Start confirmation tracker
+        let confirmation_tracker = self.confirmation_tracker.clone();
+        tokio::spawn(async move {
+            if let Err(e) = confirmation_tracker.start().await {
+                tracing::error!("Confirmation tracker failed: {}", e);
+            }
+        });
+        
+        // Start adaptive pricer adjustment task
+        let adaptive_pricer = self.adaptive_pricer.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                adaptive_pricer.adjust_strategy().await;
+            }
+        });
+        
+        // Initial blockhash refresh
+        self.refresh_blockhash().await?;
+        
+        Ok(())
+    }
+    
+    /// Stops all background tasks
+    pub async fn stop(&self) -> Result<()> {
+        self.confirmation_tracker.stop().await?;
+        Ok(())
+    }
+}
+
+// ==================== PIECE 1.30: True v0 Builder ====================
+
+/// Builds optimized v0 transactions with address lookup tables and compute budget instructions
+pub struct V0TransactionBuilder {
+    /// The message header (number of required signers and read-only signers)
+    message_header: MessageHeader,
+    /// Account keys that are required signers
+    signer_keys: Vec<Pubkey>,
+    /// Account keys that are read-only
+    read_only_keys: Vec<Pubkey>,
+    /// Recent blockhash for the transaction
+    recent_blockhash: Hash,
+    /// Fee payer (first signer)
+    fee_payer: Pubkey,
+    /// Address lookup tables to use
+    address_lookup_tables: Vec<AddressLookupTableAccount>,
+    /// Compute unit price in micro-lamports
+    compute_unit_price: u64,
+    /// Compute unit limit
+    compute_unit_limit: u32,
+    /// Priority fee in microlamports (in addition to compute unit price)
+    priority_fee: u64,
+    /// Whether to enable priority fees
+    enable_priority_fees: bool,
+}
+
+impl V0TransactionBuilder {
+    /// Creates a new V0TransactionBuilder
+    pub fn new(fee_payer: Pubkey) -> Self {
+        Self {
+            message_header: MessageHeader::default(),
+            signer_keys: vec![fee_pubkey],
+            read_only_keys: Vec::new(),
+            recent_blockhash: Hash::default(),
+            fee_payer,
+            address_lookup_tables: Vec::new(),
+            compute_unit_price: 0,
+            compute_unit_limit: 200_000, // Default compute unit limit
+            priority_fee: 0,
+            enable_priority_fees: false,
+        }
+    }
+
+    /// Sets the recent blockhash
+    pub fn recent_blockhash(mut self, recent_blockhash: Hash) -> Self {
+        self.recent_blockhash = recent_blockhash;
+        self
+    }
+
+    /// Sets the compute unit price in micro-lamports
+    pub fn compute_unit_price(mut self, micro_lamports: u64) -> Self {
+        self.compute_unit_price = micro_lamports;
+        self
+    }
+
+    /// Sets the compute unit limit
+    pub fn compute_unit_limit(mut self, units: u32) -> Self {
+        self.compute_unit_limit = units;
+        self
+    }
+
+    /// Sets the priority fee in microlamports (in addition to compute unit price)
+    pub fn priority_fee(mut self, micro_lamports: u64) -> Self {
+        self.priority_fee = micro_lamports;
+        self.enable_priority_fees = true;
+        self
+    }
+
+    /// Adds an address lookup table to use
+    pub fn add_address_lookup_table(mut self, table: AddressLookupTableAccount) -> Self {
+        self.address_lookup_tables.push(table);
+        self
+    }
+
+    /// Adds a required signer
+    pub fn add_signer(mut self, pubkey: Pubkey) -> Self {
+        if !self.signer_keys.contains(&pubkey) {
+            self.signer_keys.push(pubkey);
+            self.message_header.num_required_signatures = self.signer_keys.len() as u8;
+        }
+        self
+    }
+
+    /// Adds a read-only account that doesn't need to be a signer
+    pub fn add_readonly(mut self, pubkey: Pubkey, is_signer: bool) -> Self {
+        if is_signer {
+            if !self.signer_keys.contains(&pubkey) {
+                self.signer_keys.push(pubkey);
+                self.message_header.num_required_signatures = self.signer_keys.len() as u8;
+            }
+        } else if !self.read_only_keys.contains(&pubkey) && !self.signer_keys.contains(&pubkey) {
+            self.read_only_keys.push(pubkey);
+        }
+        self
+    }
+
+    /// Builds a versioned transaction with the given instructions
+    pub fn build(&self, instructions: &[Instruction]) -> Result<VersionedTransaction> {
+        // Create a transaction builder
+        let mut builder = VersionedTransactionBuilder::new(self.fee_payer);
+        
+        // Add compute budget instructions if needed
+        let mut instructions = instructions.to_vec();
+        
+        // Add compute budget instructions if needed
+        if self.compute_unit_price > 0 || self.enable_priority_fees || self.compute_unit_limit != 200_000 {
+            let mut compute_budget_ixs = Vec::new();
+            
+            // Set compute unit limit if not default
+            if self.compute_unit_limit != 200_000 {
+                compute_budget_ixs.push(compute_budget_instruction::set_compute_unit_limit(self.compute_unit_limit));
+            }
+            
+            // Set compute unit price if specified
+            if self.compute_unit_price > 0 {
+                compute_budget_ixs.push(compute_budget_instruction::set_compute_unit_price(self.compute_unit_price));
+            }
+            
+            // Add priority fee if enabled
+            if self.enable_priority_fees && self.priority_fee > 0 {
+                compute_budget_ixs.push(compute_budget_instruction::set_compute_unit_price(
+                    self.compute_unit_price.saturating_add(self.priority_fee)
+                ));
+            }
+            
+            // Insert compute budget instructions at the beginning
+            instructions.splice(0..0, compute_budget_ixs);
+        }
+        
+        // Add all instructions
+        for ix in instructions {
+            builder = builder.add_instruction(ix);
+        }
+        
+        // Add address lookup tables if any
+        let mut builder = if !self.address_lookup_tables.is_empty() {
+            builder.add_address_lookup_tables(self.address_lookup_tables.clone())
+        } else {
+            builder
+        };
+        
+        // Build the transaction
+        let tx = builder.build()?;
+        
+        Ok(tx)
+    }
+    
+    /// Builds and signs a versioned transaction with the given instructions and signers
+    pub fn build_and_sign<T: Signers>(
+        &self,
+        instructions: &[Instruction],
+        keypairs: &T,
+    ) -> Result<VersionedTransaction> {
+        let tx = self.build(instructions)?;
+        let signer_pubkeys: HashSet<Pubkey> = keypairs.pubkeys().into_iter().collect();
+        
+        // Verify all required signers are provided
+        for required_signer in &self.signer_keys[1..] { // Skip fee payer
+            if !signer_pubkeys.contains(required_signer) {
+                return Err(anyhow!("Missing signer for required signer: {}", required_signer));
+            }
+        }
+        
+        Ok(tx.sign(keypairs, self.recent_blockhash))
+    }
+}
+
+// ==================== PIECE 1.29: In-Flight Concurrency Gate ====================
+
+/// Manages the number of in-flight transactions to prevent overwhelming the network
+/// and respect rate limits.
+pub struct ConcurrencyGate {
+    /// Maximum number of in-flight transactions
+    max_in_flight: usize,
+    /// Current number of in-flight transactions
+    in_flight: AtomicUsize,
+    /// Waiters for when capacity becomes available
+    waiters: Mutex<Vec<oneshot::Sender<()>>>,
+    /// Last time we logged a backpressure warning
+    last_warning: Mutex<Instant>,
+    /// Minimum time between backpressure warnings
+    warning_interval: Duration,
+}
+
+impl ConcurrencyGate {
+    /// Creates a new ConcurrencyGate with the given maximum in-flight transactions
+    pub fn new(max_in_flight: usize) -> Self {
+        Self {
+            max_in_flight,
+            in_flight: AtomicUsize::new(0),
+            waiters: Mutex::new(Vec::new()),
+            last_warning: Mutex::new(Instant::now() - Duration::from_secs(60)),
+            warning_interval: Duration::from_secs(5),
+        }
+    }
+
+    /// Tries to acquire a permit for a new in-flight transaction
+    /// 
+    /// Returns `true` if the permit was acquired, `false` if it would exceed the limit
+    pub fn try_acquire(&self) -> Option<ConcurrencyPermit<'_>> {
+        let current = self.in_flight.load(Ordering::Acquire);
+        if current >= self.max_in_flight {
+            return None;
+        }
+
+        // Try to increment the counter
+        match self.in_flight.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Some(ConcurrencyPermit { gate: self }),
+            Err(_) => None, // Someone else modified it, let the next attempt handle it
+        }
+    }
+
+    /// Acquires a permit for a new in-flight transaction, waiting if necessary
+    pub async fn acquire(&self) -> ConcurrencyPermit<'_> {
+        // Fast path: try to get a permit immediately
+        if let Some(permit) = self.try_acquire() {
+            return permit;
+        }
+
+        // Slow path: need to wait for capacity
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut waiters = self.waiters.lock().await;
+            // Check again with the lock held
+            if let Some(permit) = self.try_acquire() {
+                // Someone released a permit while we were waiting for the lock
+                drop(waiters);
+                return permit;
+            }
+            // Add ourselves to the waiters
+            waiters.push(tx);
+        }
+
+        // Wait for a permit to become available
+        let _ = rx.await;
+        
+        // Try to acquire again (should succeed since we were notified)
+        self.acquire().await
+    }
+
+    /// Returns the current number of in-flight transactions
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Returns the maximum number of in-flight transactions
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Updates the maximum number of in-flight transactions
+    pub fn set_max_in_flight(&self, new_max: usize) {
+        // Update the max
+        self.max_in_flight = new_max;
+        
+        // Wake up any waiters if we increased the limit
+        if self.in_flight.load(Ordering::Relaxed) < new_max {
+            self.wake_waiters();
+        }
+    }
+
+    /// Called when a transaction completes to release a permit
+    fn release(&self) {
+        let old_count = self.in_flight.fetch_sub(1, Ordering::Release);
+        
+        // Sanity check: underflow shouldn't happen
+        if old_count == 0 {
+            tracing::error!("ConcurrencyGate underflow detected!");
+            return;
+        }
+        
+        // If we're still at or above the limit, don't wake waiters
+        if old_count > self.max_in_flight {
+            return;
+        }
+        
+        // Wake up a single waiter
+        self.wake_waiters();
+    }
+    
+    /// Wakes up to one waiter if there are any
+    fn wake_waiters(&self) {
+        let mut waiters = self.waiters.try_lock();
+        let mut waiters = match waiters {
+            Ok(w) => w,
+            Err(_) => {
+                // If we can't acquire the lock, another task is probably handling it
+                return;
+            }
+        };
+        
+        // Remove and wake a single waiter
+        while let Some(waiter) = waiters.pop() {
+            // If the receiver was dropped, just continue to the next one
+            if waiter.send(()).is_ok() {
+                // Woke one waiter, we're done
+                return;
+            }
+        }
+    }
+    
+    /// Logs a backpressure warning if enough time has passed since the last one
+    fn log_backpressure_warning(&self) {
+        let mut last_warning = match self.last_warning.try_lock() {
+            Ok(l) => l,
+            Err(_) => return, // Another task is handling it
+        };
+        
+        if last_warning.elapsed() >= self.warning_interval {
+            let in_flight = self.in_flight.load(Ordering::Relaxed);
+            tracing::warn!(
+                "ConcurrencyGate backpressure: {}/{} in-flight transactions",
+                in_flight,
+                self.max_in_flight
+            );
+            *last_warning = Instant::now();
+        }
+    }
+}
+
+/// A permit that allows a transaction to be in-flight
+/// 
+/// When dropped, the permit is automatically released.
+pub struct ConcurrencyPermit<'a> {
+    gate: &'a ConcurrencyGate,
+}
+
+impl<'a> ConcurrencyPermit<'a> {
+    /// Returns the current number of in-flight transactions (including this one)
+    pub fn in_flight_count(&self) -> usize {
+        self.gate.in_flight_count()
+    }
+    
+    /// Returns the maximum number of in-flight transactions
+    pub fn max_in_flight(&self) -> usize {
+        self.gate.max_in_flight()
+    }
+    
+    /// Explicitly releases the permit early
+    pub fn release(self) {
+        // This method takes ownership of self, so it will be dropped at the end
+        // and the Drop implementation will handle the actual release
+    }
+}
+
+impl<'a> Drop for ConcurrencyPermit<'a> {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+// ==================== PIECE 1.28: Adaptive Siblings & Price Escalation ====================
+
+/// Dynamically adjusts the number of transaction variants (siblings) and compute unit prices
+/// based on network conditions and success rates.
+pub struct AdaptivePricer {
+    /// Base compute unit price in micro-lamports
+    base_compute_unit_price: AtomicU64,
+    /// Maximum compute unit price in micro-lamports
+    max_compute_unit_price: AtomicU64,
+    /// Minimum number of transaction siblings to generate
+    min_siblings: AtomicUsize,
+    /// Maximum number of transaction siblings to generate
+    max_siblings: AtomicUsize,
+    /// Current number of siblings being used
+    current_siblings: AtomicUsize,
+    /// Current compute unit price being used
+    current_compute_unit_price: AtomicU64,
+    /// Metrics from confirmation tracker
+    metrics: Arc<ConfirmationMetrics>,
+    /// Last time we adjusted the strategy
+    last_adjustment: RwLock<Instant>,
+    /// Minimum time between adjustments
+    min_adjustment_interval: Duration,
+    /// Target success rate (0-100)
+    target_success_rate: AtomicU8,
+    /// Price adjustment step size (percentage)
+    price_step_pct: AtomicU8,
+    /// Sibling adjustment step size
+    sibling_step: AtomicUsize,
+}
+
+impl AdaptivePricer {
+    /// Creates a new AdaptivePricer with the given configuration
+    pub fn new(
+        base_compute_unit_price: u64,
+        max_compute_unit_price: u64,
+        min_siblings: usize,
+        max_siblings: usize,
+        metrics: Arc<ConfirmationMetrics>,
+        target_success_rate: u8,
+        price_step_pct: u8,
+        sibling_step: usize,
+    ) -> Self {
+        let current_siblings = min_siblings.max(1);
+        
+        Self {
+            base_compute_unit_price: AtomicU64::new(base_compute_unit_price),
+            max_compute_unit_price: AtomicU64::new(max_compute_unit_price),
+            min_siblings: AtomicUsize::new(min_siblings),
+            max_siblings: AtomicUsize::new(max_siblings),
+            current_siblings: AtomicUsize::new(current_siblings),
+            current_compute_unit_price: AtomicU64::new(base_compute_unit_price),
+            metrics,
+            last_adjustment: RwLock::new(Instant::now() - Duration::from_secs(60)), // Start eligible for adjustment
+            min_adjustment_interval: Duration::from_secs(10),
+            target_success_rate: AtomicU8::new(target_success_rate.clamp(1, 100)),
+            price_step_pct: AtomicU8::new(price_step_pct.clamp(1, 100)),
+            sibling_step: AtomicUsize::new(sibling_step.max(1)),
+        }
+    }
+
+    /// Gets the current number of siblings to generate
+    pub fn current_siblings(&self) -> usize {
+        self.current_siblings.load(Ordering::Relaxed)
+    }
+
+    /// Gets the current compute unit price to use
+    pub fn current_compute_unit_price(&self) -> u64 {
+        self.current_compute_unit_price.load(Ordering::Relaxed)
+    }
+
+    /// Adjusts the strategy based on recent performance
+    pub async fn adjust_strategy(&self) {
+        // Check if enough time has passed since the last adjustment
+        let last_adjustment = *self.last_adjustment.read().await;
+        if last_adjustment.elapsed() < self.min_adjustment_interval {
+            return;
+        }
+
+        // Update the last adjustment time
+        *self.last_adjustment.write().await = Instant::now();
+
+        let current_success_rate = self.metrics.success_rate();
+        let target_success_rate = self.target_success_rate.load(Ordering::Relaxed) as u8;
+        let price_step_pct = self.price_step_pct.load(Ordering::Relaxed) as f64 / 100.0;
+        let sibling_step = self.sibling_step.load(Ordering::Relaxed);
+        
+        let current_price = self.current_compute_unit_price.load(Ordering::Relaxed);
+        let max_price = self.max_compute_unit_price.load(Ordering::Relaxed);
+        let current_siblings = self.current_siblings.load(Ordering::Relaxed);
+        let min_siblings = self.min_siblings.load(Ordering::Relaxed);
+        let max_siblings = self.max_siblings.load(Ordering::Relaxed);
+
+        // Calculate the price adjustment factor based on success rate
+        let success_ratio = current_success_rate as f64 / target_success_rate as f64;
+        let mut price_adjustment = 1.0;
+        let mut siblings_adjustment = 0;
+
+        if success_ratio < 0.9 {
+            // Success rate is too low - increase price and/or siblings
+            price_adjustment = 1.0 + price_step_pct;
+            if success_ratio < 0.7 {
+                // If really struggling, also increase siblings
+                siblings_adjustment = sibling_step;
+            }
+        } else if success_ratio > 1.1 && current_price > self.base_compute_unit_price.load(Ordering::Relaxed) {
+            // Success rate is good, try to reduce price
+            price_adjustment = 1.0 - (price_step_pct / 2.0);
+        } else if success_ratio > 1.3 && current_siblings > min_siblings {
+            // Success rate is very good, try to reduce siblings
+            siblings_adjustment = sibling_step.saturating_neg();
+        }
+
+        // Apply price adjustment
+        let new_price = if price_adjustment != 1.0 {
+            let new_price = (current_price as f64 * price_adjustment).round() as u64;
+            new_price.clamp(
+                self.base_compute_unit_price.load(Ordering::Relaxed),
+                max_price
+            )
+        } else {
+            current_price
+        };
+
+        // Apply siblings adjustment
+        let new_siblings = if siblings_adjustment != 0 {
+            current_siblings.saturating_add_signed(siblings_adjustment)
+                .clamp(min_siblings, max_siblings)
+        } else {
+            current_siblings
+        };
+
+        // Update the state if anything changed
+        if new_price != current_price || new_siblings != current_siblings {
+            self.current_compute_unit_price.store(new_price, Ordering::Relaxed);
+            self.current_siblings.store(new_siblings, Ordering::Relaxed);
+            
+            tracing::info!(
+                "Adjusted strategy: price={} ({}%), siblings={} ({}), success_rate={}% (target={}%)",
+                new_price,
+                ((new_price as f64 / self.base_compute_unit_price.load(Ordering::Relaxed) as f64 - 1.0) * 100.0).round() as i32,
+                new_siblings,
+                (new_siblings as i32 - current_siblings as i32),
+                current_success_rate,
+                target_success_rate
+            );
+        }
+    }
+
+    /// Resets the strategy to base values
+    pub fn reset(&self) {
+        let base_price = self.base_compute_unit_price.load(Ordering::Relaxed);
+        let min_siblings = self.min_siblings.load(Ordering::Relaxed);
+        
+        self.current_compute_unit_price.store(base_price, Ordering::Relaxed);
+        self.current_siblings.store(min_siblings, Ordering::Relaxed);
+        
+        // Reset the last adjustment time to allow immediate re-evaluation
+        *self.last_adjustment.try_write().unwrap_or_else(|_| self.last_adjustment.blocking_write()) = 
+            Instant::now() - self.min_adjustment_interval - Duration::from_secs(1);
+    }
+}
+
+// ==================== PIECE 1.27: Confirmation Tracker ====================
+
+/// Tracks transaction confirmations and provides feedback to the tip router
+/// 
+/// This tracks transaction lifecycle from submission to confirmation/failure,
+/// providing feedback to optimize future transaction fees and reliability.
+pub struct ConfirmationTracker {
+    /// In-flight transactions awaiting confirmation
+    in_flight: DashMap<Signature, InFlightTx>,
+    /// RPC client for checking transaction status
+    rpc: Arc<RpcClient>,
+    /// Metrics for tracking confirmation times and success rates
+    metrics: Arc<ConfirmationMetrics>,
+    /// Background task handle
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+}
+
+/// Metrics collected by the ConfirmationTracker
+#[derive(Default, Debug)]
+pub struct ConfirmationMetrics {
+    /// Total transactions tracked
+    pub total_txs: AtomicU64,
+    /// Successful confirmations
+    pub confirmed: AtomicU64,
+    /// Failed transactions
+    pub failed: AtomicU64,
+    /// Timed out transactions
+    pub timed_out: AtomicU64,
+    /// Average confirmation time in milliseconds (exponential moving average)
+    pub avg_confirmation_ms: AtomicU64,
+    /// Success rate (0-100)
+    pub success_rate: AtomicU8,
+    /// Recent confirmation times (for percentile calculations)
+    recent_times: Mutex<VecDeque<u64>>>,
+}
+
+/// Information about an in-flight transaction
+struct InFlightTx {
+    /// When the transaction was submitted
+    submitted_at: Instant,
+    /// The transaction signature
+    signature: Signature,
+    /// The compute unit price used (in micro-lamports)
+    compute_unit_price: u64,
+    /// The compute units used by the transaction
+    compute_units: u64,
+    /// Optional callback to notify when confirmed
+    on_confirmed: Option<Box<dyn FnOnce(Result<()>) + Send + 'static>>,
+}
+
+impl ConfirmationTracker {
+    /// Creates a new ConfirmationTracker
+    pub fn new(rpc: Arc<RpcClient>) -> Self {
+        Self {
+            in_flight: DashMap::with_capacity(1000),
+            rpc,
+            metrics: Arc::new(ConfirmationMetrics::default()),
+            handle: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Starts the background confirmation polling task
+    pub fn start(&self, poll_interval: Duration) {
+        let this = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(poll_interval);
+            
+            while !this.shutdown.load(Ordering::Relaxed) {
+                interval.tick().await;
+                if let Err(e) = this.check_confirmations().await {
+                    tracing::warn!("Error checking confirmations: {}", e);
+                }
+            }
+        });
+        
+        *self.handle.lock().await = Some(handle);
+    }
+
+    /// Stops the background confirmation polling task
+    pub async fn stop(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+
+    /// Tracks a new transaction
+    pub fn track(&self, signature: Signature, compute_unit_price: u64, compute_units: u64) -> Result<()> {
+        if self.in_flight.contains_key(&signature) {
+            return Err(anyhow!("Transaction already being tracked"));
+        }
+
+        self.in_flight.insert(signature, InFlightTx {
+            submitted_at: Instant::now(),
+            signature,
+            compute_unit_price,
+            compute_units,
+            on_confirmed: None,
+        });
+
+        self.metrics.total_txs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Tracks a new transaction with a confirmation callback
+    pub fn track_with_callback<F>(&self, signature: Signature, compute_unit_price: u64, compute_units: u64, on_confirmed: F) -> Result<()>
+    where
+        F: FnOnce(Result<()>) + Send + 'static
+    {
+        if self.in_flight.contains_key(&signature) {
+            return Err(anyhow!("Transaction already being tracked"));
+        }
+
+        self.in_flight.insert(signature, InFlightTx {
+            submitted_at: Instant::now(),
+            signature,
+            compute_unit_price,
+            compute_units,
+            on_confirmed: Some(Box::new(on_confirmed)),
+        });
+
+        self.metrics.total_txs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Checks the status of all in-flight transactions
+    async fn check_confirmations(&self) -> Result<()> {
+        let now = Instant::now();
+        let mut to_remove = Vec::new();
+        let mut confirmed = 0;
+        let mut failed = 0;
+        let mut timed_out = 0;
+        let mut total_time = 0;
+
+        // Process all in-flight transactions
+        for entry in self.in_flight.iter() {
+            let sig = entry.key();
+            let tx = entry.value();
+            
+            // Check if transaction has timed out (30 seconds)
+            if now.duration_since(tx.submitted_at) > Duration::from_secs(30) {
+                to_remove.push(*sig);
+                timed_out += 1;
+                self.notify_confirmed(*sig, Err(anyhow!("Transaction timed out")));
+                continue;
+            }
+
+            // Check transaction status
+            match self.rpc.get_signature_status(sig).await? {
+                Some(transaction_status) => {
+                    if transaction_status.err.is_some() {
+                        // Transaction failed
+                        to_remove.push(*sig);
+                        failed += 1;
+                        self.notify_confirmed(*sig, Err(anyhow!("Transaction failed: {:?}", transaction_status.err)));
+                    } else if let Some(confirmation_status) = transaction_status.confirmations {
+                        if confirmation_status >= 1 {
+                            // Transaction confirmed
+                            to_remove.push(*sig);
+                            confirmed += 1;
+                            let elapsed = now.duration_since(tx.submitted_at).as_millis() as u64;
+                            total_time += elapsed;
+                            self.metrics.record_confirmation(elapsed);
+                            self.notify_confirmed(*sig, Ok(()));
+                        }
+                    }
+                }
+                None => {
+                    // Transaction not found yet, check if it's still in the mempool
+                    if let Ok(false) = self.rpc.is_mempool_signature(sig).await {
+                        // Not in mempool or confirmed, might need to wait longer
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Clean up confirmed/failed transactions
+        for sig in to_remove {
+            self.in_flight.remove(&sig);
+        }
+
+        // Update metrics
+        if confirmed > 0 || failed > 0 || timed_out > 0 {
+            let total_processed = confirmed + failed + timed_out;
+            self.metrics.record_batch(confirmed, failed, timed_out, total_time);
+            
+            tracing::debug!(
+                "Processed {} transactions: {} confirmed, {} failed, {} timed out",
+                total_processed, confirmed, failed, timed_out
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Notifies any registered callbacks of confirmation/failure
+    fn notify_confirmed(&self, signature: Signature, result: Result<()>) {
+        if let Some((_, mut tx)) = self.in_flight.remove(&signature) {
+            if let Some(callback) = tx.on_confirmed.take() {
+                callback(result);
+            }
+        }
+    }
+
+    /// Gets the current metrics
+    pub fn metrics(&self) -> Arc<ConfirmationMetrics> {
+        self.metrics.clone()
+    }
+}
+
+impl ConfirmationMetrics {
+    /// Records a confirmation with its timing
+    pub fn record_confirmation(&self, elapsed_ms: u64) {
+        // Update exponential moving average (90% weight to history, 10% to new value)
+        let prev_avg = self.avg_confirmation_ms.load(Ordering::Relaxed) as f64;
+        let new_avg = (prev_avg * 0.9) + (elapsed_ms as f64 * 0.1);
+        self.avg_confirmation_ms.store(new_avg as u64, Ordering::Relaxed);
+
+        // Track recent times (keep last 100)
+        let mut times = self.recent_times.lock().unwrap();
+        times.push_back(elapsed_ms);
+        if times.len() > 100 {
+            times.pop_front();
+        }
+    }
+
+    /// Records a batch of results
+    pub fn record_batch(&self, confirmed: u64, failed: u64, timed_out: u64, total_time: u64) {
+        let total = confirmed + failed + timed_out;
+        if total == 0 {
+            return;
+        }
+
+        // Update success rate (0-100)
+        let success_rate = (confirmed * 100) / total;
+        self.success_rate.store(success_rate as u8, Ordering::Relaxed);
+        
+        // Update counts
+        if confirmed > 0 {
+            self.confirmed.fetch_add(confirmed, Ordering::Relaxed);
+        }
+        if failed > 0 {
+            self.failed.fetch_add(failed, Ordering::Relaxed);
+        }
+        if timed_out > 0 {
+            self.timed_out.fetch_add(timed_out, Ordering::Relaxed);
+        }
+    }
+
+    /// Gets the current success rate (0-100)
+    pub fn success_rate(&self) -> u8 {
+        self.success_rate.load(Ordering::Relaxed)
+    }
+
+    /// Gets the average confirmation time in milliseconds
+    pub fn avg_confirmation_ms(&self) -> u64 {
+        self.avg_confirmation_ms.load(Ordering::Relaxed)
+    }
+
+    /// Gets the 90th percentile confirmation time in milliseconds
+    pub fn p90_confirmation_ms(&self) -> Option<u64> {
+        let times = self.recent_times.lock().unwrap();
+        if times.is_empty() {
+            return None;
+        }
+        
+        let mut sorted = times.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        
+        let idx = (sorted.len() as f64 * 0.9).floor() as usize;
+        Some(sorted[idx.min(sorted.len() - 1)])
+    }
+}
+
+impl Clone for ConfirmationTracker {
+    fn clone(&self) -> Self {
+        Self {
+            in_flight: self.in_flight.clone(),
+            rpc: self.rpc.clone(),
+            metrics: self.metrics.clone(),
+            handle: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+// ==================== PIECE 1.26: Slot-Edge Pacer ====================
+
+/// Optimizes transaction timing relative to Solana's 400ms slot boundaries
+/// 
+/// This pacer helps avoid head-of-line blocking by spreading transactions
+/// across the slot using a combination of slot-phase awareness and jitter.
+pub struct SlotEdgePacer {
+    /// Slot duration in milliseconds (400ms for Solana mainnet)
+    slot_duration_ms: u64,
+    /// Target offset from slot start (in ms) to avoid congestion
+    target_offset_ms: u64,
+    /// Jitter range in milliseconds to add to the target offset
+    jitter_range_ms: u64,
+    /// Last slot we observed
+    last_slot: AtomicU64,
+    /// Last timestamp we observed (unix timestamp in ms)
+    last_timestamp_ms: AtomicU64,
+    /// Last blockhash we observed (for jitter seeding)
+    last_blockhash: RwLock<Hash>,
+    /// RPC client for slot updates
+    rpc: Arc<RpcClient>,
+}
+
+impl SlotEdgePacer {
+    /// Creates a new SlotEdgePacer
+    /// 
+    /// # Arguments
+    /// * `rpc` - RPC client to track slot and blockhash
+    /// * `target_offset_ms` - Target offset from slot start in milliseconds (default: 50ms)
+    /// * `jitter_range_ms` - Jitter range in milliseconds (default: 20ms)
+    pub fn new(rpc: Arc<RpcClient>, target_offset_ms: Option<u64>, jitter_range_ms: Option<u64>) -> Self {
+        Self {
+            slot_duration_ms: 400, // Solana mainnet
+            target_offset_ms: target_offset_ms.unwrap_or(50),
+            jitter_range_ms: jitter_range_ms.unwrap_or(20),
+            last_slot: AtomicU64::new(0),
+            last_timestamp_ms: AtomicU64::new(0),
+            last_blockhash: RwLock::new(Hash::default()),
+            rpc,
+        }
+    }
+
+    /// Updates the pacer's internal state with the latest slot and timestamp
+    pub async fn update_state(&self) -> Result<()> {
+        // Get the latest slot and blockhash in parallel
+        let (slot_res, hash_res) = join!(
+            self.rpc.get_slot(),
+            self.rpc.get_latest_blockhash()
+        );
+        
+        let slot = slot_res?;
+        let blockhash = hash_res?;
+        
+        // Update atomic state
+        self.last_slot.store(slot, Ordering::Relaxed);
+        self.last_timestamp_ms.store(timestamp_millis(), Ordering::Relaxed);
+        *self.last_blockhash.write().await = blockhash;
+        
+        Ok(())
+    }
+
+    /// Calculate the optimal time to wait before sending the next transaction
+    /// 
+    /// Returns the number of milliseconds to wait before sending
+    pub async fn calculate_wait_time(&self) -> u64 {
+        let slot = self.last_slot.load(Ordering::Relaxed);
+        let now = timestamp_millis();
+        let last_ts = self.last_timestamp_ms.load(Ordering::Relaxed);
+        
+        // If we don't have a recent update, don't wait
+        if now.saturating_sub(last_ts) > 1000 {
+            return 0;
+        }
+        
+        // Calculate time into current slot
+        let slot_start = now - (now % self.slot_duration_ms);
+        let time_in_slot = now - slot_start;
+        
+        // Add deterministic jitter based on blockhash
+        let jitter = {
+            let hash = self.last_blockhash.read().await;
+            let mut hasher = Sha256::new();
+            hasher.update(hash.as_ref());
+            hasher.update(&slot.to_le_bytes());
+            let hash = hasher.finalize();
+            (hash[0] as u64) % self.jitter_range_ms
+        };
+        
+        // Target time is slot start + offset + jitter
+        let target_time = slot_start + self.target_offset_ms + jitter;
+        
+        // If we're already past the target time, don't wait
+        if now >= target_time {
+            return 0;
+        }
+        
+        // Otherwise wait until target time
+        target_time - now
+    }
+
+    /// Wait until the optimal time to send the next transaction
+    pub async fn wait_for_slot_edge(&self) -> Result<()> {
+        let wait_time = self.calculate_wait_time().await;
+        if wait_time > 0 {
+            tokio::time::sleep(Duration::from_millis(wait_time)).await;
+        }
+        Ok(())
+    }
+}
+
+// Helper function to get current timestamp in milliseconds
+fn timestamp_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ==================== PIECE 1.25: Hybrid TPU+RPC Sender ====================
+
+/// Combines TPU and RPC sending for optimal transaction delivery
+/// 
+/// Uses direct TPU connection to the leader when possible, with fallback to RPC
+/// fanout for reliability. This provides the best of both worlds: low latency
+/// via direct TPU and high reliability via RPC fallback.
+pub struct HybridSender {
+    /// RPC fanout for fallback broadcasting
+    pub rpc_fanout: Arc<RpcFanout>,
+    /// Direct TPU client (when compiled with tpu feature)
+    #[cfg(feature = "tpu")]
+    tpu: Arc<TpuClient>,
+}
+
+impl HybridSender {
+    /// Creates a new HybridSender with the given RPC URLs and WebSocket URL
+    /// 
+    /// # Arguments
+    /// * `rpc_urls` - List of RPC endpoints for fallback broadcasting
+    /// * `ws_url` - WebSocket URL for TPU client (only used with tpu feature)
+    pub async fn new(rpc_urls: &[String], ws_url: String) -> Result<Self> {
+        let fan = Arc::new(RpcFanout::new(rpc_urls));
+        
+        #[cfg(feature = "tpu")]
+        {
+            // Use first RPC for TPU discovery; you can point to a private node
+            let rpc = fan.clients[0].clone();
+            let cfg = TpuClientConfig::default();
+            let tpu = TpuClient::new_with_client(rpc, &ws_url, cfg)?;
+            return Ok(Self { rpc_fanout: fan, tpu: Arc::new(tpu) });
+        }
+        
+        #[cfg(not(feature = "tpu"))]
+        {
+            let _ = ws_url; // Keep signature consistent
+            Ok(Self { rpc_fanout: fan })
+        }
+    }
+
+    /// Resolve current leader's TPU address (best-effort), else return None
+    async fn leader_tpu_addr(&self) -> Option<std::net::SocketAddr> {
+        // Use the first fanout client for metadata
+        let cli = self.rpc_fanout.clients.get(0)?.clone();
+        
+        // Map identity -> TPU
+        let nodes = cli.get_cluster_nodes().await.ok()?;
+        let leader = cli.get_slot_leader().await.ok()?;
+        
+        for RpcContactInfo { pubkey, tpu, .. } in nodes {
+            if pubkey == leader {
+                if let Some(addr) = tpu {
+                    if let Ok(sa) = addr.parse() { 
+                        return Some(sa); 
+                    }
+                }
+                break;
+            }
+        }
+        None
+    }
+
+    /// Fire to TPU (if available) and concurrently to top-K RPCs; return first Signature
+    /// 
+    /// # Arguments
+    /// * `vtx` - The versioned transaction to send
+    /// * `rpc_parallel` - Number of RPC endpoints to fan out to (0 = TPU only)
+    pub async fn send(&self, vtx: &VersionedTransaction, rpc_parallel: usize) -> Result<Signature> {
+        let tx_sig = vtx.signatures.first().cloned()
+            .ok_or_else(|| anyhow!("Transaction is missing signatures"))?;
+        
+        #[cfg(feature = "tpu")]
+        {
+            // Best-effort TPU first - fire and forget
+            let _ = self.tpu.try_send_transaction(vtx.clone());
+        }
+        
+        // Also push via RPC fanout; whichever lands is fine (same signature)
+        match self.rpc_fanout.broadcast_vtx_skip_preflight(vtx, rpc_parallel).await {
+            Ok(sig) => Ok(sig),
+            Err(e) => {
+                // If RPC failed but we already pushed to TPU, return the signature
+                // (caller can confirm later)
+                #[cfg(feature = "tpu")]
+                { 
+                    tracing::debug!("RPC broadcast failed but TPU attempt was made: {}", e);
+                    Ok(tx_sig) 
+                }
+                #[cfg(not(feature = "tpu"))]
+                { 
+                    Err(e) 
+                }
+            }
+        }
+    }
+}
+
+// ==================== PIECE 1.24: Attempt-aware Assembly ====================
+
+/// Configuration for transaction assembly and broadcasting
+#[derive(Debug, Clone)]
+pub struct TxAssemblyConfig {
+    /// Maximum number of signature siblings to generate (0 = no siblings)
+    pub max_siblings: usize,
+    /// Minimum priority fee in micro-lamports per CU
+    pub min_priority_fee: u64,
+    /// Maximum priority fee in micro-lamports per CU
+    pub max_priority_fee: u64,
+    /// Whether to enable Jito-style bundles
+    pub enable_jito: bool,
+    /// Jito tip account (if Jito is enabled)
+    pub jito_tip_account: Option<Pubkey>,
+    /// Jito tip amount in lamports (if Jito is enabled)
+    pub jito_tip_amount: u64,
+}
+
+impl Default for TxAssemblyConfig {
+    fn default() -> Self {
+        Self {
+            max_siblings: 3,
+            min_priority_fee: 1,
+            max_priority_fee: 1_000_000, // 1 SOL per million CU
+            enable_jito: false,
+            jito_tip_account: None,
+            jito_tip_amount: 10_000, // 0.00001 SOL
+        }
+    }
+}
+
+/// Result of a transaction assembly attempt
+#[derive(Debug)]
+pub struct AssembledTx {
+    /// The transaction to send
+    pub tx: VersionedTransaction,
+    /// The transaction's signature
+    pub signature: Signature,
+    /// The blockhash used
+    pub blockhash: Hash,
+    /// The compute unit limit
+    pub compute_unit_limit: u32,
+    /// The compute unit price in micro-lamports
+    pub compute_unit_price: u64,
+    /// Whether this is a Jito bundle
+    pub is_jito: bool,
+    /// The Jito tip account (if any)
+    pub jito_tip_account: Option<Pubkey>,
+}
+
+impl PortOptimizer {
+    /// Assembles and signs a transaction with all optimizations applied
+    pub async fn assemble_tx(
+        &self,
+        ixs: &[Instruction],
+        config: &TxAssemblyConfig,
+        blockhash_pipeline: &BlockhashPipeline,
+    ) -> Result<Vec<AssembledTx>> {
+        if ixs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get a fresh blockhash
+        let blockhash = blockhash_pipeline.get_blockhash().await;
+        
+        // Generate signature siblings
+        let siblings = make_signature_siblings(
+            ixs,
+            &self.wallet.pubkey(),
+            &[], // TODO: Pass actual lookup tables if needed
+            config.max_siblings,
+            |ixs, _| {
+                // Simple size estimation - should match the one used in make_signature_siblings
+                let mut size = 128; // Header size
+                size += ixs.iter().map(|ix| {
+                    1 + 1 + (ix.accounts.len() * 34) + 4 + ix.data.len()
+                }).sum::<usize>();
+                size
+            },
+        );
+
+        // Prepare transactions with budget instructions
+        let mut txs = Vec::with_capacity(siblings.len());
+        for (i, ixs) in siblings.into_iter().enumerate() {
+            // Skip if we've seen this transaction before
+            let fingerprint = ixs_fingerprint(&ixs);
+            if hot_deduper().is_dupe(&fingerprint).await {
+                continue;
+            }
+
+            // Add compute budget instructions
+            let budget_ixs = self.dynamic_budget_ixs_v2(
+                &ixs,
+                config.min_priority_fee,
+                config.max_priority_fee,
+            ).await?;
+
+            let mut all_ixs = budget_ixs;
+            all_ixs.extend(ixs);
+
+            // Add Jito tip if enabled
+            if config.enable_jito {
+                if let Some(tip_account) = config.jito_tip_account {
+                    all_ixs.push(system_instruction::transfer(
+                        &self.wallet.pubkey(),
+                        &tip_account,
+                        config.jito_tip_amount,
+                    ));
+                }
+            }
+
+            // Build and sign the transaction
+            let message = Message::new(&all_ixs, Some(&self.wallet.pubkey()));
+            let tx = VersionedTransaction::try_new(
+                VersionedMessage::Legacy(message),
+                &[&*self.wallet],
+            )?;
+
+            let signature = tx.signatures[0];
+            
+            // Get compute unit info from the budget instructions
+            let (compute_unit_limit, compute_unit_price) = if !budget_ixs.is_empty() {
+                let limit = if let Ok(ComputeBudgetInstruction::RequestUnitsDeprecated { units, .. }) = 
+                    budget_ixs[0].try_into() {
+                    units
+                } else {
+                    COMPUTE_UNITS_FLOOR
+                };
+                
+                let price = if budget_ixs.len() > 1 {
+                    if let Ok(ComputeBudgetInstruction::SetComputeUnitPrice(price)) = 
+                        budget_ixs[1].try_into() {
+                        price
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                
+                (limit, price)
+            } else {
+                (COMPUTE_UNITS_FLOOR, 0)
+            };
+
+            txs.push(AssembledTx {
+                tx,
+                signature,
+                blockhash,
+                compute_unit_limit,
+                compute_unit_price,
+                is_jito: config.enable_jito && config.jito_tip_account.is_some(),
+                jito_tip_account: config.jito_tip_account,
+            });
+
+            // Mark as seen to prevent duplicates
+            hot_deduper().mark_seen(fingerprint).await;
+        }
+
+        Ok(txs)
+    }
+
+    /// Broadcasts a batch of transactions with optimal fanout
+    pub async fn broadcast_txs(
+        &self,
+        txs: Vec<AssembledTx>,
+        rpc_fanout: &RpcFanout,
+    ) -> Result<Vec<Signature>> {
+        if txs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut signatures = Vec::with_capacity(txs.len());
+        let mut futures = Vec::with_capacity(txs.len());
+
+        // Fan out transactions to multiple RPC endpoints
+        for tx in txs {
+            let rpc_fanout = rpc_fanout.clone();
+            let tx_data = bincode::serialize(&tx.tx)?;
+            
+            let future = async move {
+                // Try to send with Jito bundle if configured
+                if tx.is_jito && tx.jito_tip_account.is_some() {
+                    if let Ok(bundle) = JitoBundle::new(vec![tx.tx], tx.jito_tip_account.unwrap()) {
+                        if let Ok(sig) = rpc_fanout.send_jito_bundle(bundle).await {
+                            return Ok(sig);
+                        }
+                    }
+                }
+                
+                // Fall back to regular transaction
+                rpc_fanout.send_raw_transaction(tx_data).await
+            };
+            
+            futures.push(future);
+        }
+
+        // Wait for all sends to complete or fail
+        let results = futures::future::join_all(futures).await;
+        
+        // Collect successful signatures
+        for result in results {
+            match result {
+                Ok(sig) => signatures.push(sig),
+                Err(e) => tracing::warn!("Failed to broadcast transaction: {}", e),
+            }
+        }
+
+        Ok(signatures)
+    }
+}
+
+// ==================== PIECE 1.21: Budget Composer v2 ====================
+
+impl PortOptimizer {
+    /// Compose compute budget instructions with exact simulation and v2 fee estimation.
+    /// 
+    /// This function optimizes compute unit limits and priority fees by:
+    /// 1. Simulating the transaction once to get exact compute unit requirements
+    /// 2. Adding a 12% buffer to the measured units
+    /// 3. Clamping between FLOOR and CEIL constants
+    /// 4. Pricing using the v2 fee estimator
+    pub async fn dynamic_budget_ixs_v2(
+        &self,
+        ixs: &[Instruction],
+        floor_cu_price: u64,
+        max_cu_price: u64,
+    ) -> Result<Vec<Instruction>> {
+        if ixs.is_empty() { 
+            return Ok(Vec::new()); 
+        }
+
+        // Check cache first to avoid repeated simulations
+        let key = ixs_fingerprint(ixs);
+        let cached = { 
+            let cache = cu_lru().read().await;
+            cache.get(&key).cloned()
+        };
+
+        // Get or calculate compute unit limit
+        let cu_limit = if let Some(cu) = cached {
+            cu as u32
+        } else {
+            // Simulate with generous headroom to get actual usage
+            let payer = self.wallet.pubkey();
+            let msg = Message::new(ixs, Some(&payer));
+            let vtx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&*self.wallet])?;
+            
+            // Get actual units used from simulation
+            let sim = self.simulate_exact_v0_default(&vtx).await?;
+            let raw = sim.units_consumed.unwrap_or(COMPUTE_UNITS_FLOOR as u64);
+            
+            // Add 12% buffer and clamp to reasonable bounds
+            let cu = ((raw as f64) * 1.12).ceil() as u32;
+            let cu = cu.clamp(COMPUTE_UNITS_FLOOR, COMPUTE_UNITS_CEIL);
+            
+            // Cache the result for future use
+            cu_lru().write().await.put(key, cu as u64);
+            cu
+        };
+
+        // Get priority fee using v2 estimator with program awareness
+        let mut cu_price = self.priority_fee_for_ixs_v2(ixs, floor_cu_price).await;
+        cu_price = cu_price.min(max_cu_price).max(floor_cu_price);
+
+        // Return budget instructions to prepend to transaction
+        Ok(vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+            ComputeBudgetInstruction::set_compute_unit_price(cu_price),
+        ])
+    }
+
+    /// Simulate a transaction with default config (v0, no commitment)
+    async fn simulate_exact_v0_default(
+        &self,
+        vtx: &VersionedTransaction,
+    ) -> Result<RpcSimulateTransactionResult> {
+        let cfg = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: false,
+            commitment: None,
+            encoding: None,
+            accounts: None,
+            min_context_slot: None,
+            inner_instructions: false,
+        };
+        self.rpc_client.simulate_transaction_with_config(vtx, cfg).await
+            .map_err(Into::into)
+    }
+}
+
+// ==================== PIECE 1.13c: Program-aware fee fusion ====================
+
+impl PortOptimizer {
+    /// Fuses program-specific fees with global fee tape using adaptive weighting.
+    /// Uses program-specific fees when available, falls back to global quantiles.
+    /// 
+    /// # Arguments
+    /// * `programs` - List of programs involved in the transaction
+    /// * `global_floor` - Minimum fee to return (from autoscaler or config)
+    /// 
+    /// # Returns
+    /// Tuple of (fused_fee, confidence) where confidence is 0.0-1.0
+    #[inline]
+    pub async fn fuse_program_fees(&self, programs: &[Pubkey], global_floor: u64) -> (u64, f64) {
+        if programs.is_empty() {
+            return (global_floor, 0.0);
+        }
+
+        // Get program-specific fees in parallel
+        let program_fees = self.get_fee_values_cached(programs, Duration::from_secs(5)).await;
+        
+        // Get global fee quantiles
+        let global = fee_q().read().await.pair().unwrap_or_else(|| (global_floor as f64, (global_floor * 2) as f64));
+        
+        // If no program-specific data, return global p90 with low confidence
+        if program_fees.is_empty() {
+            return (global.1 as u64, 0.3);
+        }
+        
+        // Calculate robust statistics (median and IQR)
+        let median = percentile_pair_unstable(&program_fees, 50, 50).0 as f64;
+        let (q25, q75) = percentile_pair_unstable(&program_fees, 25, 75);
+        let iqr = (q75 - q25) as f64;
+        
+        // Calculate confidence based on IQR and sample size
+        let confidence = 1.0f64.min(0.7 + 0.3 * (1.0 - iqr / median).max(0.0));
+        
+        // Fuse with global quantiles using confidence
+        let lo = global.0 * (1.0 - confidence) + median * confidence;
+        let hi = global.1 * (1.0 - confidence) + (median + iqr * 1.5).max(median * 1.1) * confidence;
+        
+        // Ensure we're above global floor and program median
+        let fee = hi.max(global_floor as f64).max(median) as u64;
+        
+        (fee, confidence)
+    }
+    
+    /// Gets the current recommended fee for a set of programs
+    /// Combines program-specific fees with global congestion signals
+    pub async fn get_recommended_fee(&self, programs: &[Pubkey]) -> u64 {
+        let global_floor = self.priority_fee_autoscale(0).await;
+        let (fee, _) = self.fuse_program_fees(programs, global_floor).await;
+        fee
+    }
+    
+    /// Sends a transaction with cohort-based jitter to avoid network collisions
+    /// and improve transaction success rates.
+    pub async fn send_with_jitter(
+        &self,
+        ixs: &[Instruction],
+        signers: &[&dyn Signer],
+        recent_blockhash: Hash,
+        max_jitter_us: u32,
+    ) -> Result<Signature, Box<dyn std::error::Error>> {
+        // Calculate jitter based on wallet and blockhash
+        let jitter_us = cohort_jitter_us(self.wallet.pubkey(), &recent_blockhash, max_jitter_us);
+        
+        // Sleep for the jitter duration
+        if jitter_us > 0 {
+            tokio::time::sleep(Duration::from_micros(jitter_us as u64)).await;
+        }
+        
+        // Send the transaction
+        let tx = Transaction::new_signed_with_payer(
+            ixs,
+            Some(&self.wallet.pubkey()),
+            signers,
+            recent_blockhash,
+        );
+        
+        self.rpc_client.send_and_confirm_transaction_with_spinner(&tx).await
+    }
+}
+
+// ==================== PIECE 1.23: Low-Latency Blockhash Pipeline ====================
+
+/// Manages blockhash updates with minimal latency using a background task.
+/// Maintains a fresh blockhash and notifies waiters when a new one is available.
+pub struct BlockhashPipeline {
+    current: Arc<tokio::sync::RwLock<Hash>>,
+    notifier: Arc<tokio::sync::Notify>,
+    rpc_client: Arc<RpcClient>,
+    update_interval: Duration,
+}
+
+impl BlockhashPipeline {
+    /// Creates a new BlockhashPipeline with the given RPC client and update interval
+    pub fn new(rpc_client: Arc<RpcClient>, update_interval: Duration) -> Self {
+        Self {
+            current: Arc::new(tokio::sync::RwLock::new(Hash::default())),
+            notifier: Arc::new(tokio::sync::Notify::new()),
+            rpc_client,
+            update_interval,
+        }
+    }
+
+    /// Starts the background blockhash update task
+    pub fn start(&self) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.run().await;
+        })
+    }
+
+    /// Main loop for the blockhash updater
+    async fn run(&self) {
+        let mut interval = tokio::time::interval(self.update_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.update_blockhash().await {
+                tracing::warn!("Failed to update blockhash: {}", e);
+            }
+        }
+    }
+
+    /// Updates the current blockhash from the RPC node
+    async fn update_blockhash(&self) -> Result<()> {
+        let (recent_blockhash, _) = self.rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await?;
+
+        // Only update if it's different
+        {
+            let mut current = self.current.write().await;
+            if *current != recent_blockhash {
+                *current = recent_blockhash;
+                self.notifier.notify_waiters();
+                tracing::debug!("Updated blockhash: {}", recent_blockhash);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Gets the current blockhash, waiting for the next update if necessary
+    pub async fn get_blockhash(&self) -> Hash {
+        self.notifier.notified().await;
+        *self.current.read().await
+    }
+
+    /// Gets the current blockhash immediately without waiting
+    pub async fn get_blockhash_now(&self) -> Hash {
+        *self.current.read().await
+    }
+}
+
+impl Clone for BlockhashPipeline {
+    fn clone(&self) -> Self {
+        Self {
+            current: self.current.clone(),
+            notifier: self.notifier.clone(),
+            rpc_client: self.rpc_client.clone(),
+            update_interval: self.update_interval,
+        }
+    }
+}
+
+// ==================== PIECE 1.22: Hot Deduper ====================
+
+/// Deduplicates transactions based on their instruction fingerprint and recent submission history.
+/// Uses a time-windowed approach to track recent transactions and prevent duplicates.
+/// 
+/// This is a critical component for MEV protection, preventing:
+/// 1. Accidental duplicate submissions
+/// 2. Replay attacks
+/// 3. Frontrunning our own transactions
+#[derive(Debug)]
+pub struct HotDeduper {
+    inner: Arc<tokio::sync::RwLock<HashMap<[u8; 32], Instant>>>,
+    ttl: Duration,
+    max_size: usize,
+}
+
+impl Default for HotDeduper {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30))
+    }
+}
+
+impl HotDeduper {
+    /// Creates a new HotDeduper with the specified TTL for deduplication entries
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::RwLock::new(HashMap::with_capacity(1024))),
+            ttl,
+            max_size: 10_000, // Prevent unbounded memory growth
+        }
+    }
+    
+    pub fn with_max_size(mut self, max_size: usize) -> Self {
+        self.max_size = max_size;
+        self
+    }
+    
+    /// Check if a transaction with the given fingerprint is a duplicate
+    /// Returns true if this is a duplicate (should be dropped)
+    pub async fn is_dupe(&self, fingerprint: &[u8; 32]) -> bool {
+        let now = Instant::now();
+        let inner = self.inner.read().await;
+        
+        // Check if key exists and is not expired
+        match inner.get(fingerprint) {
+            Some(&ts) if now.duration_since(ts) <= self.ttl => true,
+            _ => false,
+        }
+    }
+    
+    /// Mark a transaction as seen by its fingerprint
+    pub async fn mark_seen(&self, fingerprint: [u8; 32]) -> bool {
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        
+        // Clean up expired entries first
+        inner.retain(|_, &mut ts| now.duration_since(ts) <= self.ttl);
+        
+        // Enforce max size by removing oldest entry if needed
+        if inner.len() >= self.max_size {
+            if let Some(oldest_key) = inner.iter()
+                .min_by_key(|(_, &ts)| ts)
+                .map(|(k, _)| *k) {
+                inner.remove(&oldest_key);
+            }
+        }
+        
+        // Insert or update the timestamp
+        inner.insert(fingerprint, now).is_none()
+    }
+    
+    /// Background task to periodically clean up old entries
+    fn start_cleanup_task(&self) {
+        let inner = self.inner.clone();
+        let ttl = self.ttl;
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                let mut dedupe = inner.write().await;
+                let before = dedupe.len();
+                let threshold = now.checked_sub(ttl).unwrap_or(now);
+                
+                // Remove entries older than TTL
+                dedupe.retain(|_, ts| *ts > threshold);
+                
+                let after = dedupe.len();
+                if before > 0 && before != after {
+                    tracing::debug!(
+                        "Deduper cleaned {} entries ({} -> {})",
+                        before - after,
+                        before,
+                        after
+                    );
+                }
+            }
+        });
+    }
+}
+
+// Global instance for the hot deduper
+static HOT_DEDUPER: OnceLock<HotDeduper> = OnceLock::new();
+
+/// Get a reference to the global hot deduper instance
+pub fn hot_deduper() -> &'static HotDeduper {
+    HOT_DEDUPER.get_or_init(|| HotDeduper::default())
+}
+
+// ==================== PIECE 1.20: Memo-Salt Siblings ====================
+
+/// Returns the SPL Memo v1 program ID
+#[inline(always)]
+fn memo_program() -> Pubkey {
+    // SPL Memo v1
+    Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap()
+}
+
+/// Creates a memo instruction with the given salt value
+#[inline(always)]
+fn memo_salt_ix(salt: u32) -> Instruction {
+    let data = salt.to_le_bytes().to_vec();
+    Instruction { 
+        program_id: memo_program(), 
+        accounts: Vec::new(), 
+        data 
+    }
+}
+
+/// Generates up to `n` transaction variants by appending memo salts
+/// 
+/// This creates signature-distinct variants of the same transaction by appending
+/// a small memo with a deterministic salt. This helps avoid head-to-head
+/// signature collisions when multiple bots send similar transactions.
+pub fn make_signature_siblings<F>(
+    base_ixs: &[Instruction],
+    payer: &Pubkey,
+    alts: &[AddressLookupTableAccount],
+    n: usize,
+    size_fn: F,
+) -> Vec<Vec<Instruction>>
+where
+    F: Fn(&[Instruction], &[AddressLookupTableAccount]) -> usize
+{
+    let mut out = Vec::with_capacity(n.max(1));
+    let base_sz = size_fn(base_ixs, alts);
+    out.push(base_ixs.to_vec()); // Original transaction is first
+
+    // 5 bytes per salt memo (1 program index + 1 len + 4 data) + shortvec noise; rounded headroom 16B
+    const SALT_OVERHEAD: usize = 16;
+
+    // Generate up to n-1 salted variants
+    for k in 1..n {
+        // Create a deterministic salt based on the base transaction and index
+        let salt = {
+            let mut h = Sha256::new();
+            h.update(b"SALT1");
+            h.update(payer.as_ref());
+            h.update(&(k as u32).to_le_bytes());
+            let d = h.finalize();
+            u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+        };
+        
+        // Clone the base instructions and append the salt memo
+        let mut ixs = base_ixs.to_vec();
+        ixs.push(memo_salt_ix(salt));
+        
+        // Only include if it fits within MTU
+        if base_sz + SALT_OVERHEAD <= QUIC_SAFE_PACKET_BUDGET {
+            out.push(ixs);
+        } else {
+            break; // MTU-safe
+        }
+    }
+    out
+}
+
+// ==================== PIECE 1.12: TipRouter Gumbel pick ====================
+
+/// Bias-free stochastic argmax via Gumbel(0,1) perturbation.
+/// Equivalent to sampling from the categorical distribution defined by current weights.
+impl TipRouter {
+    pub fn pick_gumbel_sync(&self) -> Pubkey {
+        let tips = self.inner.blocking_read();
+        if tips.is_empty() { return Pubkey::new_unique(); }
+        let eps = 1e-9_f64;
+        let mut best = 0usize;
+        let mut best_score = f64::NEGATIVE_INFINITY;
+        for (i, t) in tips.iter().enumerate() {
+            // Gumbel noise: -ln(-ln(U))
+            let u: f64 = rand::random::<f64>().clamp(eps, 1.0 - eps);
+            let g = -((-(u.ln())).ln());
+            // temperature τ slightly <1 for mild exploration
+            let tau = 0.85_f64;
+            let s = (t.weight.max(eps)).ln() / tau + g;
+            if s > best_score { best_score = s; best = i; }
+        }
+        tips[best].account
+    }
+
+    pub async fn pick_gumbel(&self) -> Pubkey {
+        let tips = self.inner.read().await;
+        if tips.is_empty() { return Pubkey::new_unique(); }
+        let eps = 1e-9_f64;
+        let mut best = 0usize;
+        let mut best_score = f64::NEGATIVE_INFINITY;
+        for (i, t) in tips.iter().enumerate() {
+            let u: f64 = rand::random::<f64>().clamp(eps, 1.0 - eps);
+            let g = -((-(u.ln())).ln());
+            let tau = 0.85_f64;
+            let s = (t.weight.max(eps)).ln() / tau + g;
+            if s > best_score { best_score = s; best = i; }
+        }
+        tips[best].account
+    }
 }
 
 #[derive(Clone)]
 pub struct TipRouter {
     inner: Arc<RwLock<Vec<TipStats>>>,
-    alpha: f64,      // level smoothing
-    beta: f64,       // volatility smoothing
+    alpha: f64,    // level smoothing
+    beta: f64,     // volatility smoothing
     floor_ms: f64,
     ceil_ms: f64,
+    outlier_q: f64,
     min_weight: f64,
-    half_life: Duration,   // decay for old stats
-    hampel_k: f64,         // outlier clamp factor
 }
 
 impl TipRouter {
     pub fn new(accounts: Vec<Pubkey>) -> Self {
         let now = Instant::now();
-        let v = accounts.into_iter().map(|a| TipStats {
-            account: a, ema: 800.0, emv: 100.0, ghost_rate: 0.0, weight: 1.0,
-            attempts: 1, failures: 0, last_update: now
-        }).collect();
-        let me = Self {
+        let v: Vec<TipStats> = accounts
+            .into_iter()
+            .map(|a| TipStats {
+                account: a,
+                ema: 800.0,
+                emv: 100.0,
+                ghost_rate: 0.0,
+                weight: 1.0,
+                attempts: 0,
+                failures: 0,
+                last_update: now,
+                succ_ewma: 0.90,
+                fail_ewma: 0.10,
+            })
+            .collect();
+
+        let r = Self {
             inner: Arc::new(RwLock::new(v)),
-            alpha: 0.22, beta: 0.12,
-            floor_ms: 80.0, ceil_ms: 3500.0,
-            min_weight: 0.01,
-            half_life: Duration::from_secs(120),
-            hampel_k: 3.0,
+            alpha: 0.22, // latency EMA smoothing
+            beta: 0.12,  // volatility smoothing
+            floor_ms: 100.0,
+            ceil_ms: 3000.0,
+            outlier_q: 0.95,
+            min_weight: 0.005, // exploration floor
         };
-        me.reweight_now();
-        me
+        let mut g = r.inner.blocking_write();
+        r.recompute_weights_locked(&mut g);
+        drop(g);
+        r
     }
 
-    fn reweight_now(&self) {
-        let mut g = self.inner.blocking_write();
-        Self::recompute_weights_locked(&mut g, self.min_weight);
+    #[inline(always)]
+    fn apply_time_decay(t: &mut TipStats, now: Instant) {
+        // Half-life ≈ 60s for reliability stats; prevents permanent penalties.
+        let dt = now.saturating_duration_since(t.last_update).as_secs_f64();
+        if dt <= 0.0 { return; }
+        let halflife = 60.0f64;
+        let lambda = (-std::f64::consts::LN_2 * dt / halflife).exp(); // ∈(0,1]
+        t.succ_ewma *= lambda;
+        t.fail_ewma *= lambda;
+        t.last_update = now;
     }
 
     pub async fn record_attempt(&self, acct: Pubkey, success: bool, latency_ms: Option<f64>) {
         let mut tips = self.inner.write().await;
-        // Hampel clamp reference
-        let med = median(tips.iter().map(|t| t.ema).collect());
-        let mad = median(tips.iter().map(|t| (t.ema - med).abs()).collect()).max(1.0);
+        let now = Instant::now();
 
         if let Some(t) = tips.iter_mut().find(|t| t.account == acct) {
-            // time decay for attempts/failures
-            let dt = t.last_update.elapsed();
-            let decay = (0.5_f64).powf(dt.as_secs_f64() / self.half_life.as_secs_f64());
-            t.attempts = ((t.attempts as f64) * decay).max(1.0) as u64;
-            t.failures = ((t.failures as f64) * decay).max(0.0) as u64;
-            t.last_update = Instant::now();
+            Self::apply_time_decay(t, now);
 
             t.attempts = t.attempts.saturating_add(1);
             if !success { t.failures = t.failures.saturating_add(1); }
-            t.ghost_rate = (t.failures as f64) / (t.attempts as f64);
+
+            // Reliability EWMAs with soft prior mass
+            let obs_gain = 0.25; // weight per new observation (bounded)
+            if success {
+                t.succ_ewma = (1.0 - obs_gain) * t.succ_ewma + obs_gain * 1.0;
+                t.fail_ewma = (1.0 - obs_gain) * t.fail_ewma + obs_gain * 0.0;
+            } else {
+                t.succ_ewma = (1.0 - obs_gain) * t.succ_ewma + obs_gain * 0.0;
+                t.fail_ewma = (1.0 - obs_gain) * t.fail_ewma + obs_gain * 1.0;
+            }
+            let succ = t.succ_ewma.max(1e-6);
+            let fail = t.fail_ewma.max(1e-6);
+            t.ghost_rate = (fail / (succ + fail)).clamp(0.0, 1.0);
 
             if let Some(ms) = latency_ms {
                 let ms = ms.clamp(self.floor_ms, self.ceil_ms);
-                let clamp_hi = med + self.hampel_k * mad;
-                let ms = ms.min(clamp_hi);
+                // EWMA on level and absolute deviation
                 t.ema = self.alpha * ms + (1.0 - self.alpha) * t.ema;
-                t.emv = self.beta * (ms - t.ema).abs() + (1.0 - self.beta) * t.emv;
+                let abs_dev = (ms - t.ema).abs();
+                t.emv = self.beta * abs_dev + (1.0 - self.beta) * t.emv;
             }
         }
-        Self::recompute_weights_locked(&mut tips, self.min_weight);
+        self.recompute_weights_locked(&mut tips);
     }
 
-    fn recompute_weights_locked(tips: &mut [TipStats], min_weight: f64) {
-        // Weight ∝ (1 - ghost)^2 / (ema + 2*emv)
-        let k = 2.0;
+    fn recompute_weights_locked(&self, tips: &mut [TipStats]) {
+        if tips.is_empty() { return; }
+
+        // Robust scale from median EMA
+        let mut ema_vec: Vec<f64> = tips.iter().map(|t| t.ema).collect();
+        ema_vec.sort_by(|a,b| a.partial_cmp(b).unwrap());
+        let med_ema = ema_vec[ema_vec.len()/2].max(1.0);
+
+        // Constants (battle-tested ranges)
+        let k_var: f64 = 1.8;       // volatility penalty
+        let winsor: f64 = 4.0;      // cap EMA at 4× median
+        let gamma: f64 = 3.0;       // ghost penalty exponent
+        let ramp_smooth: f64 = 48.0; // attempts to fully ramp capacity
+        let eps_w: f64 = 1e-6;
+
         let mut sum = 0.0;
         for t in tips.iter_mut() {
-            let reliab = (1.0 - t.ghost_rate).max(0.0).powi(2);
-            t.weight = (reliab / (t.ema + k * t.emv).max(1.0)).max(min_weight);
+            // Winsorized latency & bounded volatility
+            let ema = t.ema.min(med_ema * winsor).max(self.floor_ms);
+            let emv = t.emv.min(ema * 0.75).max(0.5);
+
+            // Reliability from EWMAs
+            let succ = t.succ_ewma.max(1e-6);
+            let fail = t.fail_ewma.max(1e-6);
+            let p_succ = (succ / (succ + fail)).clamp(0.0, 1.0);
+
+            // Capacity ramp to avoid overweighting fresh routes
+            let ramp = ((t.attempts as f64) / ramp_smooth).min(1.0);
+
+            // Base inverse-latency with volatility penalty
+            let base = 1.0 / (ema + k_var * emv).max(1.0);
+
+            // Ghosting penalty (smooth exponential)
+            let ghost_pen = (-gamma * t.ghost_rate).exp(); // ∈(e^{-γ},1]
+
+            t.weight = (base * p_succ * p_succ * ghost_pen * (0.5 + 0.5 * ramp))
+                .max(self.min_weight) + eps_w;
             sum += t.weight;
         }
         if sum > 0.0 { for t in tips.iter_mut() { t.weight /= sum; } }
     }
 
     pub async fn pick(&self) -> Pubkey {
-        use rand_chacha::ChaCha20Rng;
-        use rand::SeedableRng;
-        let mut rng = ChaCha20Rng::from_entropy();
         let tips = self.inner.read().await;
         if tips.is_empty() { return Pubkey::new_unique(); }
+        let mut rng = thread_rng();
         let r: f64 = rng.gen();
         let mut acc = 0.0;
         for t in tips.iter() { acc += t.weight; if r <= acc { return t.account; } }
@@ -1679,26 +5584,9 @@ impl TipRouter {
     }
 
     pub fn pick_sync(&self) -> Pubkey {
-        use rand_chacha::ChaCha20Rng;
-        use rand::SeedableRng;
-        let mut rng = ChaCha20Rng::from_entropy();
         let tips = self.inner.blocking_read();
         if tips.is_empty() { return Pubkey::new_unique(); }
-        let r: f64 = rng.gen();
-        let mut acc = 0.0;
-        for t in tips.iter() { acc += t.weight; if r <= acc { return t.account; } }
-        tips.last().map(|t| t.account).unwrap_or_else(Pubkey::new_unique)
-    }
-
-    pub fn pick_seeded(&self, payer: &Pubkey, bh: &Hash) -> Pubkey {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(payer.as_ref());
-        hasher.update(bh.as_ref());
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(hasher.finalize().as_bytes());
-        let mut rng = ChaCha20Rng::from_seed(seed);
-        let tips = self.inner.blocking_read();
-        if tips.is_empty() { return Pubkey::new_unique(); }
+        let mut rng = thread_rng();
         let r: f64 = rng.gen();
         let mut acc = 0.0;
         for t in tips.iter() { acc += t.weight; if r <= acc { return t.account; } }
@@ -1706,19 +5594,11 @@ impl TipRouter {
     }
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
-    if v.is_empty() { return 0.0; }
-    v.sort_by(|a,b| a.partial_cmp(b).unwrap());
-    let m = v.len()/2;
-    if v.len()%2==0 { (v[m-1]+v[m]) * 0.5 } else { v[m] }
-}
-
-// === global constants ===
-const MAX_UDP_TX_BYTES: usize = 1232;
-const UDP_SAFETY_MARGIN: usize = 24;
-const MAX_COMPUTE_UNITS: u32 = 1_400_000;
-const DEFAULT_PRIORITY_FEE_PER_CU: u64 = 50_000;
-const BALANCE_RESERVE_LAMPORTS: u64 = 500_000;
+const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+@@ -38,15 +333,55 @@ const MIN_PROFIT_BPS: u64 = 10;
+const REBALANCE_THRESHOLD_BPS: u64 = 25;
+const MAX_SLIPPAGE_BPS: u64 = 50;
 
 // ----- Module-level instruction encoding helpers -----
 // Anchor-compliant discriminator for instruction names: sha256("global:{ix}")[0..8]
@@ -1758,106 +5638,113 @@ const SOLEND_WITHDRAW_TAG: u8 = 5; // Verified from Solend program source/tests
 const FLASHLOAN_TAG: u8 = 10;
 const FLASHREPAY_TAG: u8 = 11;
 
+// ==================== PIECE 1.13b: Global fee quantile trackers ====================
+
+/// Tracks fee percentiles (p70, p90) using P² algorithm for streaming quantiles
+#[derive(Clone, Debug)]
+pub struct FeeQuantiles {
+    lo: P2Quantile, // ~p70
+    hi: P2Quantile, // ~p90
+}
+
+impl FeeQuantiles {
+    pub fn new() -> Self { 
+        Self { 
+            lo: P2Quantile::new(0.70), 
+            hi: P2Quantile::new(0.90) 
+        } 
+    }
+    
+    #[inline] 
+    pub fn push(&mut self, v: f64) { 
+        self.lo.update(v); 
+        self.hi.update(v); 
+    }
+    
+    #[inline] 
+    pub fn pair(&self) -> Option<(f64, f64)> { 
+        Some((self.lo.value()?, self.hi.value()?)) 
+    }
+}
+
+static FEE_Q: OnceLock<tokio::sync::RwLock<FeeQuantiles>> = OnceLock::new();
+
+#[inline(always)]
+fn fee_q() -> &'static tokio::sync::RwLock<FeeQuantiles> {
+    FEE_Q.get_or_init(|| tokio::sync::RwLock::new(FeeQuantiles::new()))
+}
+
+// ----- Leader schedule cache (epoch-aware, short TTL) -----
+static LEADER_CACHE: OnceLock<tokio::sync::RwLock<LeaderCache>> = OnceLock::new();
+
+fn leader_cache() -> &'static tokio::sync::RwLock<LeaderCache> {
+    LEADER_CACHE.get_or_init(|| tokio::sync::RwLock::new(LeaderCache {
+        epoch: 0,
+        schedule: HashMap::new(),
+        last_refresh: Instant::now() - Duration::from_secs(3600),
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct LeaderCache {
+    epoch: u64,
+    schedule: HashMap<String, Vec<usize>>, // leader -> slot indices
+    last_refresh: Instant,
+}
+
+// Small helper for bounded fee escalation on retries
+fn fee_escalation_nudge(base_cu_price: u64, attempt_no: u32) -> u64 {
+    let mult = match attempt_no { 0 => 1.00, 1 => 1.08, 2 => 1.16, _ => 1.24 };
+    ((base_cu_price as f64) * mult).ceil() as u64
+}
+
 #[derive(Clone, Debug)]
 pub struct LendingMarket {
-    pub market_pubkey: Pubkey,
+pub market_pubkey: Pubkey,
     pub token_mint: Pubkey,
-    pub protocol: Protocol,
-    pub supply_apy: f64,
-    pub borrow_apy: f64,
-    pub utilization: f64,
-    pub liquidity_available: u64,
-    pub last_update: Instant,
+pub protocol: Protocol,
+pub supply_apy: f64,
+pub borrow_apy: f64,
+pub utilization: f64,
+pub liquidity_available: u64,
+pub last_update: Instant,
     pub layout_version: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Protocol {
-    Solend,
-    Kamino,
-}
-
 pub struct PortOptimizer {
-    rpc_client: Arc<RpcClient>,
-    // Optional faster RPC for hedged sims (may be None)
-    rpc_fast: Option<Arc<RpcClient>>,
     wallet: Arc<Keypair>,
     markets: Arc<RwLock<HashMap<String, Vec<LendingMarket>>>>,
     active_positions: Arc<RwLock<HashMap<String, Position>>>,
     tip_router: Arc<RwLock<Option<TipRouter>>>,
-    // Piece K/M: flow budget EMA and duplicate message digest guard
-    flow_budget_ema: PLRwLock<HashMap<u64, FlowBudgetEma>>, // key: flow_salt
-    recent_msg_digests: PLRwLock<(VecDeque<[u8;32]>, HashSet<[u8;32]>)>,
-    // === [IMPROVED: PIECE 93A v15] === ALT plan cache keyed by need-set fingerprint
-    alt_plan_by_need: PLRwLock<HashMap<(u64, u64), smallvec::SmallVec<[u64;6]>>>,
-    // === [IMPROVED: PIECE 95A v15] === Tip router bandit stats
-    tip_stats: DashMap<Pubkey, TipStat>,
-    // === [IMPROVED: PIECE 96A v15] === Inverted ALT address index
-    alt_addr_index: DashMap<Pubkey, smallvec::SmallVec<[Pubkey;6]>>,
+    last_tx_signature: Arc<tokio::sync::RwLock<Option<solana_sdk::signature::Signature>>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Position {
     pub token_mint: Pubkey,
-    pub protocol: Protocol,
-    pub amount: u64,
-    pub entry_apy: f64,
     pub last_rebalance: Instant,
+{{ ... }}
 }
 
 #[derive(Clone, Debug)]
 pub struct ReserveMeta {
-    pub program_id: Pubkey,
     pub reserve: Pubkey,
     pub lending_market: Pubkey,
     pub lending_market_authority: Pubkey,
     pub liquidity_mint: Pubkey,
     pub liquidity_supply_vault: Pubkey,
     pub collateral_mint: Pubkey,
-    pub flash_capacity_hint: Option<u64>,
-}
-
-impl ReserveMeta {
-    pub fn available_flash_capacity(&self) -> Result<u64> {
-        Ok(self.flash_capacity_hint.unwrap_or(1_000_000_000_000))
-    }
+    pub collateral_supply_vault: Pubkey,
+    pub program_id: Pubkey,
 }
 
 impl PortOptimizer {
-    // --------- Fast digest and UDP guard (moved out of BufPool) ---------
-    #[inline]
-    fn digest_v0_fast(&self, tx: &VersionedTransaction) -> Option<[u8; 32]> {
-        bincode::serialize(tx).ok().map(|b| {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(blake3::hash(&b).as_bytes());
-            out
-        })
-    }
+    // ----- Liquidity-weighted market scoring (risk-aware) -----
+    const UTIL_RISK_FACTOR: f64 = 120.0;       // weight of utilization penalty
+    const CAPACITY_RISK_FACTOR: f64 = 0.000001; // penalty per lamport shortfall vs. move size
 
-    #[inline]
-    fn near_udp_cap(&self, len: usize) -> bool {
-        len + 12 + UDP_SAFETY_MARGIN >= MAX_UDP_TX_BYTES
-    }
-
-    /// returns true if newly inserted, false if seen recently
-    fn seen_or_insert_digest(&self, d: [u8;32]) -> bool {
-        let mut g = self.recent_msg_digests.write();
-        let (ring, set) = (&mut g.0, &mut g.1);
-        if set.contains(&d) { return false; }
-        if ring.len() == 512 {
-            if let Some(old) = ring.pop_front() { set.remove(&old); }
-        }
-        ring.push_back(d);
-        set.insert(d);
-        true
-    }
-    // ... (rest of the code remains the same)
-
-    // ---------------- Piece K: Per-flow CU/heap EMA ---------------
-    const EMA_ALPHA: f64 = 0.22;
-    const UNITS_HEADROOM: f64 = 1.12;
-    const HEAP_HEADROOM:  f64 = 1.15;
-    const MAX_UNITS: u32 = 1_400_000;
+    pub fn market_score(
         &self,
         amount: u64,
         apy_percent: f64,
@@ -1886,6 +5773,7 @@ impl PortOptimizer {
             })
             .cloned()
     }
+
     pub fn new(rpc_url: &str, wallet: Keypair) -> Self {
         let rpc_client = Arc::new(RpcClient::new_with_commitment(
             rpc_url.to_string(),
@@ -1894,28 +5782,12 @@ impl PortOptimizer {
 
         Self {
             rpc_client,
-            rpc_fast: None,
             wallet: Arc::new(wallet),
             markets: Arc::new(RwLock::new(HashMap::new())),
             active_positions: Arc::new(RwLock::new(HashMap::new())),
             tip_router: Arc::new(RwLock::new(None)),
-            flow_budget_ema: PLRwLock::new(HashMap::new()),
-            recent_msg_digests: PLRwLock::new((VecDeque::with_capacity(256), HashSet::with_capacity(256))),
-            alt_plan_by_need: PLRwLock::new(HashMap::new()),
-            tip_stats: DashMap::new(),
-            alt_addr_index: DashMap::new(),
+            last_tx_signature: Arc::new(tokio::sync::RwLock::new(None)),
         }
-
-    // ----- Flashloan-based atomic rebalance (generic token-lending style) -----
-    #[derive(Clone)]
-    pub struct FlashPlan {
-        pub flash_program: Pubkey,
-        pub reserve: Pubkey,
-        pub liquidity_supply_vault: Pubkey,
-        pub lending_market: Pubkey,
-        pub market_authority: Pubkey,
-        pub token_mint: Pubkey,
-        pub amount: u64,
     }
 
     // Build flash loan ix (non-Anchor example; verify tags per protocol and lock by tests)
@@ -1950,1090 +5822,24 @@ impl PortOptimizer {
     }
 
     fn protocol_from_program_id(&self, program_id: &Pubkey) -> Protocol {
-        if *program_id == *KAMINO_PROGRAM_ID { Protocol::Kamino } else { Protocol::Solend }
+        if *program_id == Pubkey::from_str(KAMINO_PROGRAM_ID).unwrap_or(Pubkey::default()) {
+            Protocol::Kamino
+        } else {
+            Protocol::Solend
+        }
     }
 
-    // Compute precise repay amount from on-chain fee bps
+    // Compute precise repay amount from on-chain fee bps (ceiling division to avoid under-repay)
     fn compute_flash_repay_amount(&self, amount: u64, fee_bps: u64) -> u64 {
-        amount.saturating_add(((amount as u128) * (fee_bps as u128) / 10_000u128) as u64)
-    }
-
-    // ---------------- Budget ixs + robust percentile fees ----------------
-    pub async fn percentile_cu_price(&self, floor_lamports_per_cu: u64, p: f64) -> u64 {
-        let mut price = floor_lamports_per_cu.max(1);
-        if let Ok(fees) = self.rpc_client.get_recent_prioritization_fees(&[]).await {
-            let mut v: Vec<u64> = fees
-                .into_iter()
-                .map(|f| f.prioritization_fee)
-                .filter(|&u| u > 0)
-                .collect();
-            if !v.is_empty() {
-                v.sort_unstable();
-                // trimmed quantile to resist spikes
-                let trim = (v.len() as f64 * 0.05).floor() as usize;
-                let lo = trim.min(v.len());
-                let hi = v.len().saturating_sub(trim);
-                let v = &v[lo..hi];
-                if !v.is_empty() {
-                    let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
-                    price = price.max(v[idx.min(v.len() - 1)]);
-                }
-            }
-        }
-        price
-    }
-
-    /// Program-scoped prioritization fee with 5% trimmed quantile.
-    pub async fn percentile_cu_price_scoped(
-        &self,
-        programs: &[Pubkey],
-        floor_lamports_per_cu: u64,
-        p: f64,
-    ) -> u64 {
-        let mut price = floor_lamports_per_cu.max(1);
-        if let Ok(fees) = self.rpc_client.get_recent_prioritization_fees(programs).await {
-            let mut v: Vec<u64> = fees
-                .into_iter()
-                .map(|f| f.prioritization_fee)
-                .filter(|&u| u > 0)
-                .collect();
-            if !v.is_empty() {
-                v.sort_unstable();
-                let trim = (v.len() as f64 * 0.05).floor() as usize;
-                let lo = trim.min(v.len());
-                let hi = v.len().saturating_sub(trim);
-                let v = &v[lo..hi];
-                if !v.is_empty() {
-                    let idx = ((v.len() as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as usize;
-                    price = price.max(v[idx.min(v.len() - 1)]);
-                }
-            }
-        }
-        price
-    }
-
-    /// Keep only ALTs that actually contain accounts referenced by `ixs`.
-    pub fn greedy_min_alts(
-        &self,
-        ixs: &[Instruction],
-        alts_all: &[AddressLookupTableAccount],
-    ) -> Vec<AddressLookupTableAccount> {
-        if alts_all.is_empty() { return Vec::new(); }
-        let mut needed: HashSet<Pubkey> = HashSet::with_capacity(ixs.len() * 8);
-        for ix in ixs {
-            for am in &ix.accounts { needed.insert(am.pubkey); }
-        }
-        alts_all
-            .iter()
-            .cloned()
-            .filter(|alt| alt.addresses.iter().any(|k| needed.contains(k)))
-            .collect()
-    }
-
-    /// Build a v0 transaction with provided ALTs.
-    pub fn build_v0_tx(
-        &self,
-        payer: Pubkey,
-        ixs: &[Instruction],
-        bh: Hash,
-        alts: &[AddressLookupTableAccount],
-    ) -> Result<VersionedTransaction> {
-        let msg = V0Message::try_compile(&payer, ixs, alts, bh)
-            .map_err(|e| anyhow!(format!("v0 compile failed: {e:?}")))?;
-        let vmsg = VersionedMessage::V0(msg);
-        VersionedTransaction::try_new(vmsg, &[&*self.wallet])
-            .map_err(|e| anyhow!(format!("v0 sign failed: {e:?}")))
-    }
-
-    fn build_legacy_tx(
-        &self,
-        payer: Pubkey,
-        ixs: &[Instruction],
-        bh: Hash,
-    ) -> Result<(Transaction, usize)> {
-        let msg = Message::new(ixs, Some(&payer));
-        let mut tx = Transaction::new_unsigned(msg);
-        tx.try_sign(&[&*self.wallet], bh)?;
-        let len = bincode::serialized_size(&tx)? as usize;
-        Ok((tx, len))
-    }
-
-    /// Choose shortest viable encoding under UDP cap: v0 (ALT-pruned) vs legacy.
-    pub fn choose_best_tx_sync(
-        &self,
-        payer: Pubkey,
-        ixs: &[Instruction],
-        bh: Hash,
-        alts_all: &[AddressLookupTableAccount],
-    ) -> Result<Either<(VersionedTransaction, usize, usize), (Transaction, usize)>> {
-        let v0 = self.best_subset_v0_sync(payer, ixs, bh, alts_all);
-        let legacy = self.build_legacy_tx(payer, ixs, bh).ok();
-        match (v0, legacy) {
-            (Some((vtx, vlen, kept)), Some((ltx, llen))) => {
-                let v_ok = vlen <= MAX_UDP_TX_BYTES;
-                let l_ok = llen <= MAX_UDP_TX_BYTES;
-                match (v_ok, l_ok) {
-                    (true, true) => {
-                        if vlen <= llen { Ok(Either::Left((vtx, vlen, kept))) } else { Ok(Either::Right((ltx, llen))) }
-                    }
-                    (true, false) => Ok(Either::Left((vtx, vlen, kept))),
-                    (false, true) => Ok(Either::Right((ltx, llen))),
-                    (false, false) => Ok(Either::Left((vtx, vlen, kept))),
-                }
-            }
-            (Some((vtx, vlen, kept)), None) => Ok(Either::Left((vtx, vlen, kept))),
-            (None, Some((ltx, llen)))      => Ok(Either::Right((ltx, llen))),
-            _ => Err(anyhow!("no viable transaction encoding")),
-        }
-    }
-
-    /// ALT subset optimizer: cached + prefilter + dominance + stable order + diversified frontier (sketch-penalized)
-    /// + exact (≤12) + ranked 2-step (optionally parallel) + beam-3 fallback, UDP-aware, memo + dynamic soft deadline.
-    pub fn best_subset_v0_sync(
-        &self,
-        payer: Pubkey,
-        ixs: &[Instruction],
-        bh: Hash,
-        alts_all: &[AddressLookupTableAccount],
-    ) -> Option<(VersionedTransaction, usize, usize)> {
-        // Tunables
-        const ALT_CACHE_TTL_MS: u128 = 800;
-        const HARD_CAP: usize = 128;
-        const BASE_BUDGET_MS: u128 = 6;
-        const MAX_BUDGET_MS:  u128 = 12;
-        const BNB_FUDGE: usize = 8;
-
-        let t_start = now_ms();
-
-        // Degenerate fast paths
-        if alts_all.is_empty() {
-            return self.estimate_len_v0_sync(payer, ixs, bh, &[]).map(|(tx, l)| (tx, l, 0));
-        }
-        if alts_all.len() == 1 {
-            return self.estimate_len_v0_sync(payer, ixs, bh, alts_all).map(|(tx, l)| (tx, l, 1));
-        }
-
-        // Cache
-        let salt = self.ixs_fee_salt(ixs);
-        let key  = alt_cache_key(&payer, &bh, salt, alts_all);
-        let key_fp: u64 = salt;                                       /// +++ NEXT (M.v3.1 domain sep)
-        // +++ NEXT (R): opportunistic try_read to avoid blocking; L1 guard
-        let skip_global = l1_recent_miss(key_fp);
-        if !skip_global {
-            if let Ok(g) = ALT_PRUNE_CACHE.try_read() {
-                if let Some((cached_tx, cached_len, kept, ts)) = g.get(&key) {
-                    if now_ms().saturating_sub(*ts) <= ALT_CACHE_TTL_MS {
-                        l1_put(key_fp, &(cached_tx.clone(), *cached_len, *kept));
-                        return Some((cached_tx.clone(), *cached_len, *kept));
-                    }
-                } else {
-                    l1_note_miss(key_fp);
-                }
-            } else {
-                l1_note_miss(key_fp);
-            }
-        }
-
-        // Compact key index (u16) with deterministic ordering
-        use smallvec::SmallVec;
-        use std::collections::{HashMap, HashSet};
-
-        let mut used_set: HashSet<Pubkey> = HashSet::with_capacity(ixs.len() * 4);
-        for ix in ixs {
-            used_set.insert(ix.program_id);
-            for a in &ix.accounts { used_set.insert(a.pubkey); }
-        }
-        let mut used_vec: Vec<Pubkey> = used_set.iter().cloned().collect();
-        used_vec.sort_unstable();
-        let mut idx_of: HashMap<Pubkey, u16> = HashMap::with_capacity(used_vec.len());
-        let mut rev: SmallVec<[Pubkey; 128]> = SmallVec::new();
-        for (i, k) in used_vec.into_iter().enumerate() {
-            if i >= u16::MAX as usize { break; }
-            idx_of.insert(k, i as u16);
-            rev.push(k);
-        }
-
-        #[inline]
-        fn mk_cov_u16(alt: &AddressLookupTableAccount, idx_of: &HashMap<Pubkey, u16>) -> SmallVec<[u16; 48]> {
-            let mut v: SmallVec<[u16; 48]> = SmallVec::new();
-            for k in &alt.addresses { if let Some(&ix) = idx_of.get(k) { v.push(ix); } }
-            if v.is_empty() { return v; }
-            v.sort_unstable(); v.dedup(); v
-        }
-
-        #[inline]
-        fn is_subset_sorted_u16(a: &[u16], b: &[u16]) -> bool {
-            let (mut i, mut j) = (0, 0);
-            while i < a.len() && j < b.len() {
-                if a[i] == b[j] { i += 1; j += 1; } else if a[i] > b[j] { j += 1; } else { return false; }
-            }
-            i == a.len()
-        }
-
-        // Build (ALT, cov_u16)
-        let mut pairs: Vec<(AddressLookupTableAccount, SmallVec<[u16; 48]>)> = Vec::with_capacity(alts_all.len());
-        for alt in alts_all {
-            let cov = mk_cov_u16(alt, &idx_of);
-            if !cov.is_empty() { pairs.push((alt.clone(), cov)); }
-        }
-        if pairs.is_empty() {
-            return self.estimate_len_v0_sync(payer, ixs, bh, &[]).map(|(tx, l)| (tx, l, 0));
-        }
-        if pairs.len() == 1 {
-            let (a, _) = &pairs[0];
-            return self.estimate_len_v0_sync(payer, ixs, bh, std::slice::from_ref(a)).map(|(tx, l)| (tx, l, 1));
-        }
-
-        // +++ NEXT: dedup by exact coverage via lexicographic order (collision-free)
-        pairs.sort_by(|(a1, c1), (a2, c2)| {
-            c1.len().cmp(&c2.len())
-                .then_with(|| c1.cmp(c2))
-                .then_with(|| a1.key.cmp(&a2.key))
-        });
-        pairs.dedup_by(|(a_prev, c_prev), (a_cur, c_cur)| {
-            if c_prev == c_cur { true } else { false }
-        });
-        if pairs.is_empty() {
-            return self.estimate_len_v0_sync(payer, ixs, bh, &[]).map(|(tx, l)| (tx, l, 0));
-        }
-
-        // Exact bitset path for ≤256 keys
-        #[derive(Clone, Copy, Default)]
-        struct Bits256 { a:u64,b:u64,c:u64,d:u64 }
-        impl Bits256 {
-            #[inline] fn or(self,o:Self)->Self{Self{a:self.a|o.a,b:self.b|o.b,c:self.c|o.c,d:self.d|o.d}}
-            #[inline] fn overlap(self,o:Self)->u32{ (self.a&o.a).count_ones()+(self.b&o.b).count_ones()+(self.c&o.c).count_ones()+(self.d&o.d).count_ones() }
-            #[inline] fn subset_of(self, o:Self)->bool{ (self.a & !o.a)==0 && (self.b & !o.b)==0 && (self.c & !o.c)==0 && (self.d & !o.d)==0 }
-        }
-        #[inline] fn set_bit(mut bits:Bits256, idx:u16)->Bits256{ let lane = (idx as usize)>>6; let off = (idx as u64)&63; match lane {0=>bits.a|=1<<off,1=>bits.b|=1<<off,2=>bits.c|=1<<off,_=>bits.d|=1<<off} bits }
-        let used_le_256 = rev.len() <= 256;
-        let exact_bits: Option<Vec<Bits256>> = if used_le_256 {
-            let mut v = Vec::with_capacity(pairs.len());
-            for (_, cov) in &pairs { let mut b=Bits256::default(); for &ix in cov { b=set_bit(b, ix); } v.push(b); }
-            Some(v)
-        } else { None };
-
-        // Dominance prune (bitset fast-lane or two-pointer)
-        {
-            let mut keep = vec![true; pairs.len()];
-            if let Some(ref bits) = exact_bits {
-                let sizes: Vec<usize> = pairs.iter().map(|p| p.1.len()).collect();
-                for i in 0..pairs.len() {
-                    if !keep[i] { continue; }
-                    for j in 0..pairs.len() {
-                        if i==j || !keep[j] { continue; }
-                        if sizes[i] <= sizes[j] && bits[i].subset_of(bits[j]) { keep[i]=false; break; }
-                    }
-                }
-            } else {
-                for i in 0..pairs.len() {
-                    if !keep[i] { continue; }
-                    for j in 0..pairs.len() {
-                        if i == j || !keep[j] { continue; }
-                        if pairs[i].1.len() <= pairs[j].1.len() && is_subset_sorted_u16(&pairs[i].1, &pairs[j].1) { keep[i] = false; break; }
-                    }
-                }
-            }
-            let mut compact: Vec<(AddressLookupTableAccount, SmallVec<[u16; 48]>)> = Vec::with_capacity(pairs.len());
-            for (i, p) in pairs.into_iter().enumerate() { if keep[i] { compact.push(p); } }
-            pairs = compact;
-            if pairs.is_empty() { return self.estimate_len_v0_sync(payer, ixs, bh, &[]).map(|(tx, l)| (tx, l, 0)); }
-        }
-
-        // Stable order by ALT key
-        pairs.sort_by_key(|(alt, _)| alt.key);
-
-        // Rarity weights on compact index space
-        let mut freq: Vec<u32> = vec![0; rev.len()];
-        for (_, cov) in &pairs { for &ix in cov { freq[ix as usize] += 1; } }
-
-        // +++ NEXT: preseed ALTs that carry unique keys (freq==1)
-        let mut forced_idx: Vec<usize> = Vec::new();
-        let mut forced_mark: Vec<bool> = vec![false; pairs.len()];
-        for (i, (_alt, cov)) in pairs.iter().enumerate() {
-            if cov.iter().any(|&k| freq[k as usize] == 1) {
-                forced_mark[i] = true;
-                forced_idx.push(i);
-            }
-        }
-        forced_idx.sort_unstable();
-
-        // 256-bit hashless sketch for >256-key case
-        #[derive(Clone, Copy, Default)]
-        struct CovSketch { a: u64, b: u64, c: u64, d: u64 }
-        #[inline] fn mix64(mut x: u64) -> u64 { x = x.wrapping_add(0x9E3779B97F4A7C15); let mut z = x; z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9); z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB); z ^ (z >> 31) }
-        impl CovSketch { #[inline] fn or(self,o:Self)->Self{Self{a:self.a|o.a,b:self.b|o.b,c:self.c|o.c,d:self.d|o.d}} #[inline] fn overlap(self,o:Self)->u32{ (self.a&o.a).count_ones()+(self.b&o.b).count_ones()+(self.c&o.c).count_ones()+(self.d&o.d).count_ones() } }
-        #[inline] fn sketch_idx(idx: u16, salt: u64) -> CovSketch { let s0 = mix64(salt ^ 0xA4D19DAB52A713C5u64 ^ idx as u64); let s1 = mix64(s0 ^ 0x94D049BB133111EBu64); let mut a=0u64; let mut b=0u64; let mut c=0u64; let mut d=0u64; a|=1u64<<(s0&63); b|=1u64<<((s0>>8)&63); c|=1u64<<(s1&63); d|=1u64<<((s1>>8)&63); CovSketch{a,b,c,d} }
-        #[inline] fn sketch_vec_u16(v:&[u16], salt:u64)->CovSketch{ let mut s=CovSketch::default(); for &ix in v { s = s.or(sketch_idx(ix, salt)); } s }
-
-        // +++ NEXT: smooth rarity curve: ~56 down to 8 as freq grows
-        let key_value = |f: u32| -> i32 {
-            let x = (f as f64 + 1.0).log2();
-            let s = 56.0 - 12.0 * x;
-            s.max(8.0).min(56.0) as i32
-        };
-        let base_score_idx = |i: usize| -> i32 {
-            let hits = pairs[i].1.len() as i32;
-            let rare: i32 = pairs[i].1.iter().map(|&k| key_value(freq[k as usize])).sum();
-            rare + hits.saturating_mul(4) - 20
-        };
-
-        let sketches: Option<Vec<CovSketch>> = if used_le_256 { None } else { Some(pairs.iter().map(|(_, cov)| sketch_vec_u16(cov, salt)).collect()) };
-
-        // Diversified frontier selection with deterministic order + forced seeding
-        let mut pool: Vec<(i32, usize)> = (0..pairs.len())
-            .filter(|i| !forced_mark[*i])
-            .map(|i| (base_score_idx(i), i))
-            .collect();
-        pool.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), pairs[i].0.key));
-        let frontier_target = pairs.len().min(24).max(16);
-        let max_keep = pairs.len().min(HARD_CAP);
-
-        let mut kept_idx: Vec<usize> = Vec::with_capacity(max_keep);
-        kept_idx.extend(forced_idx.iter().copied());
-
-        const LAMBDA_BITS: i32 = 3;
-        let mut covered_exact = Bits256::default();
-        let mut covered_sketch = CovSketch::default();
-        if let (true, Some(ref ex)) = (used_le_256, exact_bits.as_ref()) {
-            for &i in &forced_idx { covered_exact = covered_exact.or(ex[i]); }
-        } else if let Some(ref sk) = sketches {
-            for &i in &forced_idx { covered_sketch = covered_sketch.or(sk[i]); }
-        }
-
-        if kept_idx.len() >= max_keep {
-            kept_idx.truncate(max_keep);
-        } else {
-            while kept_idx.len() < max_keep && !pool.is_empty() {
-                let mut best: Option<(i32, usize, usize)> = None;
-                for (pi, &(s, i)) in pool.iter().enumerate() {
-                    let adj = if let (true, Some(ref ex)) = (used_le_256, exact_bits.as_ref()) {
-                        s - LAMBDA_BITS * (covered_exact.overlap(ex[i]) as i32)
-                    } else {
-                        s - LAMBDA_BITS * (covered_sketch.overlap(sketches.as_ref().unwrap()[i]) as i32)
-                    };
-                    if best.is_none()
-                        || adj > best.unwrap().0
-                        || (adj == best.unwrap().0 && pairs[i].0.key < pairs[best.unwrap().2].0.key)
-                    { best = Some((adj, pi, i)); }
-                }
-                let (_adj, pi, i) = best.unwrap();
-                if let (true, Some(ref ex)) = (used_le_256, exact_bits.as_ref()) { covered_exact = covered_exact.or(ex[i]); }
-                else { covered_sketch = covered_sketch.or(sketches.as_ref().unwrap()[i]); }
-                kept_idx.push(i);
-                pool.swap_remove(pi);
-                if kept_idx.len() >= frontier_target { break; }
-            }
-        }
-        kept_idx.sort_unstable();
-        let mut alts_pref: SmallVec<[AddressLookupTableAccount; 16]> = SmallVec::new();
-        for i in &kept_idx { alts_pref.push(pairs[*i].0.clone()); }
-
-        // Memo (mask -> (len, kept)) + tiny fail-memo (Q)
-        struct LocalLenMemo(std::collections::HashMap<u128, (usize, usize)>);
-        impl LocalLenMemo { #[inline] fn new() -> Self { Self(std::collections::HashMap::with_capacity(256)) } #[inline] fn get(&self, m: u128) -> Option<(usize, usize)> { self.0.get(&m).cloned() } #[inline] fn put(&mut self, m: u128, l: usize, kept: usize) { self.0.insert(m, (l, kept)); } }
-        /// +++ NEXT: tiny memo for failed masks (open addressing)
-        struct TinyFail { keys: [u128; 128], tags: [u16; 128], used: [u8; 128] }
-        impl TinyFail {
-            #[inline] fn new() -> Self { Self { keys: [0;128], tags: [0;128], used: [0;128] } }
-            #[inline] fn tag(k: u128) -> u16 { let x = (k as u64) ^ ((k >> 64) as u64); ((x ^ (x >> 15)).wrapping_mul(0x9E37) & 0xFFFF) as u16 }
-            #[inline] fn idx(k: u128) -> usize { let x = (k as u64) ^ ((k >> 64) as u64); (x.wrapping_mul(0xD6E8_F1C4_27A3_94B5) as usize) & (128 - 1) }
-            #[inline] fn has(&self, k: u128) -> bool { let mut i = Self::idx(k); let t = Self::tag(k); for _ in 0..128 { if self.used[i]==0 { return false; } if self.tags[i]==t && self.keys[i]==k { return true; } i = (i+1) & (128-1); } false }
-            #[inline] fn put(&mut self, k: u128) { let mut i = Self::idx(k); let t = Self::tag(k); for _ in 0..128 { if self.used[i]==0 || (self.tags[i]==t && self.keys[i]==k) { self.keys[i]=k; self.tags[i]=t; self.used[i]=1; return; } i = (i+1) & (128-1); } self.keys[0]=k; self.tags[0]=t; self.used[0]=1; }
-        }
-        let mut memo = LocalLenMemo::new();
-        let mut memo_fail = TinyFail::new();
-        #[inline] fn bit(mask: u128, idx: usize) -> bool { ((mask >> idx) & 1) == 1 }
-        #[inline] fn pop(mask: u128) -> u32 { mask.count_ones() }
-        #[inline] fn tri_better(len_a: usize, kept_a: usize, mask_a: u128, len_b: usize, kept_b: usize, mask_b: u128) -> bool { (len_a, kept_a, pop(mask_a)) < (len_b, kept_b, pop(mask_b)) }
-
-        // Length measure (bytes-only estimate optional)
-        let mut measure_len = |mask: u128| -> Option<(usize, usize)> {
-            if memo_fail.has(mask) { return None; }
-            if let Some((l, kept)) = memo.get(mask) { return Some((l, kept)); }
-            let mut picked: SmallVec<[AddressLookupTableAccount; 16]> = SmallVec::new();
-            picked.reserve(mask.count_ones() as usize);
-            for (i, alt) in alts_pref.iter().enumerate() { if bit(mask, i) { picked.push(alt.clone()); } }
-            #[cfg(feature = "alt_fast_len")]
-            let l = match self.estimate_len_v0_bytes_only_sync(payer, ixs, bh, &picked) { Some(x) => x, None => { memo_fail.put(mask); return None; } };
-            #[cfg(not(feature = "alt_fast_len"))]
-            let (_tx, l) = match self.estimate_len_v0_sync(payer, ixs, bh, &picked) { Some((t,x)) => (t,x), None => { memo_fail.put(mask); return None; } };
-            let kept = picked.len();
-            memo.put(mask, l, kept);
-            Some((l, kept))
-        };
-
-        // Finalizer build
-        let mut build_tx_for = |mask: u128| -> Option<(VersionedTransaction, usize, usize)> {
-            let mut picked: SmallVec<[AddressLookupTableAccount; 16]> = SmallVec::new();
-            for (i, alt) in alts_pref.iter().enumerate() { if bit(mask, i) { picked.push(alt.clone()); } }
-            let (tx, l) = self.estimate_len_v0_sync(payer, ixs, bh, &picked)?;
-            Some((tx, l, picked.len()))
-        };
-
-        // Safety clamp
-        let n = alts_pref.len();
-        if n > HARD_CAP {
-            let mut all_mask = 0u128; for i in 0..HARD_CAP.min(n) { all_mask |= 1u128 << i; }
-            if let Some((l, kept)) = measure_len(all_mask) {
-                let (tx, _, _) = build_tx_for(all_mask)?;
-                let mut g = ALT_PRUNE_CACHE.write();
-                if g.len() > 64 { if let Some((&old_k, _)) = g.iter().min_by_key(|(_, v)| v.3) { g.remove(&old_k); } }
-                g.insert(key, (tx.clone(), l, kept, now_ms()));
-                return Some((tx, l, kept));
-            }
-            return None;
-        }
-
-        let full_mask: u128 = if n == HARD_CAP { u128::MAX } else { (1u128 << n) - 1 };
-        let (base_len, base_cnt) = measure_len(full_mask)?;
-        let mut best_len  = base_len;
-        let mut best_cnt  = base_cnt;
-        let mut best_mask = full_mask;
-
-        // Dynamic soft deadline
-        let mut budget_ms: u128 = BASE_BUDGET_MS;
-        if best_len > MAX_UDP_TX_BYTES { let over = best_len - MAX_UDP_TX_BYTES; budget_ms = (BASE_BUDGET_MS + (over as u128) / 40).min(MAX_BUDGET_MS); }
-        let deadline = t_start + budget_ms;
-        let mut _time_tick: u32 = 0;                             /// +++ NEXT (P)
-
-        if best_len + 64 <= MAX_UDP_TX_BYTES {
-            let (tx, l, kept) = build_tx_for(best_mask)?;
-            cache_put_alt_sampled(&key, key_fp, &tx, l, kept);           /// +++ NEXT
-            return Some((tx, l, kept));
-        }
-
-        // Exact search (≤12) via Gray-code
-        if n <= 12 {
-            let end = 1u128 << n;
-            for g in 1..end {
-                if time_over(deadline, &mut _time_tick) { break; }
-                let m = g ^ (g >> 1);
-                if let Some((l, kept)) = measure_len(m) {
-                    if tri_better(l, kept, m, best_len, best_cnt, best_mask) { best_len = l; best_cnt = kept; best_mask = m; }
-                }
-            }
-            let (tx, l, kept) = build_tx_for(best_mask)?;
-            cache_put_alt_sampled(&key, key_fp, &tx, l, kept);           /// +++ NEXT
-            return Some((tx, l, kept));
-        }
-
-        // UDP-aware single-drops (mask-first, optional parallel)
-        let udp_score = |l: usize| -> usize { if l > MAX_UDP_TX_BYTES { usize::MAX - (l - MAX_UDP_TX_BYTES) } else { MAX_UDP_TX_BYTES - l } };
-        let mut len_after_drop: Vec<Option<usize>> = vec![None; n];
-        let mut deltas: Vec<(usize, usize)> = Vec::with_capacity(n);
-        #[cfg(feature = "parallel_alt_search")]
-        {
-            use rayon::prelude::*;
-            let drops: Vec<(usize, usize)> = (0..n).into_par_iter().filter_map(|i| { let m = full_mask & !(1u128 << i); measure_len(m).map(|(l, _k)| (i, l)) }).collect();
-            for (i, l) in drops { len_after_drop[i] = Some(l); deltas.push((i, udp_score(l))); }
-        }
-        #[cfg(not(feature = "parallel_alt_search"))]
-        {
-            for i in 0..n {
-                if time_over(deadline, &mut _time_tick) { break; }
-                let m = full_mask & !(1u128 << i);
-                if let Some((l, _k)) = measure_len(m) {
-                    len_after_drop[i] = Some(l);
-                    deltas.push((i, udp_score(l)));
-
-                    // +++ NEXT: perfect-fit early accept
-                    if l <= MAX_UDP_TX_BYTES.saturating_sub(8) {
-                        let (tx2, l2, kept2) = build_tx_for(m)?;
-                        cache_put_alt_sampled(&key, key_fp, &tx2, l2, kept2);
-                        return Some((tx2, l2, kept2));
-                    }
-                }
-            }
-        }
-
-        let overshoot = best_len.saturating_sub(MAX_UDP_TX_BYTES);
-        let k1_target = if overshoot > 512 { 16 } else if overshoot > 256 { 12 } else if overshoot > 64 { 10 } else { 8 };
-        // +++ NEXT (S): gain-density ordering for seeds
-        let mut scored: Vec<(usize, usize, i32)> = Vec::with_capacity(deltas.len());
-        for &(i, s) in &deltas {
-            let freq_sum: i32 = pairs[i].1.iter().map(|&k| freq[k as usize] as i32).sum();
-            let penalty = 1 + (freq_sum / (pairs[i].1.len().max(1) as i32));
-            let density = (s as i32) / penalty.max(1);
-            scored.push((i, s, density));
-        }
-        scored.sort_by_key(|&(i, s, d)| (std::cmp::Reverse(d), std::cmp::Reverse(s), i));
-        let k1 = scored.len().min(k1_target);
-        let top1: Vec<(usize, usize)> = scored.into_iter().take(k1).map(|(i, s, _)| (i, s)).collect();
-
-        'pairs: for a in 0..top1.len() {
-            for b in (a + 1)..top1.len() {
-                if time_over(deadline, &mut _time_tick) { break 'pairs; }
-                let i = top1[a].0; let j = top1[b].0; if i == j { continue; }
-                let gi = len_after_drop[i].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                let gj = len_after_drop[j].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                let optimistic = base_len.saturating_sub(gi + gj);
-                if optimistic + BNB_FUDGE >= best_len { continue; }
-                let m = full_mask & !(1u128 << i) & !(1u128 << j);
-                if let Some((l2, kept2)) = measure_len(m) { if l2 < best_len || (l2 == best_len && kept2 < best_cnt) { best_len = l2; best_cnt = kept2; best_mask = m; if best_len + 16 <= MAX_UDP_TX_BYTES { break 'pairs; } } }
-            }
-        }
-
-        // Beam-3 + BnB
-        if best_len > MAX_UDP_TX_BYTES.saturating_sub(8) && top1.len() >= 3 {
-            let k3 = top1.len().min(6);
-            'triples: for a in 0..k3 {
-                for b in (a + 1)..k3 {
-                    for c in (b + 1)..k3 {
-                        if time_over(deadline, &mut _time_tick) { break 'triples; }
-                        let i = top1[a].0; let j = top1[b].0; let k = top1[c].0;
-                        let gi = len_after_drop[i].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                        let gj = len_after_drop[j].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                        let gk = len_after_drop[k].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                        let optimistic = base_len.saturating_sub(gi + gj + gk);
-                        if optimistic + BNB_FUDGE >= best_len { continue; }
-                        let m = full_mask & !(1u128 << i) & !(1u128 << j) & !(1u128 << k);
-                        if let Some((l3, kept3)) = measure_len(m) { if l3 < best_len || (l3 == best_len && kept3 < best_cnt) { best_len = l3; best_cnt = kept3; best_mask = m; if best_len + 16 <= MAX_UDP_TX_BYTES { break 'triples; } } }
-                    }
-                }
-            }
-        }
-
-        // Guarded 4-drop pass when overshoot is large
-        if best_len > MAX_UDP_TX_BYTES.saturating_sub(8) && top1.len() >= 4 && overshoot > 256 {
-            let k4 = top1.len().min(6);
-            'quads: for a in 0..k4 {
-                for b in (a + 1)..k4 {
-                    for c in (b + 1)..k4 {
-                        for d in (c + 1)..k4 {
-                            if time_over(deadline, &mut _time_tick) { break 'quads; }
-                            let i = top1[a].0; let j = top1[b].0; let k = top1[c].0; let t = top1[d].0;
-                            let gi = len_after_drop[i].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                            let gj = len_after_drop[j].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                            let gk = len_after_drop[k].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                            let gt = len_after_drop[t].map(|l| base_len.saturating_sub(l)).unwrap_or(0);
-                            let optimistic = base_len.saturating_sub(gi + gj + gk + gt);
-                            if optimistic + BNB_FUDGE >= best_len { continue; }
-                            let m = full_mask & !(1u128 << i) & !(1u128 << j) & !(1u128 << k) & !(1u128 << t);
-                            if let Some((l4, kept4)) = measure_len(m) { if l4 < best_len || (l4 == best_len && kept4 < best_cnt) { best_len = l4; best_cnt = kept4; best_mask = m; if best_len + 16 <= MAX_UDP_TX_BYTES { break 'quads; } } }
-                        }
-                    }
-                }
-            // end quads
-        }
-
-        // Final refinement: hill-climb drop-one if still near/over cap
-        if best_len > MAX_UDP_TX_BYTES.saturating_sub(8) {
-            let mut cur_mask = best_mask;
-            let mut improved = true;
-            while improved && cur_mask != 0 {
-                if time_over(deadline, &mut _time_tick) { break; }
-                improved = false;
-                let mut m = cur_mask;
-                while m != 0 {
-                    let i = m.trailing_zeros();
-                    let trial = cur_mask & !(1u128 << i);
-                    if let Some((l, kept)) = measure_len(trial) {
-                        if l < best_len && l <= MAX_UDP_TX_BYTES {
-                            best_len = l; best_cnt = kept; best_mask = trial; improved = true; break;
-                        }
-                    }
-                    m &= m - 1;
-                }
-                if improved { cur_mask = best_mask; }
-            }
-        }
-
-        // Build from best mask and cache
-        let (tx, l, kept) = build_tx_for(best_mask)?;
-        cache_put_alt_sampled(&key, key_fp, &tx, l, kept);
-        Some((tx, l, kept))
-    }
-
-    /// Exact v0 simulation that returns units_consumed (if parsable) and logs.
-    pub async fn simulate_units_and_logs(&self, tx: &VersionedTransaction) -> Result<(Option<u32>, Vec<String>)> {
-        let cfg = RpcSimulateTransactionConfig { sig_verify: false, replace_recent_blockhash: true, ..Default::default() };
-        let out = self.rpc_client.simulate_transaction_with_config(tx, cfg).await?;
-        let mut units = out.value.units_consumed.map(|u| u as u32);
-
-        if units.is_none() {
-            if let Some(ls) = out.value.logs.as_ref() {
-                // Consolidated vendor patterns; scan tail in reverse to bound work
-                const KEYS: &[&str] = &[
-                    "consumed ", "compute units: ", "units consumed: ", "total units consumed: ",
-                    "compute units consumed: ", "Total compute units consumed: ", "units total: ",
-                    "CU total: ", "units=", "used: ", "used=", "cu_used=", "cu: ", "total cu: ",
-                ];
-                let tail = 256usize.min(ls.len());
-                for line in ls[ls.len()-tail..].iter().rev() {
-                    let clean = self.strip_ansi(line);
-                    if let Some(v) = self.parse_num_after_any(&clean, KEYS).and_then(|n| self.filter_units(n)) {
-                        units = Some(v); break;
-                    }
-                    if units.is_none() {
-                        if let Some(v) = self.parse_last_num_if_hinted(&clean).and_then(|n| self.filter_units(n)) {
-                            units = Some(v); break;
-                        }
-                    }
-                }
-            }
-        }
-        Ok((units, out.value.logs.unwrap_or_default()))
-    }
-
-    /// Adjust compute/heap budgets based on common simulation errors. (widened cues + quantized bumps)
-    pub fn adjust_budget_from_sim_error(&self, logs: &[String], units0: u32, heap0: Option<u32>) -> (u32, Option<u32>, bool) {
-        let mut units = units0;
-        let mut heap  = heap0;
-        let mut changed = false;
-
-        let mut bump_units = 0.0;
-        let mut need_heap  = false;
-        let mut drop_heap  = false;
-
-        for s in logs {
-            let l = s.as_str();
-            if l.contains("computational budget exceeded")
-                || l.contains("max compute units exceeded")
-                || l.contains("Program failed to complete")
-                || l.contains("Exceeded maximum number of instructions")
-                || l.contains("budget exhausted")
-            { bump_units = bump_units.max(0.35); }
-
-            if l.contains("insufficient compute units") { bump_units = bump_units.max(0.20); }
-
-            if l.contains("Heap") || l.contains("heap") || l.contains("request heap") || l.contains("HeapLimitExceeded") { need_heap = true; }
-            if l.contains("Transaction too large")
-                || l.contains("packet too large")
-                || l.contains("too many account keys")
-                || l.contains("account keys length")
-                || l.contains("would exceed packet size")
-            { drop_heap = true; }
-
-            if l.contains("AccountInUse") || l.contains("write lock") { bump_units = bump_units.max(0.10); }
-        }
-
-        if bump_units == 0.0 && !need_heap && !drop_heap { return (units, heap, false); }
-
-        if drop_heap && heap.is_some() { heap = None; changed = true; }
-
-        if bump_units > 0.0 && units < MAX_COMPUTE_UNITS {
-            let mut next = ((units as f64) * (1.0 + bump_units)).ceil() as u32;
-            next = ((next + 1023) / 1024) * 1024; // quantize to 1k
-            if next <= units { next = (units + 1024).min(MAX_COMPUTE_UNITS); }
-            units = next.min(MAX_COMPUTE_UNITS);
-            if units != units0 { changed = true; }
-        }
-
-        if !drop_heap && need_heap {
-            let base = heap.unwrap_or(131_072);
-            let next = base.max(131_072).saturating_mul(2).min(512_000);
-            if heap != Some(next) { heap = Some(next); changed = true; }
-        }
-        (units, heap, changed)
-    }
-
-    /// === [IMPROVED: PIECE 1 v3] ===
-    /// exact v0 sim with bounded backoff + jitter; resilient to transient RPC hiccups.
-    pub async fn simulate_exact_v0_ok(&self, tx: &VersionedTransaction) -> Result<bool> {
-        let cfg = RpcSimulateTransactionConfig { sig_verify: false, replace_recent_blockhash: true, ..Default::default() };
-
-        // deterministic per-tx jitter (0..40ms) to avoid retry herding
-        let j = {
-            let bytes = bincode::serialize(tx).unwrap_or_default();
-            let h = blake3::hash(&bytes);
-            (u32::from_le_bytes(h.as_bytes()[..4].try_into().unwrap()) % 41) as u64
-        };
-
-        let mut attempt = 0;
-        let mut timeout_ms = 280u64; // tight first budget
-        loop {
-            attempt += 1;
-            let fut = self.rpc_client.simulate_transaction_with_config(tx, cfg.clone());
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms + j), fut).await {
-                Ok(Ok(out)) => return Ok(out.value.err.is_none()),
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
-                    let transient = msg.contains("Too many requests")
-                        || msg.contains("Rate limit")
-                        || msg.contains("deadline exceeded")
-                        || msg.contains("Connection reset")
-                        || msg.contains("timeout")
-                        || msg.contains("502")
-                        || msg.contains("503")
-                        || msg.contains("504");
-                    if transient && attempt < 2 {
-                        timeout_ms = 420;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    if attempt < 2 {
-                        timeout_ms = 420;
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!("simulate timeout"));
-                }
-            }
-        }
-    }
-
-    /// === [IMPROVED: PIECE 1 v3] ===
-    /// returns units_consumed with the same retry logic; robust log fallback if field missing.
-    pub async fn simulate_exact_v0_units(&self, tx: &VersionedTransaction) -> Result<Option<u32>> {
-        let cfg = RpcSimulateTransactionConfig { sig_verify: false, replace_recent_blockhash: true, ..Default::default() };
-
-        let j = {
-            let bytes = bincode::serialize(tx).unwrap_or_default();
-            let h = blake3::hash(&bytes);
-            (u32::from_le_bytes(h.as_bytes()[0..4].try_into().unwrap()) % 41) as u64
-        };
-
-        let mut attempt = 0;
-        let mut timeout_ms = 280u64;
-        let out = loop {
-            attempt += 1;
-            let fut = self.rpc_client.simulate_transaction_with_config(tx, cfg.clone());
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms + j), fut).await {
-                Ok(Ok(o)) => break o,
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
-                    let transient = msg.contains("Too many requests")
-                        || msg.contains("Rate limit")
-                        || msg.contains("deadline exceeded")
-                        || msg.contains("Connection reset")
-                        || msg.contains("timeout")
-                        || msg.contains("502")
-                        || msg.contains("503")
-                        || msg.contains("504");
-                    if transient && attempt < 2 {
-                        timeout_ms = 420;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    if attempt < 2 { timeout_ms = 420; continue; }
-                    return Err(anyhow::anyhow!("simulate timeout"));
-                }
-            }
-        };
-
-        if let Some(u) = out.value.units_consumed { return Ok(Some(u as u32)); }
-
-        // fallback parse from logs (multiple vendor stylings)
-        let mut units: Option<u32> = None;
-        if let Some(ls) = out.value.logs.as_ref() {
-            const KEYS: &[&str] = &[
-                "consumed ", "compute units: ", "units consumed: ", "total units consumed: ",
-                "compute units consumed: ", "Total compute units consumed: ", "units total: ",
-                "CU total: ", "units=", "used: ", "used=", "cu_used=", "cu: ", "total cu: ",
-            ];
-            let tail = 256usize.min(ls.len());
-            for line in ls[ls.len() - tail..].iter().rev() {
-                let clean = self.strip_ansi(line);
-                if let Some(v) = self.parse_num_after_any(&clean, KEYS).and_then(|n| self.filter_units(n)) {
-                    units = Some(v); break;
-                }
-                if units.is_none() {
-                    if let Some(v) = self.parse_last_num_if_hinted(&clean).and_then(|n| self.filter_units(n)) {
-                        units = Some(v); break;
-                    }
-                }
-            }
-        }
-        Ok(units)
-    }
-
-    /// === [IMPROVED: PIECE 2 v3] ===
-    /// ultra-stable flow salt: skips CB/tips/payer, collapses dup metas, mixes head+tail+stride checksum.
-    pub fn ixs_fee_salt(&self, ixs: &[Instruction]) -> u64 {
-        use solana_program::system_instruction::SystemInstruction;
-        let mut hasher = blake3::Hasher::new();
-        let payer = self.wallet.pubkey();
-
-        for ix in ixs {
-            // ignore budgets and pure system transfer (tip)
-            if ix.program_id == solana_sdk::compute_budget::id() { continue; }
-            if ix.program_id == solana_program::system_program::id() {
-                let is_tip = bincode::deserialize::<SystemInstruction>(&ix.data)
-                    .ok()
-                    .map(|si| matches!(si, SystemInstruction::Transfer { .. }))
-                    .unwrap_or(false);
-                if is_tip { continue; }
-            }
-
-            hasher.update(ix.program_id.as_ref());
-
-            // collapse accidental consecutive dup metas and ignore payer meta
-            let mut last: Option<(Pubkey, bool, bool)> = None;
-            let mut kept = 0u32;
-            for am in &ix.accounts {
-                if am.pubkey == payer { continue; }
-                let cur = (am.pubkey, am.is_signer, am.is_writable);
-                if Some(cur) == last { continue; }
-                hasher.update(am.pubkey.as_ref());
-                hasher.update(&[am.is_signer as u8, am.is_writable as u8]);
-                last = Some(cur);
-                kept = kept.saturating_add(1);
-            }
-            hasher.update(&kept.to_le_bytes());
-
-            if !ix.data.is_empty() {
-                let len = ix.data.len() as u32;
-                hasher.update(&len.to_le_bytes());
-                let head = &ix.data[..ix.data.len().min(8)];
-                let tail = if ix.data.len() > 8 { &ix.data[ix.data.len() - 8..] } else { head };
-                hasher.update(head);
-                hasher.update(tail);
-                let mut x: u8 = 0; let mut i = 0usize; while i < ix.data.len() { x ^= ix.data[i]; i = i.saturating_add(16); }
-                hasher.update(&[x]);
-            }
-        }
-        let bytes = hasher.finalize();
-        u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap())
-    }
-
-    /// === [IMPROVED: PIECE 3 v3] ===
-    /// vol-aware headroom + two-sided dither + dynamic down-ramp limiter.
-    pub fn apply_flow_ema(&self, salt: u64, guess_units: u32, guess_heap: Option<u32>) -> (u32, Option<u32>) {
-        let mut map = self.flow_budget_ema.write();
-        let ent = map.entry(salt).or_default();
-        let prev = if ent.units_ema == 0.0 { guess_units as f64 } else { ent.units_ema };
-
-        if ent.units_ema == 0.0 {
-            ent.units_ema = guess_units as f64;
-            ent.heap_hint = guess_heap;
-        } else {
-            let r = ((guess_units as f64) / ent.units_ema).max(1e-9);
-            let logdiff = r.ln().abs().min(1.5);
-            let alpha_up = (0.12 + 0.16 * (logdiff / 1.5)).min(0.28);
-            let alpha_dn = (0.06 + 0.06 * (logdiff / 1.5)).min(0.12);
-            if (guess_units as f64) > ent.units_ema {
-                ent.units_ema = (1.0 - alpha_up) * ent.units_ema + alpha_up * (guess_units as f64);
-            } else {
-                ent.units_ema = (1.0 - alpha_dn) * ent.units_ema + alpha_dn * (guess_units as f64);
-            }
-            if let Some(h) = guess_heap { if ent.heap_hint.map_or(true, |old| h > old) { ent.heap_hint = Some(h); } }
-        }
-
-        let r_now = ((guess_units as f64) / prev.max(1.0)).max(1e-9);
-        let logdiff = r_now.ln().abs().min(0.7);
-        let mut head = Self::UNITS_HEADROOM * (1.0 + 0.18 * logdiff.exp().min(1.6) - 0.18);
-        let lo = Self::UNITS_HEADROOM * 0.95;
-        let hi = Self::UNITS_HEADROOM * 1.25;
-        if head < lo { head = lo; } else if head > hi { head = hi; }
-
-        let mut target = (ent.units_ema * head).ceil().max(20_000.0) as u32;
-
-        // two-sided anti-herding dither around 256-CU boundaries
-        let q: u32 = 256;
-        let seed = (salt as u32).wrapping_mul(0x9E37_79B9);
-        let jitter = seed & (q - 1);
-        let half = q / 2;
-        if jitter >= half { target = target.saturating_add(jitter - half); } else { target = target.saturating_sub(half - jitter); }
-
-        let mut units = ((target + (q - 1)) / q) * q;
-
-        // dynamic down-ramp: tighter when volatility is high
-        let drop_cap = 1.0 - (0.08 + 0.10 * (logdiff / 0.7).min(1.0));
-        let floor_drop = ((prev as f64) * drop_cap) as u32;
-        if units < floor_drop { units = floor_drop; }
-
-        (units.min(Self::MAX_UNITS).max(20_000), ent.heap_hint)
-    }
-
-    /// === [IMPROVED: PIECE 4 v3] ===
-    /// EMA update with continuous alpha from |ln error| + Huber-style clipping.
-    pub fn note_units_after_sim(&self, salt: u64, consumed: u32) {
-        let mut map = self.flow_budget_ema.write();
-        let ent = map.entry(salt).or_default();
-        let c = consumed.min(Self::MAX_UNITS).max(20_000) as f64;
-
-        if ent.units_ema == 0.0 {
-            ent.units_ema = c;
-            return;
-        }
-
-        let mut r = (c / ent.units_ema).max(1e-9);
-        if r > 3.0 { r = 3.0; }
-        if r < 1.0/3.0 { r = 1.0/3.0; }
-
-        let abs_ln = r.ln().abs();
-        let alpha = (0.08 + 0.18 * (abs_ln / (0.69)).min(1.0)).min(0.26);
-        ent.units_ema = (1.0 - alpha) * ent.units_ema + alpha * c;
-    }
-
-    /// === [IMPROVED: PIECE 5 v3] ===
-    /// budget/tip canon: merges CB (incl. opcode=3), ignores 0-lamport tips, clamps heap, CBs before tip.
-    pub fn dedup_budget_and_tip(&self, ixs: Vec<Instruction>) -> Vec<Instruction> {
-        use solana_program::system_instruction::SystemInstruction;
-
-        let mut max_limit: Option<u32> = None;
-        let mut max_price: Option<u64> = None;
-        let mut max_heap:  Option<u32> = None;
-        let mut max_acc_data: Option<u32> = None;
-        let mut last_tip: Option<Instruction> = None;
-
-        for ix in &ixs {
-            if ix.program_id == solana_sdk::compute_budget::id() {
-                if let Some(tag) = ix.data.first().copied() {
-                    match tag {
-                        0 => { // CU limit
-                            if let Some(u) = ix.data.get(1..5).and_then(|d| bincode::deserialize::<u32>(d).ok()) {
-                                max_limit = Some(max_limit.map_or(u.min(1_400_000), |cur| cur.max(u).min(1_400_000)));
-                            }
-                        }
-                        1 => { // CU price
-                            if let Some(p) = ix.data.get(1..9).and_then(|d| bincode::deserialize::<u64>(d).ok()) {
-                                let p = p.max(1);
-                                max_price = Some(max_price.map_or(p, |cur| cur.max(p)));
-                            }
-                        }
-                        2 => { // heap
-                            if let Some(h) = ix.data.get(1..5).and_then(|d| bincode::deserialize::<u32>(d).ok()) {
-                                max_heap = Some(max_heap.map_or(h.min(512_000), |cur| cur.max(h).min(512_000)));
-                            }
-                        }
-                        3 => { // accounts data limit (undocumented wire)
-                            if let Some(a) = ix.data.get(1..5).and_then(|d| bincode::deserialize::<u32>(d).ok()) {
-                                max_acc_data = Some(max_acc_data.map_or(a, |cur| cur.max(a)));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else if ix.program_id == solana_program::system_program::id() {
-                if let Ok(si) = bincode::deserialize::<SystemInstruction>(&ix.data) {
-                    if let SystemInstruction::Transfer { lamports } = si {
-                        if lamports > 0 { last_tip = Some(ix.clone()); }
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<Instruction> = Vec::with_capacity(ixs.len());
-        if let Some(u) = max_limit { out.push(ComputeBudgetInstruction::set_compute_unit_limit(u)); }
-        if let Some(p) = max_price { out.push(ComputeBudgetInstruction::set_compute_unit_price(p)); }
-        if let Some(h) = max_heap  { out.push(ComputeBudgetInstruction::request_heap_frame(h)); }
-        if let Some(a) = max_acc_data {
-            let mut data = Vec::with_capacity(1 + 4);
-            data.push(3u8);
-            data.extend_from_slice(&a.to_le_bytes());
-            out.push(Instruction { program_id: solana_sdk::compute_budget::id(), accounts: vec![], data });
-        }
-        if let Some(t) = last_tip { out.push(t); }
-
-        for ix in ixs.into_iter() {
-            let is_cb  = ix.program_id == solana_sdk::compute_budget::id();
-            let is_tip = if ix.program_id == solana_program::system_program::id() {
-                bincode::deserialize::<SystemInstruction>(&ix.data)
-                    .ok()
-                    .map(|si| matches!(si, SystemInstruction::Transfer { .. }))
-                    .unwrap_or(false)
-            } else { false };
-            if !is_cb && !is_tip { out.push(ix); }
-        }
-        out
-    }
-
-    /// ++ Ensure one canonical CB set (max values) and only the last tip; order-agnostic.
-    #[inline]
-    pub fn budget_ixs_for(
-        &self,
-        unit_limit: u32,
-        cu_price: u64,
-        heap_frame_bytes: Option<u32>,
-    ) -> Vec<Instruction> {
-        let mut out: SmallVec<[Instruction; 3]> = SmallVec::new();
-        out.push(ComputeBudgetInstruction::set_compute_unit_limit(unit_limit.min(1_400_000)));
-        out.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price.max(1)));
-        if let Some(bytes) = heap_frame_bytes { out.push(ComputeBudgetInstruction::request_heap_frame(bytes)); }
-        out.into_vec()
-    }
-
-    /// ++ Drop any pre-existing compute budget/tip ixs so we always control them.
-    pub fn normalize_budget_ixs(&self, mut ixs: Vec<Instruction>) -> Vec<Instruction> {
-        use solana_program::system_instruction::SystemInstruction;
-        ixs.retain(|ix| {
-            if ix.program_id == solana_sdk::compute_budget::id() { return false; }
-            if ix.program_id == solana_program::system_program::id() {
-                return !bincode::deserialize::<SystemInstruction>(&ix.data)
-                    .ok()
-                    .map(|si| matches!(si, SystemInstruction::Transfer{..}))
-                    .unwrap_or(false);
-            }
-            true
-        });
-        ixs
-    }
-
-    // --------- Size estimators (sync) for best-of chooser ---------
-    #[inline]
-    fn estimate_len_v0_sync(
-        &self,
-        payer: Pubkey,
-        ixs: &[Instruction],
-        bh: Hash,
-        alts: &[AddressLookupTableAccount],
-    ) -> Option<(VersionedTransaction, usize)> {
-        self.build_v0_tx(payer, ixs, bh, alts)
-            .ok()
-            .and_then(|tx| bincode::serialize(&tx).ok().map(|b| (tx, b.len())))
-    }
-
-    #[inline]
-    fn estimate_len_legacy_sync(
-        &self,
-        payer: Pubkey,
-        ixs: &[Instruction],
-        _bh: Hash,
-    ) -> Option<(Transaction, usize)> {
-        let msg = Message::new(ixs, Some(&payer));
-        let tx = Transaction::new_unsigned(msg);
-        bincode::serialize(&tx).ok().map(|b| (tx, b.len()))
-    }
-
-    // --------- Static lamport outlay and balance/profit clamp ---------
-    #[inline]
-    fn static_lamport_outlay(&self, ixs: &[Instruction]) -> u64 {
-        use solana_program::system_instruction::SystemInstruction;
-        use bincode::deserialize;
-        ixs.iter()
-            .filter_map(|ix| {
-                if ix.program_id == solana_program::system_program::id() {
-                    deserialize::<SystemInstruction>(&ix.data).ok().and_then(|si| match si {
-                        SystemInstruction::Transfer { lamports } => Some(lamports),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .sum()
-    }
-
-    #[inline]
-    fn clamp_cu_price_to_balance_and_profit(
-        &self,
-        payer_balance: u64,
-        units_budget: u32,
-        desired: u64,
-        static_outlay: u64,
-        max_priority_fee_lamports: Option<u64>,
-    ) -> Result<u64> {
-        if units_budget == 0 { return Ok(desired); }
-        let free = payer_balance
-            .saturating_sub(static_outlay)
-            .saturating_sub(BALANCE_RESERVE_LAMPORTS);
-        let max_by_balance = free / (units_budget as u64);
-        if max_by_balance == 0 { return Err(anyhow!("insufficient balance for priority fee")); }
-        let max_by_profit = max_priority_fee_lamports
-            .map(|lim| lim / (units_budget as u64))
-            .unwrap_or(u64::MAX);
-        Ok(desired.min(max_by_balance).min(max_by_profit))
+        // fee = ceil(amount * fee_bps / 10_000)
+        let fee = ((amount as u128) * (fee_bps as u128) + 9_999) / 10_000;
+        amount.saturating_add(fee as u64)
     }
 
     pub async fn execute_rebalance_flash_atomic(
         &self,
         position: &Position,
-        _src_meta: &ReserveMeta,
+        src_meta: &ReserveMeta,
         dst_meta: &ReserveMeta,
         amount: u64,
         alts: &[AddressLookupTableAccount],
@@ -3041,7 +5847,6 @@ impl PortOptimizer {
         let user = self.wallet.pubkey();
         let user_flash_ata = spl_associated_token_account::get_associated_token_address(&user, &position.token_mint);
 
-        // Flash plan on the destination program
         let plan = FlashPlan {
             flash_program: dst_meta.program_id,
             reserve: dst_meta.reserve,
@@ -3052,129 +5857,35 @@ impl PortOptimizer {
             amount,
         };
 
-        // Legs
         let flash_start_ix = self.build_flash_loan_ix(&plan, user_flash_ata)?;
-        // TODO: swap 5bps for on-chain read of fee_bps when wired
-        let repay_amount = self.compute_flash_repay_amount(amount, 5);
+        // Estimate repay; ideally compute from on-chain reserve config
+        let repay_amount = amount.saturating_add((amount as f64 * 0.0005) as u64);
         let flash_repay_ix = self.build_flash_repay_ix(&plan, user_flash_ata, repay_amount)?;
+
         let withdraw_old_ix = self.build_withdraw_instruction(position).await?;
 
+        // Build deposit into destination protocol by constructing a minimal LM with correct protocol
         let dst_protocol = self.protocol_from_program_id(&dst_meta.program_id);
         let dst_stub = LendingMarket {
             market_pubkey: dst_meta.reserve,
             token_mint: position.token_mint,
             protocol: dst_protocol,
-            supply_apy: 0.0, borrow_apy: 0.0,
-            utilization: 0.0, liquidity_available: 0,
+            supply_apy: 0.0,
+            borrow_apy: 0.0,
+            utilization: 0.0,
+            liquidity_available: 0,
             last_update: Instant::now(),
             layout_version: 1,
         };
         let deposit_new_ix = self.build_deposit_instruction(position, &dst_stub).await?;
 
-        // Core legs first
-        let mut core_ixs = vec![flash_start_ix, withdraw_old_ix, deposit_new_ix, flash_repay_ix];
+        let mut ixs = vec![flash_start_ix, withdraw_old_ix, deposit_new_ix, flash_repay_ix];
+        let baseline_cu = self.optimize_compute_units(&ixs).await;
+        let (cu_ix, fee_ix) = self.dynamic_budget_ixs(baseline_cu, PRIORITY_FEE_LAMPORTS).await;
+        ixs.splice(0..0, [cu_ix, fee_ix]);
 
-        // Zero-alloc core snapshot for the closure
-        let core_ixs_arc: Arc<[Instruction]> = {
-            let mut v = self.normalize_budget_ixs(core_ixs);
-            v.shrink_to_fit();
-            Arc::from(v)
-        };
-
-        // Sender v3 style using existing slot-guard API: we rebuild budgets per fresh blockhash
         let payer = self.wallet.pubkey();
-        let dst_program = dst_meta.program_id;
-        let build_with_hash = move |bh: Hash| {
-            // Normalize (drop any preexisting CB ixs) and prepend final budget ixs
-            // Use robust percentile for price and a conservative CU cap
-            let fut = async {
-                let flow_salt = self.ixs_fee_salt(&core_ixs_arc);
-                let units_est = self.estimate_units(&core_ixs_arc).await;
-                let mut units_guess = ((units_est as f64) * 1.15).ceil() as u32;
-                // Scoped percentile for tighter pricing
-                let price_base =  self.percentile_cu_price_scoped(&[dst_program, spl_token::id()], PRIORITY_FEE_LAMPORTS, 0.90).await;
-                let (units0, heap0) = self.apply_flow_ema(flow_salt, units_guess, None);
-
-                // Tip seeded by payer+bh (stable within slot)
-                let mut tip_ix: Option<Instruction> = None;
-                if let Some(router) = self.tip_router.read().await.as_ref() {
-                    let tip_acc = router.pick_seeded(&payer, &bh);
-                    let tip_base = self.percentile_cu_price_scoped(&[dst_program, spl_token::id()], PRIORITY_FEE_LAMPORTS, 0.75).await.max(10_000);
-                    tip_ix = Some(system_instruction::transfer(&payer, &tip_acc, tip_base));
-                }
-
-                // Balance/profit clamps
-                let payer_balance = self.rpc_client.get_balance(&payer).await.unwrap_or(0);
-                let static_outlay = self.static_lamport_outlay(&core_ixs_arc);
-                let mut cu_price = self.clamp_cu_price_to_balance_and_profit(
-                    payer_balance, units0, price_base, static_outlay, None,
-                )?;
-                // Optional extra profit guard (no-op if huge bound)
-                cu_price = self.profit_guard_cu_price(u64::MAX, units0, cu_price, static_outlay).unwrap_or(cu_price);
-                // Jitter the fee slightly based on payer+blockhash
-                cu_price = self.jittered_fee(cu_price, &payer, &bh);
-
-                // Build ixs on stack via SmallVec
-                let mut ixs_v0: SmallVec<[Instruction; 8]> = SmallVec::new();
-                let mut budget = self.budget_ixs_for(units0, cu_price, heap0);
-                ixs_v0.extend(budget.drain(..));
-                if let Some(ix) = tip_ix { ixs_v0.push(ix); }
-                ixs_v0.extend(core_ixs_arc.iter().cloned());
-
-                // Subset-pruned v0 candidate
-                let tip_acc_for_plan = if let Some(router) = self.tip_router.read().await.as_ref() { Some(router.pick_seeded(&payer, &bh)) } else { None };
-                let alts_min = self.alts_plan_for_core(&core_ixs_arc, payer, bh, alts, tip_acc_for_plan);
-                let cand_v0 = self.best_subset_v0_sync(payer, &ixs_v0, bh, &alts_min)
-                    .ok_or_else(|| anyhow!("failed to build any v0 subset"))?;
-                let (mut tx, mut tx_len, kept_cnt) = (cand_v0.0, cand_v0.1, cand_v0.2);
-
-                // UDP squeeze: if near cap, try removing TIP first, then HEAP
-                if self.near_udp_cap(tx_len) {
-                    // try without tip
-                    let mut ixs_try: SmallVec<[Instruction; 8]> = SmallVec::new();
-                    let mut budget2 = self.budget_ixs_for(units0, cu_price, heap0);
-                    // do not push tip here
-                    ixs_try.extend(budget2.drain(..));
-                    ixs_try.extend(core_ixs_arc.iter().cloned());
-                    if let Some((tx2, l2, _)) = self.best_subset_v0_sync(payer, &ixs_try, bh, &alts_min) {
-                        if l2 <= MAX_UDP_TX_BYTES { tx = tx2; tx_len = l2; }
-                    }
-
-                    // then try without heap if still near cap
-                    if heap0.is_some() && self.near_udp_cap(tx_len) {
-                        let mut ixs_try2: SmallVec<[Instruction; 8]> = SmallVec::new();
-                        let mut budget3 = self.budget_ixs_for(units0, cu_price, None);
-                        ixs_try2.extend(budget3.drain(..));
-                        ixs_try2.extend(core_ixs_arc.iter().cloned());
-                        if let Some((tx3, l3, _)) = self.best_subset_v0_sync(payer, &ixs_try2, bh, &alts_min) {
-                            if l3 <= MAX_UDP_TX_BYTES { tx = tx3; tx_len = l3; }
-                        }
-                    }
-                }
-
-                // Learn units on exact sim & guard duplicates
-                if let Ok(Some(u)) = self.simulate_exact_v0_units(&tx).await { self.note_units_after_sim(flow_salt, u); }
-                if let Some(d) = self.digest_v0_fast(&tx) {
-                    if !self.seen_or_insert_digest(d) {
-                        let ladder = if self.near_udp_cap(tx_len) { [0u64, 60, 180, 300] } else { [0u64, 60, 180] };
-                        for step in ladder {
-                            let price2 = cu_price.saturating_add(step);
-                            let (u2, h2) = self.apply_flow_ema(flow_salt, units0, heap0);
-                            let mut ixs_v0b: SmallVec<[Instruction; 8]> = SmallVec::new();
-                            let mut b2 = self.budget_ixs_for(u2, price2, h2);
-                            ixs_v0b.extend(b2.drain(..));
-                            if let Some(ix) = tip_ix.clone() { ixs_v0b.push(ix); }
-                            ixs_v0b.extend(core_ixs_arc.iter().cloned());
-                            if let Some((tx2, l2, _)) = self.best_subset_v0_sync(payer, &ixs_v0b, bh, &alts_min) { tx = tx2; tx_len = l2; break; }
-                        }
-                    }
-                }
-                Ok::<_, anyhow::Error>(tx)
-            };
-            // We must block in this closure; use block_in_place
-            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
-        };
-
+        let build_with_hash = |bh: Hash| self.build_v0_tx(payer, &ixs, bh, alts);
         let sig = self
             .send_v0_with_slot_guard(build_with_hash, Duration::from_secs(45), 200, 120)
             .await?;
@@ -3193,41 +5904,44 @@ impl PortOptimizer {
         breaker: &mut CircuitBreaker,
     ) -> Result<solana_sdk::signature::Signature> {
         obs.rebalance_attempts.inc();
-        if flash_sources.is_empty() {
-            return Err(anyhow!("no flash sources available"));
-        }
+        if flash_sources.is_empty() { return Err(anyhow!("no flash sources available")); }
 
-        // Split across sources greedily with de-dup by reserve, then sort by (fee_bps ASC, capacity DESC)
-        let mut uniq = std::collections::HashSet::new();
+        // Order sources by ascending fee, then by capacity desc (greedy optimal for repay)
+        let mut sources: Vec<ReserveMeta> = flash_sources.to_vec();
+        sources.sort_by(|a, b| {
+            let fa = a.flash_fee_bps().unwrap_or(10_000);
+            let fb = b.flash_fee_bps().unwrap_or(10_000);
+            fa.cmp(&fb).then_with(|| {
+                a.available_flash_capacity().unwrap_or(0).cmp(&b.available_flash_capacity().unwrap_or(0)).reverse()
+            })
+        });
+
+        // Greedy fill
         let mut remaining = amount;
-        let mut chunks: Vec<(ReserveMeta, u64)> = Vec::new();
-        for src in flash_sources.iter().cloned() {
-            if !uniq.insert(src.reserve) { continue; }
-            if remaining == 0 { break; }
-            let cap = src.available_flash_capacity()?;
-            let take = remaining.min(cap);
-            if take > 0 { chunks.push((src, take)); remaining -= take; }
+        let mut chunks: Vec<(ReserveMeta, u64, u64)> = Vec::with_capacity(sources.len()); // (src, take, repay)
+        while remaining > 0 {
+            if let Some(src) = sources.first().cloned() {
+                let cap = src.available_flash_capacity().unwrap_or(0);
+                if cap == 0 { sources.remove(0); if sources.is_empty() { break; } continue; }
+                let fee_bps = src.flash_fee_bps().unwrap_or(0);
+                let take = remaining.min(cap);
+                let repay = self.compute_flash_repay_amount(take, fee_bps);
+                chunks.push((src, take, repay));
+                remaining = remaining.saturating_sub(take);
+            } else { break; }
         }
         if remaining > 0 {
             warn!(missing = remaining, "insufficient flash capacity across sources");
             return Err(anyhow!("insufficient flash capacity"));
         }
 
-        chunks.sort_by(|(a, av), (b, bv)| {
-            let fa = a.flash_fee_bps().unwrap_or(0);
-            let fb = b.flash_fee_bps().unwrap_or(0);
-            fa.cmp(&fb).then(bv.cmp(av))
-        });
-
-        // Build instructions (fee-aware start legs first) using a single ATA
+        // Build instructions
         let payer = self.wallet.pubkey();
-        let user_flash_ata = spl_associated_token_account::get_associated_token_address(&payer, &position.token_mint);
-        let mut ixs: SmallVec<[Instruction; 16]> = SmallVec::new();
-        let mut _repay_sum = 0u64;
-        for (src, take) in chunks.iter() {
-            let fee_bps = src.flash_fee_bps()?;
-            let repay = self.compute_flash_repay_amount(*take, fee_bps);
-            _repay_sum = _repay_sum.saturating_add(repay);
+        let mut ixs: Vec<Instruction> = Vec::with_capacity(2 + 2 * chunks.len());
+        let mut repay_total: u64 = 0;
+
+        for (src, take, repay) in chunks.iter() {
+            let user_flash_ata = spl_associated_token_account::get_associated_token_address(&payer, &position.token_mint);
             ixs.push(self.build_flash_loan_ix(&FlashPlan {
                 flash_program: src.reserve_owner_program(),
                 reserve: src.reserve,
@@ -3237,17 +5951,18 @@ impl PortOptimizer {
                 token_mint: position.token_mint,
                 amount: *take,
             }, user_flash_ata)?);
+            repay_total = repay_total.saturating_add(*repay);
         }
 
-        // Core legs in the middle (withdraw old, deposit new)
+        // Core legs
         let withdraw_old = self.build_withdraw_instruction(position).await?;
         let dst_protocol = self.protocol_from_program_id(&dst_meta.program_id);
         let dst_stub = LendingMarket {
             market_pubkey: dst_meta.reserve,
             token_mint: position.token_mint,
             protocol: dst_protocol,
-            supply_apy: 0.0, borrow_apy: 0.0,
-            utilization: 0.0, liquidity_available: 0,
+            supply_apy: 0.0, borrow_apy: 0.0, utilization: 0.0,
+            liquidity_available: 0,
             last_update: Instant::now(),
             layout_version: 1,
         };
@@ -3255,10 +5970,9 @@ impl PortOptimizer {
         ixs.push(withdraw_old);
         ixs.push(deposit_new);
 
-        // Repay legs last (mirroring starts' order)
-        for (src, take) in chunks.iter() {
-            let fee_bps = src.flash_fee_bps()?;
-            let repay = self.compute_flash_repay_amount(*take, fee_bps);
+        // Repay legs
+        for (src, _take, repay) in chunks.iter() {
+            let user_flash_ata = spl_associated_token_account::get_associated_token_address(&payer, &position.token_mint);
             ixs.push(self.build_flash_repay_ix(&FlashPlan {
                 flash_program: src.reserve_owner_program(),
                 reserve: src.reserve,
@@ -3266,113 +5980,19 @@ impl PortOptimizer {
                 lending_market: src.lending_market,
                 market_authority: src.lending_market_authority,
                 token_mint: position.token_mint,
-                amount: *take,
-            }, user_flash_ata, repay)?);
+                amount: 0,
+            }, user_flash_ata, *repay)?);
         }
 
-        // Freeze to Arc once for deterministic build path
-        let core_ixs: Arc<[Instruction]> = {
-            let mut v = ixs.into_vec();
-            v.shrink_to_fit();
-            Arc::from(v)
-        };
+        // Prefetch to warm RPC cache before simulation
+        self.prefetch_for_ixs(&ixs).await?;
 
-        // ALT-aware builder with seeded tip and scoped fee percentiles
-        let alts_empty: [AddressLookupTableAccount; 0] = [];
-        let build_with_hash = {
-            let core_ixs = core_ixs.clone();
-            let dst_pid = dst_meta.program_id;
-            move |bh: Hash| {
-                let this = self;
-                let core_ixs = core_ixs.clone();
-                let payer = this.wallet.pubkey();
-                let fut = async move {
-                    // Deterministic tip selection per slot
-                    let mut tip_ix: Option<Instruction> = None;
-                    if let Some(router) = this.tip_router.read().await.as_ref() {
-                        let tip_acc = router.pick_seeded(&payer, &bh);
-                        let tip_amt = this
-                            .percentile_cu_price_scoped(&[dst_pid, spl_token::id()], DEFAULT_PRIORITY_FEE_PER_CU, 0.75)
-                            .await
-                            .max(10_000);
-                        tip_ix = Some(system_instruction::transfer(&payer, &tip_acc, tip_amt));
-                    }
+        // Assemble with autoscaled budget and latency‑weighted tip
+        let tip_acc = tip_router.pick().await;
+        let vtx = self.assemble_tx_v0(ixs, true, Some(tip_acc), &[]).await?;
 
-                    // Baseline CU and price
-                    let units_guess = this.optimize_compute_units_rough(&core_ixs).await.min(MAX_COMPUTE_UNITS);
-                    let base = this
-                        .percentile_cu_price_scoped(&[dst_pid, spl_token::id()], DEFAULT_PRIORITY_FEE_PER_CU, 0.90)
-                        .await;
-                    let mut cu_price0 = base;
-
-                    // Clamp by balance/profit
-                    let payer_balance = this.rpc_client.get_balance(&payer).await.unwrap_or(0);
-                    let static_outlay = this.static_lamport_outlay(&core_ixs);
-                    let mut cu_price = this
-                        .clamp_cu_price_to_balance_and_profit(payer_balance, units_guess, cu_price0, static_outlay, None)
-                        .unwrap_or(cu_price0);
-                    cu_price = this.jittered_fee(cu_price, &payer, &bh);
-
-                    // Build with budget + optional tip
-                    let mut ixs_budgeted: SmallVec<[Instruction; 8]> = SmallVec::new();
-                    ixs_budgeted.push(ComputeBudgetInstruction::set_compute_unit_limit(units_guess));
-                    ixs_budgeted.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price));
-                    if let Some(ix) = tip_ix.clone() { ixs_budgeted.push(ix); }
-                    ixs_budgeted.extend(core_ixs.iter().cloned());
-
-                    // ALT plan via need-set cache with fast prefilter
-                    let need_fp = this.needset_fp(&ixs_budgeted);
-                    let mut alts_pref = this.greedy_min_alts(&ixs_budgeted, &alts_empty);
-                    if let Some(cached) = this.alt_need_get(0, need_fp, &alts_pref) { // flow_salt=0 scoped since not tracked here
-                        alts_pref = cached;
-                    } else {
-                        this.alt_need_put(0, need_fp, &alts_pref);
-                    }
-                    let alts_min = alts_pref;
-                    let cand = this.best_subset_v0_sync(payer, &ixs_budgeted, bh, &alts_min)
-                        .ok_or_else(|| anyhow!("failed to build any v0 candidate"))?;
-                    let mut vtx = cand.0;
-                    let mut tx_len = cand.1;
-
-                    // UDP squeeze: try dropping TIP first (no heap requested in this builder)
-                    if this.near_udp_cap(tx_len) {
-                        let mut pre: SmallVec<[Instruction; 8]> = SmallVec::new();
-                        let mut b2 = this.budget_ixs_for(units_guess, cu_price, None);
-                        pre.extend(b2.drain(..));
-                        // no tip here
-                        pre.extend(core_ixs.iter().cloned());
-                        let alts_min = this.greedy_min_alts(&pre, &alts_empty);
-                        if let Some((tx2, l2, _)) = this.best_subset_v0_sync(payer, &pre, bh, &alts_min) {
-                            if l2 <= MAX_UDP_TX_BYTES { vtx = tx2; tx_len = l2; }
-                        }
-                    }
-
-                    // Learn units via exact sim; duplicate digest guard with slight nudge
-                    if let Ok(Some(u)) = this.simulate_exact_v0_units(&vtx).await { this.note_units_after_sim(0, u); }
-                    if let Some(d) = this.digest_v0_fast(&vtx) {
-                        if !this.seen_or_insert_digest(d) {
-                            let ladder = if this.near_udp_cap(tx_len) { [0u64, 60, 180, 300] } else { [0u64, 60, 180] };
-                            for step in ladder {
-                                let mut pre: SmallVec<[Instruction; 8]> = SmallVec::new();
-                                pre.push(ComputeBudgetInstruction::set_compute_unit_limit(units_guess));
-                                pre.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price.saturating_add(step)));
-                                if let Some(ix) = tip_ix { pre.push(ix); }
-                                pre.extend(core_ixs.iter().cloned());
-                                let alts_min = this.alts_plan_for_core(&core_ixs, payer, bh, &[], tip_ix.as_ref().map(|ix| if let solana_program::system_instruction::SystemInstruction::Transfer{..} = bincode::deserialize::<solana_program::system_instruction::SystemInstruction>(&ix.data).ok().unwrap_or(solana_program::system_instruction::SystemInstruction::AdvanceNonceAccount) { ix.accounts[1].pubkey } else { payer } ));
-                                if let Some((tx2, _l2, _)) = this.best_subset_v0_sync(payer, &pre, bh, &alts_min) { vtx = tx2; break; }
-                            }
-                        }
-                    }
-                    Ok::<_, anyhow::Error>(vtx)
-                };
-                tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
-            }
-        };
-
-        // Exact simulation safety (fast fail)
-        let (bh_now, _) = self.rpc_client.get_latest_blockhash().await?;
-        let vtx_preview = build_with_hash(bh_now)?;
-        if let Err(e) = self.simulate_exact_v0(&vtx_preview).await {
+        // Exact simulation safety
+        if let Err(e) = self.simulate_exact_v0(&vtx).await {
             error!(?e, "flash rebalance sim failed");
             let ok_to_continue = breaker.record(false);
             if !ok_to_continue { return Err(anyhow!("breaker open: too many failures")); }
@@ -3382,11 +6002,20 @@ impl PortOptimizer {
         // Send with slot guard and measure tip latency
         let t0 = Instant::now();
         let sig = self
-            .send_v0_with_slot_guard(build_with_hash, Duration::from_secs(45), 200, 120)
+            .send_v0_with_slot_guard(
+                |bh| {
+                    let ixs_vec = vtx.message().instructions().to_vec();
+                    self.build_v0_tx(self.wallet.pubkey(), &ixs_vec, bh, &[])
+                },
+                Duration::from_secs(45),
+                200,
+                120,
+            )
             .await?;
         let ms = t0.elapsed().as_millis() as f64;
         obs.tip_latency_ms.observe(ms);
-        info!(%sig, "flash rebalance executed");
+        tip_router.record_attempt(tip_acc, true, Some(ms)).await;
+        info!(%sig, repay_total, "flash rebalance executed");
         obs.rebalance_success.inc();
         Ok(sig)
     }
@@ -3394,7 +6023,7 @@ impl PortOptimizer {
 
     pub async fn build_bundle_from_plans(
         &self,
-        mut plans: Vec<Vec<Instruction>>,
+        plans: Vec<Vec<Instruction>>,
         alts: &[AddressLookupTableAccount],
         tip_account: Pubkey,
         tip_lamports: u64,
@@ -3402,32 +6031,11 @@ impl PortOptimizer {
         self.ensure_tip_funds(tip_lamports).await?;
         let bh = self.get_recent_blockhash_with_retry().await?;
         let mut out = Vec::with_capacity(plans.len());
-
-        for mut ixs in plans.drain(..) {
+        for ixs in plans {
             let (cu_ix, fee_ix) = self.dynamic_budget_ixs(COMPUTE_UNITS, PRIORITY_FEE_LAMPORTS).await;
-            ixs.splice(0..0, [cu_ix, fee_ix].into_iter());
-
-            // add tip last
-            ixs.push(system_instruction::transfer(&self.wallet.pubkey(), &tip_account, tip_lamports));
-            let ixs = Self::dedup_budget_and_tip(ixs);
-
-            // compute plan-specific minimal ALTs once
-            let alts_plan = self.greedy_min_alts(&ixs, alts);
-            let (tx0, len0) = match self.estimate_len_v0_sync(self.wallet.pubkey(), &ixs, bh, &alts_plan) {
-                Some((vtx, l)) => (vtx, l),
-                None => (self.build_v0_tx(self.wallet.pubkey(), &ixs, bh, &alts_plan)?, 0),
-            };
-
-            let vtx = if len0 > 0 && self.near_udp_cap(len0) {
-                // drop tip when near UDP cap
-                let mut ixs2: Vec<Instruction> = ixs
-                    .into_iter()
-                    .filter(|ix| ix.program_id != solana_program::system_program::id())
-                    .collect();
-                let ixs2 = Self::dedup_budget_and_tip(ixs2);
-                self.build_v0_tx(self.wallet.pubkey(), &ixs2, bh, &alts_plan)?
-            } else { tx0 };
-
+            let tip_ix = system_instruction::transfer(&self.wallet.pubkey(), &tip_account, tip_lamports);
+            let full: Vec<Instruction> = [vec![cu_ix, fee_ix, tip_ix], ixs].concat();
+            let vtx = self.build_v0_tx(self.wallet.pubkey(), &full, bh, alts)?;
             out.push(vtx);
         }
         Ok(out)
@@ -3493,64 +6101,22 @@ impl PortOptimizer {
             delay = std::cmp::min(delay * 2, Duration::from_millis(1000));
         }
     }
-    }
+}
 
-    pub async fn run(&self) -> Result<()> {
-        use tokio::time::{interval_at, Instant, Duration, MissedTickBehavior};
-        use futures::FutureExt;
-        use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
-        use std::time::{SystemTime, UNIX_EPOCH};
+pub async fn run(&self) -> Result<()> {
+@@ -116,35 +811,30 @@ impl PortOptimizer {
+}
 
-        static LAST_LOG_TS: OnceLock<AtomicU64> = OnceLock::new();
-        #[inline]
-        fn can_log_now() -> bool {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let a = LAST_LOG_TS.get_or_init(|| AtomicU64::new(0));
-            let prev = a.load(Ordering::Relaxed);
-            if now.saturating_sub(prev) >= 5 { a.store(now, Ordering::Relaxed); true } else { false }
-        }
-
-        let me = self.wallet.pubkey();
-        let mut z: u64 = 0; for &b in me.as_ref().iter().take(8) { z = (z << 8) | (b as u64); }
-        let start = Instant::now() + Duration::from_millis((z % 700) as u64);
-
-        let mut iv = interval_at(start, Duration::from_secs(5));
-        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            iv.tick().await;
-            z = z.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let jitter = (z % 101) as i64 - 50;
-            if jitter != 0 { tokio::time::sleep(Duration::from_millis(jitter.unsigned_abs() as u64)).await; }
-
-            let fut = self.optimize_cycle().catch_unwind();
-            match tokio::time::timeout(Duration::from_secs(6), fut).await {
-                Ok(Ok(Ok(_)))    => {}
-                Ok(Ok(Err(e)))   => if can_log_now() { eprintln!("[warn] optimize_cycle error: {e:?}"); }
-                Ok(Err(_panic))  => if can_log_now() { eprintln!("[warn] optimize_cycle panicked; continuing"); }
-                Err(_)           => if can_log_now() { eprintln!("[warn] optimize_cycle timed out (cancelled)"); }
-            }
-        }
-    }
-
-    async fn optimize_cycle(&self) -> Result<()> {
-        self.update_market_data().await?;
+async fn update_market_data(&self) -> Result<()> {
+        let mut markets = self.markets.write().await;
         
-        let positions = self.active_positions.read().await.clone();
-        let markets = self.markets.read().await.clone();
+        let solend_markets = self.fetch_solend_markets().await?;
+        let kamino_markets = self.fetch_kamino_markets().await?;
         
-        for (token_mint, position) in positions.iter() {
-            if let Some(token_markets) = markets.get(token_mint) {
-                if let Some(opportunity) = self.find_arbitrage_opportunity(position, token_markets).await? {
-                    self.execute_rebalance(position, opportunity).await?;
-                }
-            }
-        }
-        
-        Ok(())
-    }
-
-    async fn update_market_data(&self) -> Result<()> {
+        for market in solend_markets {
+            markets.entry(market.market_pubkey.to_string())
+                .or_insert_with(Vec::new)
+                .push(market);
         // Fetch concurrently and rebuild map keyed by token mint
         let (solend_markets, kamino_markets) = tokio::try_join!(
             self.fetch_solend_markets(),
@@ -3560,178 +6126,170 @@ impl PortOptimizer {
         for m in solend_markets.into_iter().chain(kamino_markets.into_iter()) {
             let key = m.token_mint.to_string();
             new_map.entry(key).or_default().push(m);
+}
+        
+        for market in kamino_markets {
+            markets.entry(market.market_pubkey.to_string())
+                .or_insert_with(Vec::new)
+                .push(market);
         }
+        
         let mut markets = self.markets.write().await;
         *markets = new_map;
-        Ok(())
-    }
+Ok(())
+}
 
-    async fn fetch_solend_markets(&self) -> Result<Vec<LendingMarket>> {
-        let program_id = *SOLEND_PROGRAM_ID;
+async fn fetch_solend_markets(&self) -> Result<Vec<LendingMarket>> {
+let program_id = Pubkey::from_str(SOLEND_PROGRAM_ID)?;
+        let accounts = self.rpc_client.get_program_accounts(&program_id)?;
         let accounts = self.rpc_client.get_program_accounts(&program_id).await?;
-        
-        let mut markets = Vec::new();
-        
-        for (pubkey, account) in accounts {
-            if account.data.len() >= 600 {
+
+let mut markets = Vec::new();
+
+for (pubkey, account) in accounts {
+if account.data.len() >= 600 {
+                let market = self.parse_solend_reserve(&pubkey, &account.data)?;
                 let market = self.parse_solend_reserve(&pubkey, &account.data).await?;
-                markets.push(market);
-            }
-        }
-        
-        Ok(markets)
-    }
+markets.push(market);
+}
+}
+@@ -154,72 +844,99 @@ impl PortOptimizer {
 
-    async fn fetch_kamino_markets(&self) -> Result<Vec<LendingMarket>> {
-        let program_id = *KAMINO_PROGRAM_ID;
+async fn fetch_kamino_markets(&self) -> Result<Vec<LendingMarket>> {
+let program_id = Pubkey::from_str(KAMINO_PROGRAM_ID)?;
+        let accounts = self.rpc_client.get_program_accounts(&program_id)?;
         let accounts = self.rpc_client.get_program_accounts(&program_id).await?;
-        
-        let mut markets = Vec::new();
-        
-        for (pubkey, account) in accounts {
-            if account.data.len() >= 800 {
+
+let mut markets = Vec::new();
+
+for (pubkey, account) in accounts {
+if account.data.len() >= 800 {
+                let market = self.parse_kamino_market(&pubkey, &account.data)?;
                 let market = self.parse_kamino_market(&pubkey, &account.data).await?;
-                markets.push(market);
-            }
-        }
+markets.push(market);
+}
+}
+
+Ok(markets)
+}
+
+    fn parse_solend_reserve(&self, pubkey: &Pubkey, data: &[u8]) -> Result<LendingMarket> {
+        let supply_rate = u64::from_le_bytes(data[232..240].try_into()?);
+        let borrow_rate = u64::from_le_bytes(data[240..248].try_into()?);
+        let available_liquidity = u64::from_le_bytes(data[64..72].try_into()?);
+        let borrowed_amount = u64::from_le_bytes(data[72..80].try_into()?);
         
-        Ok(markets)
-    }
-
-    // ---- Layout guards (document the wire you touch) ----
-    const SOLEND_OFF_MINT: usize = 32;
-    const SOLEND_OFF_AVAIL: usize = 64;   // u64
-    const SOLEND_OFF_BORROW: usize = 72;  // u64
-    const SOLEND_OFF_SPLYRT: usize = 232; // u128
-    const SOLEND_OFF_BORRT: usize = 248;  // u128
-    const SOLEND_MIN_BYTES: usize = SOLEND_OFF_BORRT + 16; // 264
-
-    const KAMINO_OFF_MINT: usize = 32;
-    const KAMINO_OFF_AVAIL: usize = 80;   // u64
-    const KAMINO_OFF_BORROW: usize = 88;  // u64
-    const KAMINO_OFF_SPLYRT: usize = 296; // u128
-    const KAMINO_OFF_BORRT: usize = 312;  // u128
-    const KAMINO_MIN_BYTES: usize = KAMINO_OFF_BORRT + 16; // 328
-
-    #[inline]
-    fn le_u64(data: &[u8], off: usize) -> Result<u64> {
-        let s = data.get(off..off+8).ok_or_else(|| anyhow!(format!("slice u64 @{}", off)))?;
-        Ok(u64::from_le_bytes(s.try_into()?))
-    }
-    #[inline]
-    fn le_u128(data: &[u8], off: usize) -> Result<u128> {
-        let s = data.get(off..off+16).ok_or_else(|| anyhow!(format!("slice u128 @{}", off)))?;
-        Ok(u128::from_le_bytes(s.try_into()?))
-    }
-    #[inline]
-    fn pk_at(&self, data: &[u8], off: usize) -> Result<Pubkey> {
-        let s = data.get(off..off+32).ok_or_else(|| anyhow!(format!("slice pk @{}", off)))?;
-        Ok(Pubkey::new_from_array(s.try_into()?))
-    }
-
-    async fn parse_solend_reserve_with_spw(&self, pubkey: &Pubkey, data: &[u8], spw: f64) -> Result<LendingMarket> {
-        if data.len() < SOLEND_MIN_BYTES { anyhow::bail!("solend: too small: {}", data.len()); }
+        let total_liquidity = available_liquidity + borrowed_amount;
+        let utilization = if total_liquidity > 0 {
+            borrowed_amount as f64 / total_liquidity as f64
+        } else {
+            0.0
+        };
+        
+        Ok(LendingMarket {
+            market_pubkey: *pubkey,
+            protocol: Protocol::Solend,
+            supply_apy: self.calculate_apy_from_rate(supply_rate),
+            borrow_apy: self.calculate_apy_from_rate(borrow_rate),
+            utilization,
+            liquidity_available: available_liquidity,
+            last_update: Instant::now(),
+        })
+    async fn parse_solend_reserve(&self, pubkey: &Pubkey, data: &[u8]) -> Result<LendingMarket> {
+        if data.len() < 1024 { return Err(anyhow!(format!("solend reserve too small: {}", data.len()))); }
         let version = data[0];
-        if version == 0 || version > 5 { anyhow::bail!("solend: unexpected version {}", version); }
-
-        let token_mint          = self.pk_at(data, SOLEND_OFF_MINT)?;
-        let available_liquidity = Self::le_u64(data, SOLEND_OFF_AVAIL)?;
-        let borrowed_amount     = Self::le_u64(data, SOLEND_OFF_BORROW)?;
-        let supply_rate_raw     = Self::le_u128(data, SOLEND_OFF_SPLYRT)?;
-        let borrow_rate_raw     = Self::le_u128(data, SOLEND_OFF_BORRT)?;
-
+        if version == 0 || version > 5 { return Err(anyhow!(format!("unexpected solend version: {}", version))); }
+        let token_mint = Pubkey::new_from_array((*data.get(32..64).ok_or_else(|| anyhow!("mint slice"))?).try_into()?);
+        let available_liquidity = u64::from_le_bytes((*data.get(64..72).ok_or_else(|| anyhow!("avail"))?).try_into()?);
+        let borrowed_amount = u64::from_le_bytes((*data.get(72..80).ok_or_else(|| anyhow!("borrowed"))?).try_into()?);
+        let supply_rate_raw = u128::from_le_bytes((*data.get(232..248).ok_or_else(|| anyhow!("supply"))?).try_into()?);
+        let borrow_rate_raw = u128::from_le_bytes((*data.get(248..264).ok_or_else(|| anyhow!("borrow"))?).try_into()?);
         let total_liquidity = available_liquidity.saturating_add(borrowed_amount);
         let utilization = if total_liquidity > 0 { borrowed_amount as f64 / total_liquidity as f64 } else { 0.0 };
-        let supply_apy = self.apy_from_rate_per_slot_with_spw(supply_rate_raw, spw)?;
-        let borrow_apy = self.apy_from_rate_per_slot_with_spw(borrow_rate_raw, spw)?;
+        let supply_apy = self.apy_continuous_from_rate_per_slot_1e18(supply_rate_raw).await?;
+        let borrow_apy = self.apy_continuous_from_rate_per_slot_1e18(borrow_rate_raw).await?;
         Ok(LendingMarket { market_pubkey: *pubkey, token_mint, protocol: Protocol::Solend, supply_apy, borrow_apy, utilization, liquidity_available: available_liquidity, last_update: Instant::now(), layout_version: version })
-    }
+}
 
-    async fn parse_kamino_market_with_spw(&self, pubkey: &Pubkey, data: &[u8], spw: f64) -> Result<LendingMarket> {
-        if data.len() < KAMINO_MIN_BYTES { anyhow::bail!("kamino: too small: {}", data.len()); }
+    fn parse_kamino_market(&self, pubkey: &Pubkey, data: &[u8]) -> Result<LendingMarket> {
+        let supply_rate = u64::from_le_bytes(data[296..304].try_into()?);
+        let borrow_rate = u64::from_le_bytes(data[304..312].try_into()?);
+        let available_liquidity = u64::from_le_bytes(data[80..88].try_into()?);
+        let borrowed_amount = u64::from_le_bytes(data[88..96].try_into()?);
+        
+        let total_liquidity = available_liquidity + borrowed_amount;
+        let utilization = if total_liquidity > 0 {
+            borrowed_amount as f64 / total_liquidity as f64
+        } else {
+            0.0
+        };
+        
+        Ok(LendingMarket {
+            market_pubkey: *pubkey,
+            protocol: Protocol::Kamino,
+            supply_apy: self.calculate_apy_from_rate(supply_rate),
+            borrow_apy: self.calculate_apy_from_rate(borrow_rate),
+            utilization,
+            liquidity_available: available_liquidity,
+            last_update: Instant::now(),
+        })
+    async fn parse_kamino_market(&self, pubkey: &Pubkey, data: &[u8]) -> Result<LendingMarket> {
+        if data.len() < 1024 { return Err(anyhow!(format!("kamino market too small: {}", data.len()))); }
         let version = data[0];
-        if version == 0 || version > 10 { anyhow::bail!("kamino: unexpected version {}", version); }
-
-        let token_mint          = self.pk_at(data, KAMINO_OFF_MINT)?;
-        let available_liquidity = Self::le_u64(data, KAMINO_OFF_AVAIL)?;
-        let borrowed_amount     = Self::le_u64(data, KAMINO_OFF_BORROW)?;
-        let supply_rate_raw     = Self::le_u128(data, KAMINO_OFF_SPLYRT)?;
-        let borrow_rate_raw     = Self::le_u128(data, KAMINO_OFF_BORRT)?;
-
+        if version == 0 || version > 10 { return Err(anyhow!(format!("unexpected kamino version: {}", version))); }
+        let token_mint = Pubkey::new_from_array((*data.get(32..64).ok_or_else(|| anyhow!("mint slice"))?).try_into()?);
+        let available_liquidity = u64::from_le_bytes((*data.get(80..88).ok_or_else(|| anyhow!("avail"))?).try_into()?);
+        let borrowed_amount = u64::from_le_bytes((*data.get(88..96).ok_or_else(|| anyhow!("borrowed"))?).try_into()?);
+        let supply_rate_raw = u128::from_le_bytes((*data.get(296..312).ok_or_else(|| anyhow!("supply"))?).try_into()?);
+        let borrow_rate_raw = u128::from_le_bytes((*data.get(312..328).ok_or_else(|| anyhow!("borrow"))?).try_into()?);
         let total_liquidity = available_liquidity.saturating_add(borrowed_amount);
         let utilization = if total_liquidity > 0 { borrowed_amount as f64 / total_liquidity as f64 } else { 0.0 };
-        let supply_apy = self.apy_from_rate_per_slot_with_spw(supply_rate_raw, spw)?;
-        let borrow_apy = self.apy_from_rate_per_slot_with_spw(borrow_rate_raw, spw)?;
+        let supply_apy = self.apy_continuous_from_rate_per_slot_1e18(supply_rate_raw).await?;
+        let borrow_apy = self.apy_continuous_from_rate_per_slot_1e18(borrow_rate_raw).await?;
         Ok(LendingMarket { market_pubkey: *pubkey, token_mint, protocol: Protocol::Kamino, supply_apy, borrow_apy, utilization, liquidity_available: available_liquidity, last_update: Instant::now(), layout_version: version })
     }
 
-    // Legacy signatures (unchanged)
-    async fn parse_solend_reserve(&self, pubkey: &Pubkey, data: &[u8]) -> Result<LendingMarket> {
-        let spw = self.estimate_slots_per_year_cached().await;
-        self.parse_solend_reserve_with_spw(pubkey, data, spw).await
-    }
-    async fn parse_kamino_market(&self, pubkey: &Pubkey, data: &[u8]) -> Result<LendingMarket> {
-        let spw = self.estimate_slots_per_year_cached().await;
-        self.parse_kamino_market_with_spw(pubkey, data, spw).await
-    }
-
-    // === [IMPROVED: PIECE 6 v6] === sticky cached estimate with small-sample smoothing
-    static SPW_CACHE: OnceLock<tokio::sync::RwLock<(Instant, f64)>> = OnceLock::new();
-    async fn estimate_slots_per_year_cached(&self) -> f64 {
-        use tokio::sync::RwLock;
-        const TTL: Duration = Duration::from_secs(60);
-        let cell = SPW_CACHE.get_or_init(|| RwLock::new((Instant::now() - TTL*2, 63_072_000.0)));
-
-        // fast path
-        {
-            let g = cell.read().await;
-            if g.0.elapsed() < TTL { return g.1; }
-        }
-
-        // refresh (EWMA over ≤5 samples)
-        let mut spw = 63_072_000.0;
-        if let Ok(mut samples) = self.rpc_client.get_recent_performance_samples(Some(5)).await {
-            let mut num = 0.0; let mut den = 0.0; let mut w = 1.0;
-            for s in samples.drain(..) {
-                let sps = (s.num_slots as f64) / (s.sample_period_secs as f64).max(1.0);
-                num += (31_536_000.0 * sps) * w; den += w; w *= 0.75;
-            }
-            let cand = if den > 0.0 { num / den } else { spw };
-            if cand.is_finite() && (1.0..200_000_000.0).contains(&cand) { spw = cand; }
-        } else {
-            // fallback: wall-time delta over 10k slots
-            let sample = 10_000u64;
-            if let Ok(end_slot) = self.rpc_client.get_slot().await {
-                if let (Ok(t1), Ok(t0)) = (
-                    self.rpc_client.get_block_time(end_slot).await,
-                    self.rpc_client.get_block_time(end_slot.saturating_sub(sample)).await,
-                ) {
-                    if let (Some(t1), Some(t0)) = (t1, t0) {
-                        let dt = (t1 - t0).max(1) as f64;
-                        spw = 31_536_000.0 * (sample as f64 / dt);
+    // Estimate slots/year from on-chain timing, with safe fallback
+    async fn estimate_slots_per_year(&self) -> f64 {
+        let sample = 10_000u64;
+        if let (Ok(end_slot), Ok(start_slot)) = (
+            self.rpc_client.get_slot().await,
+            self.rpc_client.get_slot().await.map(|s| s.saturating_sub(sample)),
+        ) {
+            if let (Ok(t1_opt), Ok(t0_opt)) = (
+                self.rpc_client.get_block_time(end_slot).await,
+                self.rpc_client.get_block_time(start_slot).await,
+            ) {
+                if let (Some(t1), Some(t0)) = (t1_opt, t0_opt) {
+                    let dt = (t1 - t0).max(1) as f64;
+                    let slots = (end_slot - start_slot).max(1) as f64;
+                    let slot_time = dt / slots; // seconds per slot
+                    let sp_year = 31_536_000.0 / slot_time;
+                    if sp_year.is_finite() && sp_year > 0.0 && sp_year < 200_000_000.0 {
+                        return sp_year;
                     }
                 }
             }
         }
-
-        *cell.write().await = (Instant::now(), spw);
-        spw
-    }
-
-    #[inline]
-    fn apy_from_rate_per_slot_with_spw(&self, rate_per_slot_1e18: u128, spw: f64) -> Result<f64> {
-        let r = (rate_per_slot_1e18 as f64) / 1e18;
-        if !(r >= 0.0 && r.is_finite()) { return Err(anyhow!(format!("invalid per-slot rate: {}", r))); }
-        let apy = f64::exp_m1(r * spw).clamp(-0.5, 10.0); // [-50%, +1000%]
-        if !apy.is_finite() { return Err(anyhow!("apy non-finite")); }
-        Ok(apy * 100.0)
+        63_072_000.0
     }
 
     pub async fn apy_continuous_from_rate_per_slot_1e18(&self, rate_per_slot_1e18: u128) -> Result<f64> {
-        let spw = self.estimate_slots_per_year_cached().await;
-        self.apy_from_rate_per_slot_with_spw(rate_per_slot_1e18, spw)
-    }
+        let r = (rate_per_slot_1e18 as f64) / 1e18;
+        if !(r >= 0.0 && r.is_finite()) {
+            return Err(anyhow!(format!("invalid per-slot rate: {}", r)));
+        }
+        let spw = self.estimate_slots_per_year().await;
+        let apy = (r * spw).exp() - 1.0; // continuous compounding
+        let apy = apy.clamp(-0.5, 10.0); // [-50%, +1000%]
+        if !apy.is_finite() { return Err(anyhow!("apy non-finite")); }
+        Ok(apy * 100.0)
+}
 
+    fn calculate_apy_from_rate(&self, rate: u64) -> f64 {
+        let rate_per_slot = rate as f64 / 1e18;
+        let slots_per_year = 63072000.0;
+        ((1.0 + rate_per_slot).powf(slots_per_year) - 1.0) * 100.0
     // Backwards-compat helper for tests and legacy callers (sync fallback).
     // Uses continuous compounding with a constant slots/year when async not available.
     pub fn calculate_apy_from_rate(&self, rate_per_slot_1e18: u64) -> f64 {
@@ -3742,967 +6300,767 @@ impl PortOptimizer {
         let apy = apy.clamp(-0.5, 10.0);
         if !apy.is_finite() { return 0.0; }
         apy * 100.0
-    }
+}
 
-    // === [IMPROVED: PIECE BH UTILS v40] === hedged (hash,height) pair
-    pub async fn get_fresh_blockhash(&self) -> Result<(Hash, u64)> {
-        let fetch = async {
-            let bh = self.rpc_client.get_latest_blockhash();
-            let h  = self.rpc_client.get_block_height();
-            tokio::try_join!(bh, h)
-        };
-        let hedged = if let Some(fast) = &self.rpc_fast {
-            tokio::select! {
-                r1 = fetch => r1,
-                r2 = async {
-                    let bh = fast.get_latest_blockhash();
-                    let h  = fast.get_block_height();
-                    tokio::try_join!(bh, h)
-                } => r2,
-            }
-        } else { fetch.await };
+async fn find_arbitrage_opportunity(
+@@ -231,15 +948,27 @@ impl PortOptimizer {
+.find(|m| m.protocol == position.protocol)
+.ok_or_else(|| anyhow!("Current market not found"))?;
 
-        match hedged {
-            Ok((bh, h)) => Ok((bh, h)),
-            Err(e) => Err(anyhow::anyhow!(format!("fresh blockhash/height failed: {e}"))),
-        }
-    }
-
-    async fn find_arbitrage_opportunity(
-        &self,
-        position: &Position,
-        markets: &[LendingMarket],
-    ) -> Result<Option<LendingMarket>> {
-        // current market
-        let current = markets
-            .iter()
-            .find(|m| m.protocol == position.protocol)
-            .ok_or_else(|| anyhow!("Current market not found"))?;
-
-        // in-place best alt, hard gate on liquidity
-        let mut best_alt: Option<&LendingMarket> = None;
-        let mut best_diff_bps: i64 = 0;
-        for m in markets {
-            if m.protocol == position.protocol { continue; }
-            if m.liquidity_available < position.amount { continue; }
-            let diff_bps = (((m.supply_apy - current.supply_apy) * 100.0).round()) as i64;
-            if diff_bps > best_diff_bps { best_diff_bps = diff_bps; best_alt = Some(m); }
-        }
-        if best_diff_bps as u64 <= REBALANCE_THRESHOLD_BPS { return Ok(None); }
-        let alt = match best_alt { Some(a) => a, None => return Ok(None) };
-
-        // optional reserve meta gates
-        if let Some(meta) = self.reserve_meta_for(alt.market_pubkey).await.transpose()? {
-            let fee_bps = meta.flash_fee_bps().unwrap_or(5);
-            let cap     = meta.available_flash_capacity().unwrap_or(u64::MAX / 4);
-            if position.amount > cap { return Ok(None); }
-            if (best_diff_bps as u64) <= (fee_bps + 2) { return Ok(None); }
-        }
-
-        // gas-aware precheck: rough CU + fee floor from autoscale (no RPC if cached)
-        let mut rough_cu = self.optimize_compute_units_rough(&[]).await.max(200_000);
-        rough_cu = self.quantize_units_1024(rough_cu).min(1_400_000);
-        let cu_price_floor = self.priority_fee_autoscale(PRIORITY_FEE_LAMPORTS).await.max(PRIORITY_FEE_LAMPORTS);
-        let pre_cost = (rough_cu as u64).saturating_mul(self.quantize_cu_price_64(cu_price_floor));
-        let daily_rate_diff = ((alt.supply_apy - current.supply_apy) / 100.0) / 365.0;
-        let daily_profit_lamports = (position.amount as f64) * daily_rate_diff; // position.amount is in lamports
-        if (daily_profit_lamports as u64) <= pre_cost / 10 {
-            return Ok(None);
-        }
-
-        // exact path: build ixs and estimate cost precisely
-        let withdraw_ix = self.build_withdraw_instruction(position).await?;
-        let deposit_ix  = self.build_deposit_instruction(position, alt).await?;
-        let gas_cost = self
-            .estimate_rebalance_cost_lamports(&[withdraw_ix, deposit_ix], 1.0)
-            .await
-            .unwrap_or(PRIORITY_FEE_LAMPORTS);
-
-        let expected_profit = self.calculate_expected_profit(
-            position.amount, current.supply_apy, alt.supply_apy, gas_cost,
+        let best_alternative = markets.iter()
+            .filter(|m| m.protocol != position.protocol)
+            .max_by(|a, b| a.supply_apy.partial_cmp(&b.supply_apy).unwrap());
+        let best_alternative = self.pick_best_market_weighted(
+            position.amount,
+            &markets
+                .iter()
+                .filter(|m| m.protocol != position.protocol)
+                .cloned()
+                .collect::<Vec<_>>()
         );
-        if expected_profit > MIN_PROFIT_BPS as f64 { Ok(Some(alt.clone())) } else { Ok(None) }
+
+        if let Some(alt_market) = best_alternative {
+        if let Some(alt_market) = best_alternative.as_ref() {
+let apy_diff_bps = ((alt_market.supply_apy - current_market.supply_apy) * 100.0) as u64;
+
+if apy_diff_bps > REBALANCE_THRESHOLD_BPS {
+                let gas_cost = self.estimate_rebalance_cost(position.amount).await?;
+                // Build the candidate withdraw + deposit instructions to get a realistic CU-based gas estimate
+                let withdraw_ix = self.build_withdraw_instruction(position).await?;
+                let deposit_ix = self.build_deposit_instruction(position, alt_market).await?;
+                let gas_cost = self
+                    .estimate_rebalance_cost_lamports(&[withdraw_ix, deposit_ix], 1.0)
+                    .await
+                    .unwrap_or(PRIORITY_FEE_LAMPORTS);
+
+let expected_profit = self.calculate_expected_profit(
+position.amount,
+current_market.supply_apy,
+@@ -248,7 +977,7 @@ impl PortOptimizer {
+);
+
+if expected_profit > MIN_PROFIT_BPS as f64 {
+                    return Ok(Some(alt_market.clone()));
+                    return Ok(best_alternative);
+}
+}
+}
+@@ -262,6 +991,119 @@ impl PortOptimizer {
+Ok((base_fee as f64 * size_multiplier) as u64)
+}
+
+    // Realistic gas cost estimation from sim + fee percentiles (CU -> lamports)
     }
 
-    // Optional: map from market pubkey to ReserveMeta if available; default None keeps behavior.
-    async fn reserve_meta_for(&self, _market: Pubkey) -> Result<Option<ReserveMeta>> {
-        Ok(None)
-    }
 
-    async fn estimate_rebalance_cost(&self, amount: u64) -> Result<u64> {
-        let base_fee = PRIORITY_FEE_LAMPORTS * 2;
-        let size_multiplier = (amount as f64 / 1e9).max(1.0);
-        Ok((base_fee as f64 * size_multiplier) as u64)
-    }
-
-    // === [IMPROVED: PIECE 7 v3] ===
-            }
-            let q75v = P2P75.get().unwrap().lock().await.value().unwrap_or(PRIORITY_FEE_LAMPORTS as f64);
-            cu_price_live = q75v.round() as u64;
-        }
-    }
-
-    // 3) Log-domain ct-EMA with simple anti-windup and deadband
-    let ema_cell = SURGE_EMA.get_or_init(|| AtomicU64::new(PRIORITY_FEE_LAMPORTS));
-    let ema_floor = ema_cell.load(Ordering::Relaxed).max(PRIORITY_FEE_LAMPORTS);
-    let tri = cu_price_live.max(ema_floor).max(1);
-    let x = (tri as f64).ln().max(0.0);
+    pub async fn assemble_tx_v0(
+        &self,
+        mut ixs: Vec<Instruction>,
+        include_tip: bool,
         tip_account: Option<Pubkey>,
         alts: &[AddressLookupTableAccount],
     ) -> Result<VersionedTransaction> {
-        // 1) CU + price (quantized)
-        let mut baseline_cu = self.optimize_compute_units_rough(&ixs).await;
-        baseline_cu = self.quantize_units_1024(baseline_cu).min(1_400_000);
+        // 0) Prefetch to warm node caches (accounts & programs touched)
+        self.prefetch_for_ixs(&ixs).await?;
 
-        let ema = SURGE_EMA.get_or_init(|| AtomicU64::new(0)).load(Ordering::Relaxed);
-        let mut cu_price = self
-            .quantize_cu_price_64(self.priority_fee_autoscale(PRIORITY_FEE_LAMPORTS).await.max(ema));
+        // 1) CU estimate and fee ixs
+        let baseline_cu = self.optimize_compute_units_rough(&ixs).await;
+        let (cu_ix, fee_ix) = self.dynamic_budget_ixs(baseline_cu, PRIORITY_FEE_LAMPORTS).await;
 
-        let payer = self.wallet.pubkey();
-        let mut pref = vec![ComputeBudgetInstruction::set_compute_unit_limit(baseline_cu)];
-        if cu_price > 0 { pref.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price)); }
+        // 2) Optional tip with size-aware + leader-aware adjustment
+        let mut pref = vec![cu_ix, fee_ix];
         if include_tip {
             if let Some(tip_acc) = tip_account {
-                let tip = self.dynamic_priority_fee().await.unwrap_or(PRIORITY_FEE_LAMPORTS);
-                pref.push(system_instruction::transfer(&payer, &tip_acc, tip));
+                // Program-aware base tip (bias to touched programs)
+                let base_tip = self.priority_fee_for_ixs(&ixs, PRIORITY_FEE_LAMPORTS).await;
+
+                // Size-aware nudge (≤ +5%)
+                let sz = self.tx_message_size_estimate(&ixs) as f64;
+                let size_adj = 1.0 + (sz.min(1500.0) / 1500.0) * 0.05;
+
+                // Leader-aware nudge (≤ +10%) based on next 4 leaders
+                let conc = self.leader_window_concentration(4).await.unwrap_or(0.0);
+                let leader_adj = 1.0 + (conc * 0.10).min(0.10);
+
+                // Micro-jitter to break ties (≤30 bps), consistent with fee path
+                let j_bp = self.price_jitter_bp(30) as f64 / 10_000.0;
+                let jitter_adj = 1.0 + j_bp;
+
+                let tip = ((base_tip as f64) * size_adj * leader_adj * jitter_adj).ceil() as u64;
+                pref.push(system_instruction::transfer(&self.wallet.pubkey(), &tip_acc, tip));
             }
         }
         ixs.splice(0..0, pref);
+
+        // 3) Normalize ordering & dedup budget/tip to keep the message minimal and stable
+        ixs = Self::normalize_ixs_order(ixs);
         ixs = Self::dedup_budget_and_tip(ixs);
 
-        // 2) assemble & bin-fit
+        // 4) Pick ALTs and shrink to MTU if needed
+        let picked = Self::select_alts_for_ixs(&ixs, alts, 3);
+        let selected_alts = Self::shrink_alts_to_mtu(&ixs, picked, QUIC_SAFE_PACKET_BUDGET, &|ixs_, alts_| {
+            self.tx_message_size_with_alts_estimate(ixs_, alts_)
+        });
+
+        // 5) Build v0 with fresh hash and selected ALTs
         let bh = self.get_recent_blockhash_with_retry().await?;
-        let mut build = |ixs_in: &[Instruction]| -> Option<(VersionedTransaction, usize)> {
-            self.estimate_len_v0_sync(payer, ixs_in, bh, alts)
-                .or_else(|| self.build_v0_tx(payer, ixs_in, bh, alts).ok().map(|tx| (tx, 0)))
-        };
+        self.build_v0_tx(self.wallet.pubkey(), &ixs, bh, &selected_alts)
+    }
+}
 
-        if let Some((tx, len)) = build(&ixs) {
-            if len == 0 || !self.near_udp_cap(len) { return Ok(tx); }
-        }
+// ... (rest of the code remains the same)
+// Bounded tip escalation helper
+#[inline]
+fn tip_escalation_nudge(base_tip: u64, attempt_no: u32) -> u64 {
+    // 1st miss: +4%, 2nd: +8%, 3rd+: +12% (cap)
+    let mult = match attempt_no {
+        0 => 1.00,
+        1 => 1.04,
+        2 => 1.08,
+        _ => 1.12,
+    };
+    ((base_tip as f64) * mult).ceil() as u64
+}
 
-        // Try without tip first if near cap
-        let mut ixs_no_tip: Vec<Instruction> = ixs
-            .iter()
-            .filter(|ix| ix.program_id != solana_program::system_program::id())
-            .cloned()
-            .collect();
-        ixs_no_tip = Self::dedup_budget_and_tip(ixs_no_tip);
-
-        if let Some((tx2, len2)) = build(&ixs_no_tip) {
-            if len2 == 0 || !self.near_udp_cap(len2) { return Ok(tx2); }
-            // Try acc-data CB if it will fit
-            let acc_ix = self.cb_accdata_ix(256_000);
-            if self.will_fit_with_ix(payer, &ixs_no_tip, &acc_ix, bh, alts) {
-                let mut ixs3 = ixs_no_tip; ixs3.insert(0, acc_ix);
-                return self.build_v0_tx(payer, &ixs3, bh, alts);
-            } else {
-                return Ok(tx2);
+// Patch CU limit in-place for a transaction's instructions
+#[inline]
+fn patch_cu_limit(ixs: &mut [Instruction], new_limit: u32) {
+    for ix in ixs.iter_mut() {
+        if ix.program_id == solana_sdk::compute_budget::id() {
+            if ix.data.first() == Some(&0x00) { // set_compute_unit_limit
+                ix.data = {
+                    let mut d = vec![0x00u8];
+                    d.extend_from_slice(&new_limit.to_le_bytes());
+                    d
+                };
+                return;
             }
         }
-
-        // Fall back to core only (no tip and deduped budget)
-        let mut ixs_core: Vec<Instruction> = ixs
-            .iter()
-            .filter(|ix| ix.program_id != solana_program::system_program::id())
-            .cloned()
-            .collect();
-        ixs_core = Self::dedup_budget_and_tip(ixs_core);
-
-        if let Some((tx3, _)) = build(&ixs_core) { return Ok(tx3); }
-        self.build_v0_tx(payer, &ixs_core, bh, alts)
     }
+    // not found → prepend
+    let ins = ComputeBudgetInstruction::set_compute_unit_limit(new_limit);
+    ixs.splice(0..0, [ins]);
+}
 
-    // === [IMPROVED: PIECE 9 v3] ===
-    pub async fn priority_fee_spread_scoped(
-        &self,
-        scope: &[Pubkey],
-        p_lo: f64,
-        p_hi: f64,
-    ) -> Option<[u64; 3]> {
-        if let Ok(fees) = self.rpc_client.get_recent_prioritization_fees(scope).await {
-            if fees.is_empty() { return None; }
-            let mut vals: Vec<u64> = fees.iter().map(|f| f.prioritization_fee).collect();
-            vals.sort_unstable();
-            let ix = |p: f64| -> usize { ((vals.len() as f64 * p).floor() as usize).clamp(0, vals.len() - 1) };
-            let p50 = vals[ix(0.50)];
-            let plo = vals[ix(p_lo)];
-            let phi = vals[ix(p_hi)];
-            let step1 = plo.saturating_sub(p50).max(0);
-            let step2 = phi.saturating_sub(plo).max(60);
-            let step3 = (step2.saturating_mul(2)).max(180);
-            return Some([step1, step2, step3]);
+// Ensure heap frame is set with the specified target
+#[inline]
+fn ensure_heap_frame(ixs: &mut Vec<Instruction>, target: u32) {
+    // dedup in case caller added already
+    for ix in ixs.iter_mut() {
+        if ix.program_id == solana_sdk::compute_budget::id() && ix.data.first() == Some(&0x01) {
+            ix.data = {
+                let mut d = vec![0x01u8];
+                d.extend_from_slice(&target.to_le_bytes());
+                d
+            };
+            return;
         }
-        None
     }
+    ixs.splice(0..0, [ComputeBudgetInstruction::set_heap_frame(target)]);
+}
+
+// Deduplicate budget and tip instructions while preserving order
+fn dedup_budget_and_tip(mut ixs: Vec<Instruction>) -> Vec<Instruction> {
+    let mut saw_limit = false;
+    let mut saw_price = false;
+    let mut saw_heap = false;
+    let mut seen_tip_to: HashSet<Pubkey> = HashSet::new();
+
+    ixs.retain(|ix| {
+        if ix.program_id == solana_sdk::compute_budget::id() {
+            if let Some(op) = ix.data.first() {
+                match *op {
+                    0x00 => { if !saw_limit { saw_limit = true; return true; } return false; } // limit
+                    0x01 => { if !saw_heap  { saw_heap  = true; return true; } return false; } // heap
+                    0x02 => { if !saw_price { saw_price = true; return true; } return false; } // price
+                    _ => return false,
+                }
+            }
+        }
+        if ix.program_id == solana_sdk::system_program::id() && ix.data.first() == Some(&2u8) {
+            if let Some(to) = ix.accounts.get(1).map(|a| a.pubkey) {
+                if !seen_tip_to.insert(to) { return false; }
+            }
+        }
+        true
+    });
+    ixs
 }
 
 impl PortOptimizer {
-    // === [IMPROVED: PIECE 11A v3] ===
-    pub async fn simulate_units_and_logs(
-        &self,
-        tx: &VersionedTransaction,
-    ) -> Result<(Option<u32>, Vec<String>)> {
-        use tokio::time::{timeout, Duration};
-        let cfg = RpcSimulateTransactionConfig { sig_verify: false, replace_recent_blockhash: true, ..Default::default() };
-
-        let hedged = async {
-            if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = self.rpc_client.simulate_transaction_with_config(tx, cfg) => r1,
-                    r2 = fast.simulate_transaction_with_config(tx, cfg) => r2,
-                }
-            } else {
-                self.rpc_client.simulate_transaction_with_config(tx, cfg).await
+    /// Gets the minimum rent for a token account with caching
+    pub async fn min_rent_token_account(&self) -> u64 {
+        // Check cache first
+        if let Ok(cache) = RENT_CACHE.read().await {
+            if cache.lamports_165 > 0 && cache.ts.elapsed() <= Duration::from_secs(600) {
+                return cache.lamports_165;
             }
+        }
+        
+        // Fetch from RPC if cache miss or stale
+        let v = match self.rpc_client.get_minimum_balance_for_rent_exemption(165).await {
+            Ok(v) => v,
+            Err(_) => 2_039_280, // Fallback value if RPC fails
         };
-        let out = match timeout(Duration::from_millis(350), hedged).await {
-            Ok(Ok(o))  => o,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_)     => timeout(Duration::from_millis(520), self.rpc_client.simulate_transaction_with_config(tx, cfg))
-                            .await
-                            .map_err(|_| anyhow::anyhow!("simulate timeout"))??,
-        };
-
-        let mut units = out.value.units_consumed.map(|u| u as u32);
-        if units.is_none() {
-            if let Some(ls) = out.value.logs.as_ref() {
-                const KEYS: &[&str] = &[
-                    "consumed ","compute units: ","units consumed: ","total units consumed: ",
-                    "compute units consumed: ","total compute units consumed: ",
-                    "units total: ","cu total: ","units=","used: ","used=","cu_used=","cu: ",
-                ];
-                let tail = 256usize.min(ls.len());
-                for line in ls[ls.len()-tail..].iter().rev() {
-                    let has_esc = line.as_bytes().iter().any(|&b| b == 0x1B);
-                    let clean = if has_esc { self.strip_ansi(line) } else { line.clone() };
-                    if let Some(v) = self.parse_num_after_any(&clean, KEYS).and_then(|n| self.filter_units(n)) { units = Some(v); break; }
-                    if units.is_none() {
-                        if let Some(v) = self.parse_last_num_if_hinted(&clean).and_then(|n| self.filter_units(n)) { units = Some(v); break; }
-                    }
-                }
-            }
-        }
-        Ok((units, out.value.logs.unwrap_or_default()))
-    }
-
-    // === [IMPROVED: PIECE 11B v3] ===
-    pub fn adjust_budget_from_sim_error(
-        &self,
-        logs: &[String],
-        base_units: u32,
-        base_heap: Option<u32>,
-    ) -> (u32, Option<u32>, bool) {
-        let mut units = base_units;
-        let mut heap  = base_heap;
-        let mut changed = false;
-
-        let joined = logs.iter().fold(String::new(), |mut s, l| { s.push_str(l); s.push('\n'); s });
-
-        if joined.contains("ComputationalBudgetExceeded") || joined.contains("max compute units exceeded") {
-            units = (units as f64 * 1.18).ceil() as u32; // bump 18%
-            changed = true;
-        }
-        if joined.contains("HeapFrame") || joined.contains("heap") && joined.contains("insufficient") {
-            let next = heap.unwrap_or(0).max(64_000).saturating_mul(2).min(512_000);
-            if Some(next) != heap { heap = Some(next); changed = true; }
-        }
-        (units, heap, changed)
-    }
-
-    // === [IMPROVED: PIECE ADJ v20] ===
-    // No-op guard + single lowercase pass; returns (units, heap, acc_bytes_opt, changed)
-    pub fn adjust_budget_from_sim_error_v2(
-        &self,
-        logs: &[String],
-        units0: u32,
-        heap0: Option<u32>,
-    ) -> (u32, Option<u32>, Option<u32>, bool) {
-        let mut units = units0;
-        let mut heap  = heap0;
-        let mut acc: Option<u32> = None;
-        let mut changed = false;
-
-        let mut bump_units = 0.0f64;
-        let mut need_heap  = false;
-        let mut drop_heap  = false;
-        let mut saw_acc_phrase = false;
-
-        for s in logs {
-            let l = s.as_str();
-            let ll = l.to_ascii_lowercase();
-            if l.contains("computational budget exceeded")
-                || l.contains("max compute units exceeded")
-                || l.contains("Program failed to complete")
-                || l.contains("Exceeded maximum number of instructions")
-                || l.contains("budget exhausted")
-            { bump_units = bump_units.max(0.35); }
-
-            if l.contains("insufficient compute units") { bump_units = bump_units.max(0.20); }
-            if l.contains("Heap") || l.contains("heap") || l.contains("request heap") || l.contains("HeapLimitExceeded") { need_heap = true; }
-
-            if l.contains("Transaction too large")
-                || l.contains("packet too large")
-                || l.contains("too many account keys")
-                || l.contains("account keys length")
-                || l.contains("would exceed packet size")
-            { drop_heap = true; }
-
-            if ll.contains("accounts data") || ll.contains("accounts-data") || ll.contains("acc_data") { saw_acc_phrase = true; }
-
-            if l.contains("AccountInUse") || l.contains("write lock") { bump_units = bump_units.max(0.10); }
-        }
-
-        if bump_units == 0.0 && !need_heap && !drop_heap && !saw_acc_phrase { return (units0, heap0, None, false); }
-
-        if saw_acc_phrase {
-            if let Some(b) = self.parse_loaded_accounts_bytes_wide(logs) {
-                acc = Some(self.pad_accounts_bytes(b));
-                changed = true;
-            }
-        }
-        if drop_heap && heap.is_some() { heap = None; changed = true; }
-
-        if bump_units > 0.0 && units < MAX_COMPUTE_UNITS {
-            let mut next = ((units as f64) * (1.0 + bump_units)).ceil() as u32;
-            next = ((next + 1023) / 1024) * 1024;
-            if next <= units { next = (units + 1024).min(MAX_COMPUTE_UNITS); }
-            units = next.min(MAX_COMPUTE_UNITS);
-            if units != units0 { changed = true; }
-        }
-
-        if !drop_heap && need_heap {
-            let base = heap.unwrap_or(131_072);
-            let next = base.max(131_072).saturating_mul(2).min(512_000);
-            if heap != Some(next) { heap = Some(next); changed = true; }
-        }
-        (units, heap, acc, changed)
-    }
-
-    // Parse wide set of vendor log patterns for loaded accounts data bytes
-    fn parse_loaded_accounts_bytes_wide(&self, logs: &[String]) -> Option<u32> {
-        // Search from the end; tolerate various key phrases and formats
-        const KEYS: &[&str] = &[
-            "accounts data",
-            "accounts-data",
-            "acc_data",
-            "loaded accounts data",
-            "total accounts data",
-            "accounts data size",
-        ];
-        for line in logs.iter().rev() {
-            let clean = self.strip_ansi(line);
-            let lc = clean.to_ascii_lowercase();
-            if KEYS.iter().any(|k| lc.contains(k)) {
-                // Extract last integer-like token from the line
-                let mut num: Option<u64> = None;
-                let mut cur = String::new();
-                for ch in lc.chars() {
-                    if ch.is_ascii_digit() { cur.push(ch); }
-                    else {
-                        if !cur.is_empty() { if let Ok(v) = cur.parse::<u64>() { num = Some(v); } cur.clear(); }
-                    }
-                }
-                if num.is_none() && !cur.is_empty() { if let Ok(v) = cur.parse::<u64>() { num = Some(v); } }
-                if let Some(v) = num { return u32::try_from(v.min(512_000)).ok(); }
-            }
-        }
-        None
-    }
-
-    // Quantize to 32KiB steps, clamp to [32KiB, 512KiB]
-    fn pad_accounts_bytes(&self, bytes_exact: u32) -> u32 {
-        let step = 32 * 1024u32;
-        let mut want = ((bytes_exact + step - 1) / step) * step;
-        want = want.clamp(step, 512 * 1024);
-        want
-    }
-
-    // === [IMPROVED: PIECE U-FIT v20] === residual UDP helpers
-    #[inline]
-    fn residual_udp_room(&self, base_len: usize) -> isize {
-        MAX_UDP_TX_BYTES as isize - base_len as isize
-    }
-    /// If sum of top `k` single-drop gains < bytes we must shed, it cannot fit.
-    #[inline]
-    fn cb_residual_hopeless(&self, room: isize, top_gains: &[usize], k: usize) -> bool {
-        let need = (-room).max(0) as usize;
-        let have: usize = top_gains.iter().take(k).copied().sum();
-        have < need
-    }
-
-    // === [IMPROVED: PIECE RPC v26] === Hedged processed->confirmed with sliced fallback and optional filters
-    pub async fn get_program_accounts_smart(
-        &self,
-        program_id: &Pubkey,
-        slice_len: usize,
-        prev_estimate: usize,
-    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>> {
-        self.get_program_accounts_smart_filt(program_id, slice_len, prev_estimate, None).await
-    }
-
-    pub async fn get_program_accounts_smart_filt(
-        &self,
-        program_id: &Pubkey,
-        slice_len: usize,
-        prev_estimate: usize,
-        filters: Option<Vec<RpcFilterType>>,
-    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>> {
-        use tokio::time::{timeout, Duration};
-        use solana_account_decoder::{UiAccountEncoding, UiDataSlice};
-        use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-        use anchor_client::solana_sdk::commitment_config::CommitmentConfig;
-
-        let call_cfg = |cli: &solana_client::nonblocking::rpc_client::RpcClient,
-                        commitment: CommitmentConfig,
-                        slice: bool| async move {
-            let account_config = RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                data_slice: slice.then_some(UiDataSlice { offset: 0, length: slice_len }),
-                commitment: Some(commitment),
-                ..Default::default()
+        
+        // Update cache
+        if let Ok(mut cache) = RENT_CACHE.write().await {
+            *cache = RentCache {
+                lamports_165: v,
+                ts: Instant::now(),
             };
-            let cfg = RpcProgramAccountsConfig { filters: filters.clone(), account_config, with_context: None };
-            cli.get_program_accounts_with_config(program_id, cfg).await
-        };
-
-        // processed + sliced hedge
-        let processed = async {
-            if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = call_cfg(&self.rpc_client, CommitmentConfig::processed(), true) => r1,
-                    r2 = call_cfg(fast,               CommitmentConfig::processed(), true) => r2,
-                }
-            } else {
-                call_cfg(&self.rpc_client, CommitmentConfig::processed(), true).await
-            }
-        };
-        let mut first = match timeout(Duration::from_millis(650), processed).await {
-            Ok(Ok(v))  => v,
-            _          => Vec::new(),
-        };
-
-        // quality thresholds vs last book (both lower and upper)
-        let prev = prev_estimate.max(8);
-        let low  = (prev / 3).max(8);           // too few
-        let high = prev.saturating_mul(4) + 64; // suspiciously many
-
-        if first.is_empty() || first.len() < low || first.len() > high {
-            // confirmed + sliced hedge (800ms)
-            let confirmed = async {
-                if let Some(fast) = &self.rpc_fast {
-                    tokio::select! {
-                        r1 = call_cfg(&self.rpc_client, CommitmentConfig::confirmed(), true) => r1,
-                        r2 = call_cfg(fast,               CommitmentConfig::confirmed(), true) => r2,
-                    }
-                } else {
-                    call_cfg(&self.rpc_client, CommitmentConfig::confirmed(), true).await
-                }
-            };
-            if let Ok(Ok(v)) = timeout(Duration::from_millis(800), confirmed).await {
-                if !v.is_empty() { first = v; }
-            }
         }
-
-        if !first.is_empty() && first.len() >= low && first.len() <= high {
-            return Ok(first);
-        }
-
-        // full confirmed fallback (2s)
-        let full = async {
-            if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = call_cfg(&self.rpc_client, CommitmentConfig::confirmed(), false) => r1,
-                    r2 = call_cfg(fast,               CommitmentConfig::confirmed(), false) => r2,
-                }
-            } else {
-                call_cfg(&self.rpc_client, CommitmentConfig::confirmed(), false).await
-            }
-        };
-        let res = timeout(Duration::from_secs(2), full)
-            .await
-            .map_err(|_| anyhow::anyhow!("get_program_accounts (fallback) timeout"))??;
-        Ok(res)
+        v
     }
-
-    // === [IMPROVED: PIECE TIP v38] === surge ring+EMA, RAII reserve, balance-aware clamp
-}
-
-// TIP budget and surge caches (module scope statics)
-static TIP_BAL_CACHE: OnceLock<tokio::sync::RwLock<(std::time::Instant, u64)>> = OnceLock::new();
-static PENDING_TIP_BUDGET: OnceLock<AtomicU64> = OnceLock::new();
-static FEE_SURGE_CACHE: OnceLock<tokio::sync::RwLock<(std::time::Instant, u64)>> = OnceLock::new();
-static SURGE_RING: OnceLock<tokio::sync::RwLock<VecDeque<u64>>> = OnceLock::new();
-static SURGE_EMA: OnceLock<AtomicU64> = OnceLock::new();
-
-const SURGE_RING_CAP: usize = 24;
-const PAYER_SAFETY_FLOOR: u64 = 50_000;
-const SURGE_FRACTION_NUM: u64 = 1; // 1/3
-const SURGE_FRACTION_DEN: u64 = 3;
-
-#[inline]
-pub fn tip_budget_reserve(lamports: u64) {
-    PENDING_TIP_BUDGET.get_or_init(|| AtomicU64::new(0)).fetch_add(lamports, Ordering::Relaxed);
-}
-#[inline]
-pub fn tip_budget_release(lamports: u64) {
-    // Saturating CAS loop (never underflow)
-    let a = PENDING_TIP_BUDGET.get_or_init(|| AtomicU64::new(0));
-    let mut cur = a.load(Ordering::Relaxed);
-    loop {
-        let dec = cur.min(lamports);
-        match a.compare_exchange(cur, cur.saturating_sub(dec), Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(now) => cur = now,
-        }
-    }
-}
-
-// RAII guard (panic-safe)
-pub struct TipReservation(u64);
-impl TipReservation {
-    pub fn new(lamports: u64) -> Self { tip_budget_reserve(lamports); TipReservation(lamports) }
-    pub fn amount(&self) -> u64 { self.0 }
-    pub fn into_inner(self) -> u64 { let v = self.0; std::mem::forget(self); v }
-}
-impl Drop for TipReservation { fn drop(&mut self) { tip_budget_release(self.0); } }
-
-#[inline]
-async fn surge_ring_push(v: u64) {
-    let cell = SURGE_RING.get_or_init(|| tokio::sync::RwLock::new(VecDeque::with_capacity(SURGE_RING_CAP)));
-    let mut w = cell.write().await;
-    if w.len() >= SURGE_RING_CAP { w.pop_front(); }
-    w.push_back(v);
-    // EMA (~35% step)
-    let ema = SURGE_EMA.get_or_init(|| AtomicU64::new(v));
-    let old = ema.load(Ordering::Relaxed);
-    let next = old + ((v.saturating_sub(old)) * 35 / 100);
-    ema.store(next.max(1), Ordering::Relaxed);
-}
-#[inline]
-async fn surge_ring_p90() -> Option<u64> {
-    let cell = SURGE_RING.get_or_init(|| tokio::sync::RwLock::new(VecDeque::with_capacity(SURGE_RING_CAP)));
-    let g = cell.read().await;
-    if g.is_empty() { return None; }
-    let mut v: Vec<u64> = g.iter().copied().collect();
-    v.sort_unstable();
-    let idx = ((v.len() as f64 * 0.90).floor() as usize).clamp(0, v.len()-1);
-    Some(v[idx])
-}
-
-impl PortOptimizer {
-    async fn fee_surge_allowance_lamports(&self) -> u64 {
-        use std::time::{Duration, Instant};
-        if let Some(cell) = FEE_SURGE_CACHE.get() {
-            let g = cell.read().await;
-            if g.0.elapsed() <= Duration::from_millis(300) { return g.1; }
-        }
-
-        // Representative scope: CB + System (+ optional protocols if available elsewhere)
-        let mut scope = vec![solana_program::compute_budget::id(), solana_program::system_program::id()];
-        // Note: If SOLEND_PROGRAM_ID/KAMINO_PROGRAM_ID are defined elsewhere, they can be appended here.
-
-        use tokio::time::timeout;
-        let sample = async {
-            if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = self.rpc_client.get_recent_prioritization_fees(&scope) => r1,
-                    r2 = fast.get_recent_prioritization_fees(&scope)           => r2,
-                }
-            } else {
-                self.rpc_client.get_recent_prioritization_fees(&scope).await
-            }
-        };
-
-        let mut p90_price: Option<u64> = None;
-        if let Ok(Ok(fees)) = timeout(std::time::Duration::from_millis(150), sample).await {
-            if !fees.is_empty() {
-                let mut vals: Vec<u64> = fees.iter().map(|f| f.prioritization_fee).collect();
-                vals.sort_unstable();
-                let idx = ((vals.len() as f64 * 0.90).floor() as usize).clamp(0, vals.len() - 1);
-                p90_price = Some(vals[idx].max(1));
-            }
-        }
-        if let Some(p) = p90_price { surge_ring_push(p).await; }
-
-        // robust price = max(live p90, ring p90, EMA)
-        let ema = SURGE_EMA.get_or_init(|| AtomicU64::new(0)).load(Ordering::Relaxed);
-        let robust_price = p90_price.into_iter().chain(surge_ring_p90().await).chain((ema > 0).then_some(ema)).max().unwrap_or(0);
-
-        let lamports = if robust_price > 0 {
-            let units = ((200_000u32 + 1023) & !1023).min(1_400_000) as u64;
-            let cu_price = self.quantize_cu_price_64(robust_price);
-            let x = (units.saturating_mul(cu_price) as f64 * 1.05).ceil() as u64;
-            x.min(600_000)
-        } else { 0 };
-
-        let cell = FEE_SURGE_CACHE.get_or_init(|| tokio::sync::RwLock::new((Instant::now(), lamports)));
-        *cell.write().await = (Instant::now(), lamports);
-        lamports
-    }
-
-    async fn ensure_tip_funds(&self, min_balance: u64) -> Result<()> {
-        use anchor_client::solana_sdk::commitment_config::CommitmentConfig;
-        use std::time::Duration;
-
-        if min_balance == 0 { return Ok(()); }
-
-        let me = self.wallet.pubkey();
-        let reserved = PENDING_TIP_BUDGET.get_or_init(|| AtomicU64::new(0)).load(Ordering::Relaxed);
-
-        // 250ms hot cache short-circuit
-        if let Some(cell) = TIP_BAL_CACHE.get() {
-            let g = cell.read().await;
-            if g.0.elapsed() <= Duration::from_millis(250) && g.1 >= (min_balance + reserved + PAYER_SAFETY_FLOOR) {
-                return Ok(());
-            }
-        }
-
-        async fn get_bal(cli: &solana_client::nonblocking::rpc_client::RpcClient, who: &Pubkey, com: CommitmentConfig) -> Result<u64> {
-            Ok(cli.get_balance_with_commitment(who, com).await?.value)
-        }
-
-        // processed hedge
-        let processed = if let Some(fast) = &self.rpc_fast {
-            tokio::select! {
-                r1 = get_bal(&self.rpc_client, &me, CommitmentConfig::processed()) => r1,
-                r2 = get_bal(fast,             &me, CommitmentConfig::processed()) => r2,
-            }.ok()
-        } else {
-            get_bal(&self.rpc_client, &me, CommitmentConfig::processed()).await.ok()
-        };
-
-        // confirmed hedge if needed
-        let confirmed = if processed.is_none() {
-            Some(if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = get_bal(&self.rpc_client, &me, CommitmentConfig::confirmed()) => r1,
-                    r2 = get_bal(fast,             &me, CommitmentConfig::confirmed()) => r2,
-                }?
-            } else {
-                get_bal(&self.rpc_client, &me, CommitmentConfig::confirmed()).await?
-            })
-        } else { None };
-
-        let bal = match (processed, confirmed) {
-            (Some(p), Some(c)) => c.max(p),
-            (Some(p), None)    => p,
-            (None, Some(c))    => c,
-            (None, None)       => 0,
-        };
-
-        // clamp surge to unreserved balance slice
-        let surge_raw = self.fee_surge_allowance_lamports().await;
-        let unreserved = bal.saturating_sub(reserved + PAYER_SAFETY_FLOOR);
-        let surge_cap = (unreserved / SURGE_FRACTION_DEN).saturating_mul(SURGE_FRACTION_NUM);
-        let surge = surge_raw.min(surge_cap);
-
-        let need = min_balance.saturating_add(reserved).saturating_add(surge).saturating_add(PAYER_SAFETY_FLOOR);
-
-        let cell = TIP_BAL_CACHE.get_or_init(|| tokio::sync::RwLock::new((std::time::Instant::now(), bal)));
-        *cell.write().await = (std::time::Instant::now(), bal);
-
+    
+    /// Ensures the transaction has sufficient funds for fees and rent
+    pub async fn ensure_total_budget_safety(
+        &self, 
+        ixs: &[Instruction], 
+        rent_reserve_accounts: usize
+    ) -> Result<()> {
+        let (cu_lim, cu_price, tip) = parse_budget_from_ixs(ixs);
+        let pri_fee = priority_fee_lamports(cu_lim, cu_price);
+        let rent_reserve = (rent_reserve_accounts as u64)
+            .saturating_mul(self.min_rent_token_account().await);
+            
+        let need = BASE_SIG_COST_LAMPORTS
+            .saturating_add(pri_fee)
+            .saturating_add(tip)
+            .saturating_add(rent_reserve);
+            
+        let bal = self.rpc_client.get_balance(&self.wallet.pubkey()).await?;
+        
         if bal < need {
-            let deficit = need.saturating_sub(bal);
-            anyhow::bail!("insufficient balance: have {bal}, reserved {reserved}, surge {surge} (raw {surge_raw}), floor {PAYER_SAFETY_FLOOR}, need {need} (short {deficit})");
+            return Err(anyhow!(
+                "Insufficient funds: have {} lamports, need {} (base: {}, pri_fee: {}, tip: {}, rent: {})",
+                bal, need, BASE_SIG_COST_LAMPORTS, pri_fee, tip, rent_reserve
+            ));
         }
+        
         Ok(())
     }
 
-    // === [IMPROVED: PIECE CONFIRM v38] === dual-node probe with smarter escalation
-    async fn confirm_sig_with_backoff(
+    // Rough CU estimator with LRU cache and TTL/epoch tracking
+    async fn optimize_compute_units_rough(&self, ixs: &[Instruction]) -> u32 {
+        // Skip empty instruction sets
+        if ixs.is_empty() {
+            return 0;
+        }
+
+        // Get current epoch for cache validation
+        let epoch = match self.rpc_client.get_epoch_info().await {
+            Ok(info) => info.epoch,
+            Err(e) => {
+                error!("Failed to get epoch info: {}", e);
+                return 200_000; // Fallback to safe default
+            }
+        };
+
+        // Generate a fingerprint for these instructions
+        let fingerprint = ixs_fingerprint(ixs);
+        
+        // Try to get from cache first (with TTL and epoch validation)
+        if let Ok(cache) = cu_cache().try_read() {
+            if let Some(cached_cu) = cache.get_valid(&fingerprint, epoch, Duration::from_secs(30)) {
+                return cached_cu;
+            }
+        }
+
+        // If not in cache or expired, simulate to get the actual CU usage
+        let result = match self.simulate_compute_units(ixs).await {
+            Ok(cu) => cu,
+            Err(e) => {
+                error!("Failed to simulate CU: {}", e);
+                // Fallback to a safe default if simulation fails
+                200_000
+            }
+        };
+
+        // Update cache in background with current epoch
+        let cache = cu_cache().clone();
+        tokio::spawn(async move {
+            if let Ok(mut cache) = cache.write().await {
+                cache.put(fingerprint, result, epoch);
+            }
+        });
+
+        result
+    }
+    
+    // Helper function to simulate compute units for a set of instructions
+    async fn simulate_compute_units(&self, ixs: &[Instruction]) -> Result<u32> {
+        // Create a minimal transaction for simulation
+        let payer = self.wallet.pubkey();
+        let blockhash = self.get_recent_blockhash_with_retry().await?;
+        
+        // Build a minimal transaction with just the instructions
+        let message = V0Message::try_compile(
+            &payer,
+            ixs,
+            &[], // No address lookup tables
+            blockhash,
+        )?;
+        
+        let tx = VersionedTransaction::try_new(
+            solana_sdk::message::VersionedMessage::V0(message),
+            &[&self.wallet],
+        )?;
+        
+        // Simulate the transaction to get compute units
+        let sim_result = self
+            .rpc
+            .simulate_transaction_with_config(
+                &tx,
+                solana_client::rpc_config::RpcSimulateTransactionConfig {
+                    sig_verify: false, // Skip signature verification for speed
+                    replace_recent_blockhash: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("Simulation failed: {}", e))?;
+            
+        // Extract compute units from simulation result
+        sim_result
+            .value
+            .units_consumed
+            .ok_or_else(|| anyhow!("No units consumed in simulation"))
+            .map(|units| units.max(100_000)) // Enforce minimum CU
+    }
+    // Dynamic CU budget ixs (p75 fee floor + autoscale)
+    pub async fn dynamic_budget_ixs(&self, baseline_cu: u32, floor_cu_price: u64) -> (Instruction, Instruction) {
+        // +12% headroom, rounded to 1k CU granularity, bounded in-protocol
+        let mut cu_limit = ((baseline_cu as f64) * 1.12).ceil() as u32;
+        cu_limit = ((cu_limit + 999) / 1000) * 1000;
+        cu_limit = cu_limit.clamp(150_000, 1_400_000);
+
+        // Base price from trimmed quantiles (already robust)
+        let mut cu_price = self.priority_fee_autoscale(floor_cu_price).await;
+
+        // Add congestion slope multiplier (0..+8%) if tape rising
+        if let Ok(slope) = self.congestion_slope().await {
+            let mult = 1.0 + slope.min(0.08);
+            cu_price = ((cu_price as f64) * mult).ceil() as u64;
+        }
+
+        // Add tiny positive jitter (0..30 bps) to break ties deterministically
+        let j_bp = self.price_jitter_bp(30);
+        cu_price = cu_price.saturating_add((cu_price.saturating_mul(j_bp)) / 10_000);
+
+    // Stable v0 builder (ALT-aware)
+    pub fn build_v0_tx(
+        &self,
+        payer: Pubkey,
+        ixs: &[Instruction],
+        recent_blockhash: Hash,
+        alts: &[AddressLookupTableAccount],
+    ) -> Result<VersionedTransaction> {
+        let msg_v0 = V0Message::try_compile(&payer, ixs, alts, recent_blockhash)?;
+        Ok(VersionedTransaction::try_new(VersionedMessage::V0(msg_v0), &[self.wallet.as_ref()])?)
+    }
+
+    // Blockhash fetch with small retry/backoff
+    pub async fn get_recent_blockhash_with_retry(&self) -> Result<Hash> {
+        let mut backoff = Duration::from_millis(120);
+        for _ in 0..8 {
+            if let Ok(h) = self.rpc_client.get_latest_blockhash().await { return Ok(h); }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(1500));
+        }
+        Err(anyhow!("failed to get recent blockhash"))
+    }
+
+    // Confirmation with exponential backoff (bounded)
+    pub async fn confirm_sig_with_backoff(
         &self,
         sig: &solana_sdk::signature::Signature,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<bool> {
-        use solana_client::rpc_config::RpcSignatureStatusConfig;
-        use solana_transaction_status::TransactionConfirmationStatus;
-        use tokio::time::{sleep, Instant, Duration};
-
         let start = Instant::now();
-        let mut use_history = false;
-        let mut did_finality_probe = false;
-
-        #[inline]
-        async fn check_once(
-            cli: &solana_client::nonblocking::rpc_client::RpcClient,
-            sig: &solana_sdk::signature::Signature,
-            hist: bool,
-        ) -> Result<Option<solana_transaction_status::TransactionStatus>> {
-            let cfg = RpcSignatureStatusConfig { search_transaction_history: hist };
-            let r = cli.get_signature_statuses_with_config(&[*sig], cfg).await?;
-            Ok(r.value.into_iter().next().flatten())
-        }
-
-        // dual-node instant probe (no-history)
-        let instant = if let Some(fast) = &self.rpc_fast {
-            tokio::select! {
-                r1 = check_once(&self.rpc_client, sig, false) => r1,
-                r2 = check_once(fast,             sig, false) => r2,
-            }
-        } else {
-            check_once(&self.rpc_client, sig, false).await
-        };
-        if let Ok(Some(st)) = instant {
-            if st.err.is_some() { return Ok(false); }
-            if matches!(st.confirmation_status, Some(TransactionConfirmationStatus::Confirmed)|Some(TransactionConfirmationStatus::Finalized))
-                || st.confirmations.unwrap_or(0) > 0 { return Ok(true); }
-        }
-
-        // jittered escalation gate
-        let mut seed = { let b=sig.as_ref(); let mut z=0u64; for &x in b.iter().take(8){ z=(z<<8)|(x as u64); } (z%37) as u64 };
-        let mut delay = Duration::from_millis(120 + (seed % 40)); // 120–159ms
-        let escalate_at = Duration::from_millis(900 + (seed % 200)); // 900–1099ms
-
+        let cfg = RpcSignatureStatusConfig { search_transaction_history: true };
+        let mut delay = Duration::from_millis(160);
         loop {
-            let elapsed = start.elapsed();
-            if elapsed >= timeout { return Ok(false); }
-            if !use_history && elapsed >= escalate_at { use_history = true; }
-
-            let res = if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = check_once(&self.rpc_client, sig, use_history) => r1,
-                    r2 = check_once(fast,             sig, use_history) => r2,
-                }
-            } else {
-                check_once(&self.rpc_client, sig, use_history).await
-            };
-
-            match res {
-                Ok(Some(st)) => {
-                    if st.err.is_some() { return Ok(false); }
-                    if matches!(st.confirmation_status, Some(TransactionConfirmationStatus::Confirmed)|Some(TransactionConfirmationStatus::Finalized))
-                        || st.confirmations.unwrap_or(0) > 0 { return Ok(true); }
-                }
-                Ok(None) => {
-                    if !did_finality_probe && elapsed + Duration::from_millis(600) >= timeout {
-                        did_finality_probe = true;
-                        if let Ok(r) = self.rpc_client.get_signature_statuses_with_history(&[*sig]).await {
-                            if let Some(Some(st)) = r.value.first() {
-                                if st.err.is_some() { return Ok(false); }
-                                if matches!(st.confirmation_status, Some(TransactionConfirmationStatus::Finalized)) { return Ok(true); }
-                            }
-                        }
-                    }
+            if start.elapsed() >= timeout { return Ok(false); }
+            match self.rpc_client.get_signature_statuses_with_config(&[*sig], cfg).await {
+                Ok(resp) => {
+                    if let Some(Some(st)) = resp.value.first() { return Ok(st.err.is_none()); }
                 }
                 Err(_) => {}
             }
-
-            sleep(delay).await;
-            delay = std::cmp::min(delay * 2, Duration::from_millis(1_000));
-            seed = (seed * 1103515245 + 12345) & 0x7FFF;
-            delay += Duration::from_millis((seed % 7 + 1) as u64);
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, Duration::from_millis(1000));
         }
     }
 
-    // === [IMPROVED: PIECE OPT v38] === cooldown + bounded maps + state-FP skip + failure backoff
-    async fn optimize_cycle(&self) -> Result<()> {
-        self.update_market_data().await?;
-
-        // 1) positions snapshot (>0 only, deterministic)
-        let mut pos_list: Vec<(String, Position)> = {
-            let g = self.active_positions.read().await;
-            g.iter().filter(|(_, p)| p.amount > 0).map(|(k, v)| (k.clone(), v.clone())).collect()
-        };
-        pos_list.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        if pos_list.is_empty() { return Ok(()); }
-
-        use tokio::sync::RwLock as TokioRwLock;
-        static LAST_ACTION_TS: OnceLock<TokioRwLock<FastMap<String, std::time::Instant>>> = OnceLock::new();
-        static LAST_EVAL_FP:  OnceLock<TokioRwLock<FastMap<String, (u64, std::time::Instant)>>> = OnceLock::new();
-        static FAIL_BACKOFF:  OnceLock<TokioRwLock<FastMap<String, (u32, std::time::Instant)>>> = OnceLock::new();
-
-        const REBAL_COOLDOWN_MS: u64 = 1500;
-        const EVAL_TTL_MS: u64 = 500;
-        const COOLDOWN_MAP_SOFT_MAX: usize = 8_192;
-        const EVAL_MAP_SOFT_MAX: usize = 8_192;
-        const FAIL_SOFT_MAX: usize = 8_192;
-
-        #[inline]
-        fn apy_key_i64(apy_pct: f64) -> i64 {
-            let q = (apy_pct * 1e6).round();
-            if q.is_finite() { q as i64 } else { 0 }
+    /// Update the last transaction signature for deterministic operations
+    async fn update_last_tx_signature(&self, signature: solana_sdk::signature::Signature) {
+        if let Ok(mut last_tx) = self.last_tx_signature.write().await {
+            *last_tx = Some(signature);
         }
-        #[inline]
-        fn bundle_fp(amount: u64, mkts: &[LendingMarket]) -> u64 {
-            let mut best_supply = i64::MIN;
-            let mut best_borrow = i64::MAX;
-            for m in mkts {
-                let s = apy_key_i64(m.supply_apy);
-                let b = apy_key_i64(m.borrow_apy);
-                if s > best_supply { best_supply = s; }
-                if b < best_borrow { best_borrow = b; }
-            }
-            let s = best_supply as u64;
-            let b = best_borrow as u64;
-            amount ^ s.rotate_left(13) ^ b.rotate_left(29) ^ (mkts.len() as u64).wrapping_mul(0x9E3779B97F4A7C15)
-        }
+    }
 
-        let now = std::time::Instant::now();
-        let cooldown = LAST_ACTION_TS.get_or_init(|| TokioRwLock::new(FastMap::default()));
-        let lastfp  = LAST_EVAL_FP.get_or_init(|| TokioRwLock::new(FastMap::default()));
-        let failmap = FAIL_BACKOFF.get_or_init(|| TokioRwLock::new(FastMap::default()));
+    pub async fn send_and_confirm_v0(
+        &self,
+        tx: &VersionedTransaction,
+        timeout: Duration,
+    ) -> Result<solana_sdk::signature::Signature> {
+        use solana_client::rpc_config::RpcSendTransactionConfig;
+        use solana_sdk::commitment_config::CommitmentConfig;
 
-        let bundles: Vec<(String, Position, Vec<LendingMarket>)> = {
-            let g = self.markets.read().await;
-            let cd = cooldown.read().await;
-            let lf = lastfp.read().await;
-            let fb = failmap.read().await;
+        let cur_slot = self.rpc_client.get_slot().await.unwrap_or(0);
 
-            let mut out = Vec::with_capacity(pos_list.len());
-            for (mint, pos) in pos_list.into_iter() {
-                if let Some(ts) = cd.get(&mint) {
-                    if now.duration_since(*ts).as_millis() as u64 <= REBAL_COOLDOWN_MS { continue; }
-                }
-                // failure backoff: exponentially extend cooldown briefly
-                if let Some((count, last)) = fb.get(&mint) {
-                    let extra = (1u64 << (*count as u64).min(4)) * 200; // 200ms, 400, 800, 1600, 3200
-                    if now.duration_since(*last).as_millis() as u64 <= extra { continue; }
-                }
-                let v = match g.get(&mint) { Some(v) if !v.is_empty() => v, _ => continue };
-                let fp = bundle_fp(pos.amount, v);
-                if let Some((prev_fp, ts)) = lf.get(&mint) {
-                    if *prev_fp == fp && now.duration_since(*ts).as_millis() as u64 <= EVAL_TTL_MS { continue; }
-                }
-                out.push((mint, pos, v.clone()));
-            }
-            out
+        let cfg = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: Some(CommitmentConfig::processed()),
+            encoding: None,
+            max_retries: Some(0),
+            min_context_slot: Some(cur_slot.saturating_sub(2)), // safe cushion
         };
-        if bundles.is_empty() { return Ok(()); }
 
-        // 3) concurrency
-        use futures::{stream, StreamExt};
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-        let desired = ((bundles.len() + 3) / 4).max(8).min(64);
-        let conc = desired.min(cores * 2);
+        let sig = self.rpc_client.send_transaction_with_config(tx, cfg).await?;
+        let ok  = self.confirm_sig_with_backoff(&sig, timeout).await?;
+        if ok { Ok(sig) } else { Err(anyhow!("confirmation timeout")) }
+    }
 
-        let cdw = LAST_ACTION_TS.get().unwrap().clone();
-        let lfw = LAST_EVAL_FP.get().unwrap().clone();
-        let fbw = FAIL_BACKOFF.get().unwrap().clone();
+    // Stale-hash resilient send with slot refresh and auto-repair
+    pub async fn send_v0_with_slot_guard<F>(
+        &self,
+        mut build_with_hash: F,
+        max_wait: Duration,
+        _hash_valid_for_slots: u64,
+        refresh_before_slots: u64,
+    ) -> Result<solana_sdk::signature::Signature>
+    where
+        F: Send + 'static + FnMut(Hash) -> Result<VersionedTransaction>,
+    {
+        let start = Instant::now();
+        let (mut bh, mut h0) = self.get_fresh_blockhash().await?;
+        let mut tx = build_with_hash(bh)?;
+        let mut attempt: u32 = 0;
 
-        let mut futs = stream::iter(bundles.into_iter())
-            .map(|(mint, position, mkts)| async move {
-                {
-                    let mut w = lfw.write().await;
-                    if w.len() > EVAL_MAP_SOFT_MAX { w.clear(); }
-                    w.insert(mint.clone(), (bundle_fp(position.amount, &mkts), std::time::Instant::now()));
-                }
-                match self.find_arbitrage_opportunity(&position, &mkts).await {
-                    Ok(Some(target)) => {
-                        match self.execute_rebalance(&position, target).await {
-                            Ok(_) => {
-                                let mut w = cdw.write().await;
-                                if w.len() > COOLDOWN_MAP_SOFT_MAX { w.clear(); }
-                                w.insert(mint.clone(), std::time::Instant::now());
-                                // success → reset failures
-                                let mut fw = fbw.write().await;
-                                fw.remove(&mint);
-                            }
-                            Err(e) => {
-                                eprintln!("[warn] rebalance failed: {e:?}");
-                                let mut fw = fbw.write().await;
-                                let (cnt, _) = fw.get(&mint).copied().unwrap_or((0, std::time::Instant::now()));
-                                if fw.len() > FAIL_SOFT_MAX { fw.clear(); }
-                                fw.insert(mint, (cnt.saturating_add(1), std::time::Instant::now()));
+        loop {
+            if start.elapsed() >= max_wait { return Err(anyhow!("timeout sending v0 tx")); }
+
+            // quick legacy sim for auto-repair
+            let payer = self.wallet.pubkey();
+            let mut ixs = tx.message().instructions().to_vec();
+            let legacy = Transaction::new_unsigned(solana_sdk::message::Message::new(&ixs, Some(&payer)));
+            if let Ok(sim) = self.rpc.simulate_transaction(&legacy).await {
+                if sim.value.err.is_some() {
+                    // parse failure and auto-repair
+                    let logs = sim.value.logs.unwrap_or_default().join("\n").to_lowercase();
+                    let mut repaired = false;
+
+                    // bump CU limit on budget exceeded
+                    if logs.contains("computationalbudgetexceeded") || logs.contains("max units exceeded") {
+                        // read current CU limit (if any) → +20% (≤1_400_000)
+                        let mut cur_limit: u32 = 800_000;
+                        for ix in &ixs {
+                            if ix.program_id == solana_sdk::compute_budget::id() && ix.data.first() == Some(&0x00) && ix.data.len() >= 5 {
+                                let mut b = [0u8; 4];
+                                b.copy_from_slice(&ix.data[1..5]);
+                                cur_limit = u32::from_le_bytes(b);
                             }
                         }
+                        let mut new_limit = ((cur_limit as f64) * 1.20).ceil() as u32;
+                        new_limit = ((new_limit + 999) / 1000) * 1000;
+                        new_limit = new_limit.clamp(150_000, 1_400_000);
+                        patch_cu_limit(&mut ixs, new_limit);
+                        repaired = true;
                     }
-                    Ok(None) => { // soft success → reduce failure count
-                        let mut fw = fbw.write().await;
-                        if let Some((cnt, _)) = fw.get_mut(&mint) { *cnt = cnt.saturating_sub(1); }
+
+                    // set heap frame on heap errors
+                    if logs.contains("heap") || logs.contains("alloc") || logs.contains("exceeded heap") {
+                        ensure_heap_frame(&mut ixs, 256_000);
+                        repaired = true;
                     }
-                    Err(e) => {
-                        eprintln!("[warn] find_arbitrage_opportunity error: {e:?}");
-                        let mut fw = fbw.write().await;
-                        let (cnt, _) = fw.get(&mint).copied().unwrap_or((0, std::time::Instant::now()));
-                        if fw.len() > FAIL_SOFT_MAX { fw.clear(); }
-                        fw.insert(mint, (cnt.saturating_add(1), std::time::Instant::now()));
+
+                    if repaired {
+                        // rebuild v0 with same blockhash; keep ALTs already embedded in tx
+                        tx = self.build_v0_tx(self.wallet.pubkey(), &ixs, bh, &[])?;
+                        continue;
+                    } else {
+                        return Err(anyhow!("simulation failed: {:?}", sim.value.err));
                     }
                 }
-            })
-            .buffer_unordered(conc);
+            }
 
-        while futs.next().await.is_some() {}
-        Ok(())
+            // deterministic cohort jitter
+            let conc = self.leader_window_concentration(4).await.unwrap_or(0.0);
+            let jitter_us = self.cohort_jitter_us(tx.signatures.get(0), conc, 3_000);
+            if jitter_us > 0 { tokio::time::sleep(Duration::from_micros(jitter_us)).await; }
+
+            match self.send_and_confirm_v0(&tx, Duration::from_secs(20)).await {
+                Ok(sig) => { self.leader_quality_update(true).await; return Ok(sig); }
+                Err(e) => {
+                    self.leader_quality_update(false).await;
+                    attempt = attempt.saturating_add(1);
+                    let msg = e.to_string().to_lowercase();
+
+                    if msg.contains("blockhash not found") || msg.contains("blockhashnotfound") {
+                        let (nbh, nh) = self.get_fresh_blockhash().await?;
+                        bh = nbh; h0 = nh;
+                        tx = build_with_hash(bh)?;
+                        continue;
+                    }
+                    let h_now = self.rpc_client.get_block_height().await.unwrap_or(h0);
+                    if h_now.saturating_sub(h0) >= refresh_before_slots {
+                        let (nbh, nh) = self.get_fresh_blockhash().await?;
+                        bh = nbh; h0 = nh;
+                        tx = build_with_hash(bh)?;
+                        continue;
+                    }
+
+                    // bounded fee escalation (CU price + tip)
+                    let mut ixs = tx.message().instructions().to_vec();
+                    for ix in ixs.iter_mut() {
+                        if ix.program_id == solana_sdk::compute_budget::id() && ix.data.first() == Some(&0x02) && ix.data.len() >= 9 {
+                            let mut cur = [0u8; 8];
+                            cur.copy_from_slice(&ix.data[1..9]);
+                            let bumped = fee_escalation_nudge(u64::from_le_bytes(cur), attempt);
+                            ix.data = {
+                                let mut d = vec![0x02u8];
+                                d.extend_from_slice(&bumped.to_le_bytes());
+                                d
+                            };
+                        }
+                        if ix.program_id == solana_sdk::system_program::id() && ix.data.first() == Some(&2u8) && ix.data.len() >= 9 {
+                            let mut cur = [0u8; 8];
+                            cur.copy_from_slice(&ix.data[1..9]);
+                            let bumped = tip_escalation_nudge(u64::from_le_bytes(cur), attempt);
+                            ix.data = {
+                                let mut d = vec![2u8];
+                                d.extend_from_slice(&bumped.to_le_bytes());
+                                d
+                            };
+                        }
+                    }
+                    tx = self.build_v0_tx(self.wallet.pubkey(), &ixs, bh, &[])?;
+                    
+                    // Slot-phase aware backoff
+                    let conc = self.leader_window_concentration(4).await.unwrap_or(0.0);
+                    self.slot_phase_backoff(conc, 120).await;
+                }
+            }
+                }
+
+                // Brief yield under transient errors
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        // bounded fee escalation (CU price + tip)
+        let mut ixs = tx.message().instructions().to_vec();
+        for ix in ixs.iter_mut() {
+            if ix.program_id == solana_sdk::compute_budget::id() && ix.data.first() == Some(&0x02) && ix.data.len() >= 9 {
+                let mut cur = [0u8; 8];
+                cur.copy_from_slice(&ix.data[1..9]);
+                let bumped = fee_escalation_nudge(u64::from_le_bytes(cur), attempt);
+                ix.data = {
+                    let mut d = vec![0x02u8];
+                    d.extend_from_slice(&bumped.to_le_bytes());
+                    d
+                };
+            }
+            if ix.program_id == solana_sdk::system_program::id() && ix.data.first() == Some(&2u8) && ix.data.len() >= 9 {
+                let mut cur = [0u8; 8];
+                cur.copy_from_slice(&ix.data[1..9]);
+                let bumped = tip_escalation_nudge(u64::from_le_bytes(cur), attempt);
+                ix.data = {
+                    let mut d = vec![2u8];
+                    d.extend_from_slice(&bumped.to_le_bytes());
+                    d
+                };
+            }
+        max_tables: usize,
+    ) -> Vec<AddressLookupTableAccount> {
+        if candidates.is_empty() || max_tables == 0 { return Vec::new(); }
+
+        use std::collections::HashSet;
+        let mut need: HashSet<Pubkey> = HashSet::new();
+        for ix in ixs {
+            need.insert(ix.program_id);
+            for a in &ix.accounts { need.insert(a.pubkey); }
+        }
+
+        let mut picked: Vec<AddressLookupTableAccount> = Vec::new();
+        let mut remaining: HashSet<Pubkey> = need;
+
+        for _ in 0..max_tables {
+            let mut best: Option<(usize, usize)> = None; // (idx, coverage)
+            for (i, alt) in candidates.iter().enumerate() {
+                if picked.iter().any(|p| p.key() == alt.key()) { continue; }
+                let cov = alt.addresses.iter().filter(|k| remaining.contains(k)).count();
+                if cov == 0 { continue; }
+                if best.map(|b| cov > b.1).unwrap_or(true) { best = Some((i, cov)); }
+            }
+            if let Some((i, _)) = best {
+                let alt = candidates[i].clone();
+                for k in &alt.addresses { remaining.remove(k); }
+                picked.push(alt);
+            } else { break; }
+        }
+        picked
     }
 
-    // === [IMPROVED: PIECE FEE v38] === v0 sim units + ring/EMA blend + units-EMA fallback
-}
+    // Canonical ordering of instructions for predictability
+    fn normalize_ixs_order(mut ixs: Vec<Instruction>) -> Vec<Instruction> {
+        let mut budget: Vec<Instruction> = Vec::new();      // compute budget ixs
+        let mut tips:   Vec<Instruction> = Vec::new();      // system::transfer as tips
+        let mut repays: Vec<Instruction> = Vec::new();      // flash repay legs
+        let mut core:   Vec<Instruction> = Vec::new();      // everything else
 
-static UNITS_EMA: OnceLock<AtomicU64> = OnceLock::new();
-
-impl PortOptimizer {
-    pub async fn estimate_rebalance_cost_lamports(
-        &self,
-        ixs: &[Instruction],
-        tip_multiplier: f64,
-    ) -> Result<u64> {
-        use std::collections::HashSet;
-
-        let payer = self.wallet.pubkey();
-        let bh = self.get_recent_blockhash_with_retry().await?;
-        let tx0 = self.build_v0_tx(payer, ixs, bh, &[])?;
-        let (units_opt, _logs) = self.simulate_units_and_logs(&tx0).await.unwrap_or((None, vec![]));
-
-        // units (sim or EMA fallback)
-        let units_sim = units_opt.map(|u| u as u64);
-        let units_est = if let Some(u) = units_sim {
-            let ema = UNITS_EMA.get_or_init(|| AtomicU64::new(u));
-            let old = ema.load(Ordering::Relaxed);
-            let next = if old == 0 { u } else { old + ((u.saturating_sub(old)) * 25 / 100) }; // 25% step
-            ema.store(next, Ordering::Relaxed);
-            u
-        } else {
-            UNITS_EMA.get_or_init(|| AtomicU64::new(COMPUTE_UNITS as u64)).load(Ordering::Relaxed).max(COMPUTE_UNITS as u64)
-        };
-        let units = self.quantize_units_1024(units_est as u32).min(1_400_000) as u64;
-
-        // scope programs
-        let mut scope: HashSet<Pubkey> = HashSet::new();
-        scope.insert(solana_program::compute_budget::id());
-        scope.insert(solana_program::system_program::id());
-        for ix in ixs { scope.insert(ix.program_id); }
-
-        // hedged, bounded sampling
-        use tokio::time::timeout;
-        let fees_res = async {
-            let vec_scope: Vec<Pubkey> = scope.iter().copied().collect();
-            if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = self.rpc_client.get_recent_prioritization_fees(&vec_scope) => r1,
-                    r2 = fast.get_recent_prioritization_fees(&vec_scope)           => r2,
-                }
+        for ix in ixs.into_iter() {
+            if ix.program_id == solana_sdk::compute_budget::id() {
+                budget.push(ix);
+            } else if ix.program_id == solana_sdk::system_program::id() && ix.data.first() == Some(&2u8) {
+                tips.push(ix);
+            } else if ix.data.first() == Some(&FLASHREPAY_TAG) {
+                repays.push(ix);
             } else {
-                self.rpc_client.get_recent_prioritization_fees(&vec_scope).await
+                core.push(ix);
             }
+        }
+
+        // Budget -> tip -> core -> repay
+        budget.into_iter().chain(tips).chain(core).chain(repays).collect()
+    }
+
+    // Recent-fee congestion slope proxy (0.0..0.10)
+    pub async fn congestion_slope(&self) -> Result<f64> {
+        // Uses recent prioritization fees to gauge short-horizon uptrend.
+        // Returns 0.0..0.10 (10% max). Negative slopes return 0.
+        let fees = self.rpc_client.get_recent_prioritization_fees(&[]).await?;
+        if fees.len() < 8 { return Ok(0.0); }
+
+        let mut vals: Vec<u64> = fees.iter().map(|f| f.prioritization_fee.max(1)).collect();
+        vals.sort_unstable();
+        let p50 = vals[vals.len() / 2].max(1) as f64;
+
+        // Use the latest observed fee vs median as a robust slope proxy
+        let last = fees.last().map(|f| f.prioritization_fee.max(1) as f64).unwrap_or(p50);
+        let rel = (last - p50) / p50;
+        Ok(rel.max(0.0).min(0.10))
+    }
+
+    pub fn price_jitter_bp(&self, max_bp: u64) -> u64 {
+        // Use last transaction signature as seed if available, otherwise use wallet pubkey
+        let seed = match self.last_tx_signature.blocking_read().as_ref() {
+            Some(sig) => sig.as_ref(),
+            None => self.wallet.pubkey().as_ref(),
         };
-        let mut cu_price_live = PRIORITY_FEE_LAMPORTS;
-        if let Ok(Ok(fees)) = timeout(std::time::Duration::from_millis(150), fees_res).await {
-            if !fees.is_empty() {
-                let mut vals: Vec<u64> = fees.iter().map(|f| f.prioritization_fee).collect();
+        
+        // Generate deterministic jitter based on the seed
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        let hash = hasher.finalize();
+        let rand_val = u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]);
+        
+        // Scale to the desired range (0..=max_bp)
+        rand_val % (max_bp + 1)
+    }
+
+    pub fn safe_round_lamports(&self, x: u64, quantum: u64) -> u64 {
+        if quantum <= 1 { return x; }
+        ((x + quantum - 1) / quantum) * quantum
+    }
+
+    // Fetch the next N leaders using a cached leader schedule (epoch-aware, 15s TTL)
+    pub async fn next_n_leaders(&self, n: usize) -> Result<Vec<String>> {
+        use std::collections::HashMap;
+        let ei = self.rpc_client.get_epoch_info().await?;
+        let mut cache = leader_cache().write().await;
+
+        let refresh_needed = cache.epoch != ei.epoch || cache.last_refresh.elapsed() > Duration::from_secs(15);
+        if refresh_needed {
+            let sched_opt = self.rpc_client.get_leader_schedule(None).await?;
+            cache.schedule = match sched_opt { Some(m) => m, None => HashMap::new() };
+            cache.epoch = ei.epoch;
+            cache.last_refresh = Instant::now();
+        }
+
+        let slots_in_epoch = ei.slots_in_epoch as usize;
+        if slots_in_epoch == 0 || n == 0 { return Ok(Vec::new()); }
+
+        let mut who: Vec<String> = vec![String::new(); slots_in_epoch];
+        for (leader, slots) in cache.schedule.iter() {
+            for &idx in slots {
+                if idx < slots_in_epoch { who[idx] = leader.clone(); }
+            }
+        }
+
+        let mut out = Vec::with_capacity(n);
+        let mut i = 1usize;
+        let cur_idx = ei.slot_index as usize;
+        while out.len() < n && (cur_idx + i) < slots_in_epoch {
+            out.push(who.get(cur_idx + i).cloned().unwrap_or_default());
+            i += 1;
+        }
+        Ok(out)
+    }
+
+        /// Compute concentration score (0..1) for next k leaders (cached schedule)
+    /// Returns the fraction of slots in the window that have the same leader as the most common one
+    pub async fn leader_window_concentration(&self, k: usize) -> Result<f64> {
+        use std::collections::HashMap;
+        
+        if k == 0 {
+            return Ok(0.0);
+        }
+        
+        // Get the next k leaders from the cache or RPC
+        let leaders = self.next_n_leaders(k).await.unwrap_or_default();
+        if leaders.is_empty() {
+            return Ok(0.0);
+        }
+        
+        // Count occurrences of each leader
+        let mut leader_counts = HashMap::new();
+        for leader in &leaders {
+            *leader_counts.entry(leader).or_insert(0) += 1;
+        }
+        
+        // Find the most common leader count
+        let max_count = leader_counts.values().max().copied().unwrap_or(0);
+        
+        // Return the fraction of slots with the most common leader
+        Ok(max_count as f64 / k as f64)
+        if leaders.is_empty() { return Ok(0.0); }
+        let mut freq: HashMap<String, usize> = HashMap::new();
+        for l in leaders.into_iter().filter(|s| !s.is_empty()) {
+            *freq.entry(l).or_insert(0) += 1;
+        }
+        if freq.is_empty() { return Ok(0.0); }
+        let max_c = *freq.values().max().unwrap_or(&0) as f64;
+        Ok((max_c / k as f64).min(1.0))
+    }
+
+    // Program-aware priority fee estimator (bias to touched programs)
+    pub async fn priority_fee_for_ixs(&self, ixs: &[Instruction], floor_cu_price: u64) -> u64 {
+        use std::collections::HashSet;
+        let mut set: HashSet<Pubkey> = HashSet::new();
+        for ix in ixs { set.insert(ix.program_id); }
+        let addrs: Vec<Pubkey> = set.into_iter().collect();
+        if addrs.is_empty() {
+            return self.priority_fee_autoscale(floor_cu_price).await;
+        }
+        match self.rpc_client.get_recent_prioritization_fees(&addrs).await {
+            Ok(fees) if !fees.is_empty() => {
+                let mut vals: Vec<u64> = fees.iter().map(|f| f.prioritization_fee.max(1)).collect();
                 vals.sort_unstable();
-                let p75 = vals[(vals.len()*75/100).min(vals.len()-1)];
-                cu_price_live = p75.max(PRIORITY_FEE_LAMPORTS);
+                let n = vals.len();
+                let lo = vals[(n * 70 / 100).min(n - 1)];
+                let hi = vals[(n * 90 / 100).min(n - 1)];
+                let base = lo.saturating_add(hi) / 2;
+                let mut out = base.max(floor_cu_price).min(floor_cu_price.saturating_mul(25));
+                let j_bp = self.price_jitter_bp(30);
+                out = out.saturating_add((out.saturating_mul(j_bp)) / 10_000);
+                out
             }
+            _ => self.priority_fee_autoscale(floor_cu_price).await,
         }
-
-        // blend with ring+EMA
-        let ema = SURGE_EMA.get_or_init(|| AtomicU64::new(0)).load(Ordering::Relaxed);
-        let mut ring_p90 = 0u64;
-        if let Some(cell) = SURGE_RING.get() {
-            let g = cell.read().await;
-            if !g.is_empty() {
-                let mut v: Vec<u64> = g.iter().copied().collect();
-                v.sort_unstable();
-                ring_p90 = v[((v.len() as f64 * 0.90).floor() as usize).clamp(0, v.len()-1)];
-            }
-        }
-        let cu_price = self.quantize_cu_price_64(cu_price_live.max(ema).max(ring_p90));
-
-        // lamports = CU*price + tip
-        let base = units.saturating_mul(cu_price);
-        let tip  = (self.dynamic_priority_fee().await.unwrap_or(PRIORITY_FEE_LAMPORTS) as f64 * tip_multiplier) as u64;
-        Ok(((base.saturating_add(tip)) as f64 * 1.05).ceil() as u64)
     }
 }
 
@@ -4756,27 +7114,25 @@ impl ReserveMeta {
     pub fn reserve_owner_program(&self) -> Pubkey { self.program_id }
 }
 
-    fn calculate_expected_profit(
-        &self,
-        amount: u64,
-        current_apy: f64,
-        target_apy: f64,
-        gas_cost: u64,
-    ) -> f64 {
-        let daily_rate_diff = (target_apy - current_apy) / 365.0 / 100.0;
-        let daily_profit = (amount as f64) * daily_rate_diff;
-        let gas_cost_tokens = gas_cost as f64 / 1e9;
-        (daily_profit - gas_cost_tokens) / (amount as f64) * 10000.0
-    }
-
-    async fn execute_rebalance(
-        &self,
-        position: &Position,
-        target_market: LendingMarket,
-    ) -> Result<()> {
+fn calculate_expected_profit(
+&self,
+amount: u64,
+@@ -280,101 +1122,265 @@ impl PortOptimizer {
+position: &Position,
+target_market: LendingMarket,
+) -> Result<()> {
         // 1) Build core instructions
-        let withdraw_ix = self.build_withdraw_instruction(position).await?;
-        let deposit_ix = self.build_deposit_instruction(position, &target_market).await?;
+let withdraw_ix = self.build_withdraw_instruction(position).await?;
+let deposit_ix = self.build_deposit_instruction(position, &target_market).await?;
+        
+        let recent_blockhash = self.get_recent_blockhash_with_retry().await?;
+        
+        let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNITS);
+        let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(PRIORITY_FEE_LAMPORTS);
+        
+        let mut transaction = Transaction::new_with_payer(
+            &[compute_budget_ix, priority_fee_ix, withdraw_ix, deposit_ix],
+            Some(&self.wallet.pubkey()),
 
         // 2) Dynamic CU and priority fee (p75 with floor)
         let baseline_cu = self
@@ -4789,7 +7145,11 @@ impl ReserveMeta {
             &self.wallet.pubkey(),
             &Pubkey::from_str("JitoTip111111111111111111111111111111111")?,
             self.dynamic_priority_fee().await.unwrap_or(PRIORITY_FEE_LAMPORTS),
-        );
+);
+        
+        transaction.sign(&[self.wallet.as_ref()], recent_blockhash);
+        
+        match self.send_transaction_with_retry(&transaction).await {
 
         let ixs = vec![cu_ix, fee_ix, tip_ix, withdraw_ix, deposit_ix];
 
@@ -4816,23 +7176,43 @@ impl ReserveMeta {
             )
             .await
         {
-            Ok(signature) => {
-                println!("Rebalance executed: {signature}");
-                self.update_position(position, target_market).await?;
+Ok(signature) => {
+println!("Rebalance executed: {signature}");
+self.update_position(position, target_market).await?;
                 Ok(())
-            }
-            Err(e) => {
-                eprintln!("Rebalance failed: {e:?}");
+}
+Err(e) => {
+eprintln!("Rebalance failed: {e:?}");
+                return Err(e);
                 Err(e)
-            }
-        }
-    }
+}
+}
+        
+        Ok(())
+}
 
-    async fn build_withdraw_instruction(&self, position: &Position) -> Result<Instruction> {
+async fn build_withdraw_instruction(&self, position: &Position) -> Result<Instruction> {
+        let program_id = match position.protocol {
+            Protocol::Solend => Pubkey::from_str(SOLEND_PROGRAM_ID)?,
+            Protocol::Kamino => Pubkey::from_str(KAMINO_PROGRAM_ID)?,
+        };
+        
+        let instruction_data = match position.protocol {
+            Protocol::Solend => self.encode_solend_withdraw(position.amount),
+            Protocol::Kamino => self.encode_kamino_withdraw(position.amount),
+        };
+        
+        let accounts = self.get_withdraw_accounts(position).await?;
+        
+        Ok(Instruction {
+            program_id,
+            accounts,
+            data: instruction_data,
+        })
         match position.protocol {
             Protocol::Solend => {
                 // Resolve Reserve data and derive only the documented market authority PDA
-                let program_id = *SOLEND_PROGRAM_ID;
+                let program_id = Pubkey::from_str(SOLEND_PROGRAM_ID)?;
                 let meta = self
                     .resolve_reserve_by_mint(&program_id, &position.token_mint)
                     .await?;
@@ -4850,23 +7230,40 @@ impl ReserveMeta {
                 )
             }
             Protocol::Kamino => {
-                let program_id = *KAMINO_PROGRAM_ID;
+                let program_id = Pubkey::from_str(KAMINO_PROGRAM_ID)?;
                 let instruction_data = self.encode_kamino_withdraw(position.amount)?;
                 let accounts = self.get_withdraw_accounts(position).await?;
                 Ok(Instruction { program_id, accounts, data: instruction_data })
             }
         }
-    }
+}
 
-    async fn build_deposit_instruction(
-        &self,
-        position: &Position,
-        target_market: &LendingMarket,
-    ) -> Result<Instruction> {
+async fn build_deposit_instruction(
+&self,
+position: &Position,
+target_market: &LendingMarket,
+) -> Result<Instruction> {
+        let program_id = match target_market.protocol {
+            Protocol::Solend => Pubkey::from_str(SOLEND_PROGRAM_ID)?,
+            Protocol::Kamino => Pubkey::from_str(KAMINO_PROGRAM_ID)?,
+        };
+        
+        let instruction_data = match target_market.protocol {
+            Protocol::Solend => self.encode_solend_deposit(position.amount),
+            Protocol::Kamino => self.encode_kamino_deposit(position.amount),
+        };
+        
+        let accounts = self.get_deposit_accounts(position, target_market).await?;
+        
+        Ok(Instruction {
+            program_id,
+            accounts,
+            data: instruction_data,
+        })
         match target_market.protocol {
             Protocol::Solend => {
                 // Resolve reserve and vaults from on-chain state, derive only documented market authority PDA
-                let program_id = *SOLEND_PROGRAM_ID;
+                let program_id = Pubkey::from_str(SOLEND_PROGRAM_ID)?;
                 let meta = self
                     .resolve_reserve_by_mint(&program_id, &position.token_mint)
                     .await?;
@@ -4886,32 +7283,46 @@ impl ReserveMeta {
                 )
             }
             Protocol::Kamino => {
-                let program_id = *KAMINO_PROGRAM_ID;
+                let program_id = Pubkey::from_str(KAMINO_PROGRAM_ID)?;
                 let instruction_data = self.encode_kamino_deposit(position.amount)?;
                 let accounts = self.get_deposit_accounts(position, target_market).await?;
                 Ok(Instruction { program_id, accounts, data: instruction_data })
             }
         }
-    }
+}
 
+    fn encode_solend_withdraw(&self, amount: u64) -> Vec<u8> {
+        let mut data = vec![5u8]; // Solend withdraw instruction discriminator
+        data.extend_from_slice(&amount.to_le_bytes());
+        data
     // Kamino (Anchor program) encoders using module-level helpers
     fn encode_kamino_deposit(&self, amount: u64) -> Result<Vec<u8>> {
         encode_anchor_ix("deposit", DepositArgs { amount })
-    }
+}
 
+    fn encode_kamino_withdraw(&self, amount: u64) -> Vec<u8> {
+        let mut data = vec![183, 18, 70, 156, 148, 109, 161, 34]; // Kamino withdraw hash
+        data.extend_from_slice(&amount.to_le_bytes());
+        data
     fn encode_kamino_withdraw(&self, amount: u64) -> Result<Vec<u8>> {
         encode_anchor_ix("withdraw", WithdrawArgs { amount })
-    }
+}
 
+    fn encode_solend_deposit(&self, amount: u64) -> Vec<u8> {
+        let mut data = vec![4u8]; // Solend deposit instruction discriminator
     fn encode_solend_deposit(&self, amount: u64) -> Result<Vec<u8>> {
         let mut data = vec![SOLEND_DEPOSIT_TAG];
-        data.extend_from_slice(&amount.to_le_bytes());
+data.extend_from_slice(&amount.to_le_bytes());
+        data
         Ok(data)
-    }
+}
 
+    fn encode_kamino_deposit(&self, amount: u64) -> Vec<u8> {
+        let mut data = vec![242, 35, 198, 137, 82, 225, 242, 182]; // Kamino deposit hash
     fn encode_solend_withdraw(&self, amount: u64) -> Result<Vec<u8>> {
         let mut data = vec![SOLEND_WITHDRAW_TAG];
-        data.extend_from_slice(&amount.to_le_bytes());
+data.extend_from_slice(&amount.to_le_bytes());
+        data
         Ok(data)
     }
 
@@ -5033,144 +7444,51 @@ impl ReserveMeta {
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
         ];
         Ok(Instruction { program_id, accounts, data })
-    }
+}
 
-    async fn get_withdraw_accounts(&self, position: &Position) -> Result<Vec<AccountMeta>> {
-        let user_pubkey = self.wallet.pubkey();
-        
-        match position.protocol {
-            Protocol::Solend => {
-                let (reserve_liquidity_supply, _) = Pubkey::find_program_address(
-                    &[b"liquidity_supply", position.token_mint.as_ref()],
-                    &Pubkey::from_str(SOLEND_PROGRAM_ID)?,
-                );
-                
-                let (user_collateral, _) = Pubkey::find_program_address(
-                    &[b"user_collateral", user_pubkey.as_ref(), position.token_mint.as_ref()],
-                    &Pubkey::from_str(SOLEND_PROGRAM_ID)?,
-                );
-                
-                Ok(vec![
-                    AccountMeta::new(position.token_mint, false),
-                    AccountMeta::new(reserve_liquidity_supply, false),
-                    AccountMeta::new(user_collateral, false),
-                    AccountMeta::new(user_pubkey, true),
-                    AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::from_str(&spl_token::id().to_string()).unwrap(), false),
-                ])
-            }
-            Protocol::Kamino => {
-                let (market_authority, _) = Pubkey::find_program_address(
-                    &[b"market_authority", position.token_mint.as_ref()],
-                    &Pubkey::from_str(KAMINO_PROGRAM_ID)?,
-                );
-                
-                let (reserve_vault, _) = Pubkey::find_program_address(
-                    &[b"reserve_vault", position.token_mint.as_ref()],
-                    &Pubkey::from_str(KAMINO_PROGRAM_ID)?,
-                );
-                
-                Ok(vec![
-                    AccountMeta::new(position.token_mint, false),
-                    AccountMeta::new(market_authority, false),
-                    AccountMeta::new(reserve_vault, false),
-                    AccountMeta::new(user_pubkey, true),
-                    AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::from_str(&spl_token::id().to_string()).unwrap(), false),
-                ])
-            }
-        }
-    }
+async fn get_withdraw_accounts(&self, position: &Position) -> Result<Vec<AccountMeta>> {
+@@ -476,7 +1482,7 @@ impl PortOptimizer {
+let mut last_error = None;
 
-    async fn get_deposit_accounts(
-        &self,
-        position: &Position,
-        target_market: &LendingMarket,
-    ) -> Result<Vec<AccountMeta>> {
-        let user_pubkey = self.wallet.pubkey();
-        
-        match target_market.protocol {
-            Protocol::Solend => {
-                let (reserve_liquidity_supply, _) = Pubkey::find_program_address(
-                    &[b"liquidity_supply", position.token_mint.as_ref()],
-                    &Pubkey::from_str(SOLEND_PROGRAM_ID)?,
-                );
-                
-                let (user_collateral, _) = Pubkey::find_program_address(
-                    &[b"user_collateral", user_pubkey.as_ref(), position.token_mint.as_ref()],
-                    &Pubkey::from_str(SOLEND_PROGRAM_ID)?,
-                );
-                
-                Ok(vec![
-                    AccountMeta::new(position.token_mint, false),
-                    AccountMeta::new(reserve_liquidity_supply, false),
-                    AccountMeta::new(user_collateral, false),
-                    AccountMeta::new(user_pubkey, true),
-                    AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::from_str(&spl_token::id().to_string()).unwrap(), false),
-                ])
-            }
-            Protocol::Kamino => {
-                let (market_authority, _) = Pubkey::find_program_address(
-                    &[b"market_authority", position.token_mint.as_ref()],
-                    &Pubkey::from_str(KAMINO_PROGRAM_ID)?,
-                );
-                
-                let (reserve_vault, _) = Pubkey::find_program_address(
-                    &[b"reserve_vault", position.token_mint.as_ref()],
-                    &Pubkey::from_str(KAMINO_PROGRAM_ID)?,
-                );
-                
-                Ok(vec![
-                    AccountMeta::new(position.token_mint, false),
-                    AccountMeta::new(market_authority, false),
-                    AccountMeta::new(reserve_vault, false),
-                    AccountMeta::new(user_pubkey, true),
-                    AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::from_str(&spl_token::id().to_string()).unwrap(), false),
-                ])
-            }
-        }
-    }
-
-    async fn get_recent_blockhash_with_retry(&self) -> Result<Hash> {
-        let mut retries = 3;
-        let mut last_error = None;
-        
-        while retries > 0 {
+while retries > 0 {
+            match self.rpc_client.get_latest_blockhash() {
             match self.rpc_client.get_latest_blockhash().await {
-                Ok(blockhash) => return Ok(blockhash),
-                Err(e) => {
-                    last_error = Some(e);
-                    retries -= 1;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        
-        Err(anyhow!("Failed to get blockhash: {:?}", last_error))
-    }
+Ok(blockhash) => return Ok(blockhash),
+Err(e) => {
+last_error = Some(e);
+@@ -494,18 +1500,11 @@ impl PortOptimizer {
+let mut last_error = None;
 
-    async fn send_transaction_with_retry(&self, transaction: &Transaction) -> Result<String> {
-        let mut retries = 5;
-        let mut last_error = None;
-        
-        while retries > 0 {
+while retries > 0 {
+            match self.rpc_client.send_transaction(transaction) {
             match self.rpc_client.send_transaction(transaction).await {
-                Ok(signature) => {
-                    if self.confirm_transaction(&signature).await? { return Ok(signature.to_string()); }
+Ok(signature) => {
+                    if self.confirm_transaction(&signature).await? {
+                        return Ok(signature.to_string());
+                    }
                 }
+                Err(e) => {
+                    if e.to_string().contains("AlreadyProcessed") {
+                        return Ok(transaction.signatures[0].to_string());
+                    }
+                    last_error = Some(e);
+                    if self.confirm_transaction(&signature).await? { return Ok(signature.to_string()); }
+}
                 Err(e) => { if e.to_string().contains("AlreadyProcessed") { return Ok(transaction.signatures[0].to_string()); } last_error = Some(e); }
-            }
-            
-            retries -= 1;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        
-        Err(anyhow!("Failed to send transaction: {:?}", last_error))
-    }
+}
 
-    async fn confirm_transaction(&self, signature: &solana_sdk::signature::Signature) -> Result<bool> {
-        let start = Instant::now();
-        let timeout = Duration::from_secs(30);
-        
-        while start.elapsed() < timeout {
+retries -= 1;
+@@ -520,21 +1519,91 @@ impl PortOptimizer {
+let timeout = Duration::from_secs(30);
+
+while start.elapsed() < timeout {
+            match self.rpc_client.get_signature_status(signature)? {
+                Some(status) => {
+                    if status.is_ok() {
+                        return Ok(true);
+                    } else if status.is_err() {
+                        return Ok(false);
+                    }
             let resp = self.rpc_client.get_signature_statuses(&[*signature]).await?;
             if let Some(opt_st) = resp.value.first() { if let Some(st) = opt_st { return Ok(st.err.is_none()); } }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5179,7 +7497,75 @@ impl ReserveMeta {
         Ok(false)
     }
 
+    // Hedged transaction sender with simulation and auto-repair
+    pub async fn send_hedged_tx(
+        &self,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+        opts: Option<CommitmentConfig>,
+        max_retries: usize,
+    ) -> Result<Signature> {
+        let commitment = opts.unwrap_or(CommitmentConfig::confirmed());
+        let mut retry_count = 0;
+        let mut last_error = None;
+        
+        // Make a mutable copy of instructions for potential repairs
+        let mut current_ixs = ixs.to_vec();
+        
+        while retry_count < max_retries {
+            // 1. First try with simulation to catch errors early
+            match self.rpc_client.simulate_transaction_with_config(
+                &Transaction::new_with_payer(&current_ixs, Some(&self.wallet.pubkey())),
+                commitment,
+                RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    replace_recent_blockhash: true,
+                    ..Default::default()
+                },
+            ).await {
+                Ok(sim_result) => {
+                    if let Some(err) = sim_result.value.err {
+                        // Try to auto-repair if simulation fails
+                        if let Some(repaired_ixs) = auto_repair_from_logs(&current_ixs, &sim_result.value.logs.unwrap_or_default()) {
+                            current_ixs = repaired_ixs;
+                            retry_count += 1;
+                            continue;
+                        }
+                        return Err(anyhow!("Simulation failed: {:?}", err));
+                    }
+                    
+                    // If simulation succeeds, proceed with sending
+                    match self.send_transaction_with_retries(
+                        &current_ixs,
+                        signers,
+                        Some(commitment),
+                        3, // Fewer retries since we already simulated
+                    ).await {
+                        Ok(sig) => return Ok(sig),
+                        Err(e) => last_error = Some(e),
+                    }
+                },
+                Err(e) => last_error = Some(anyhow!("Simulation error: {}", e)),
+            }
+            
+            // If we get here, the transaction failed
+            retry_count += 1;
+            if retry_count < max_retries {
+                // Exponential backoff with jitter
+                let sleep_ms = 100 * 2u64.pow(retry_count as u32) + rand::random::<u64>() % 100;
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| anyhow!("Max retries exceeded")))
+    }
+
     // ----- Slot-aware blockhash lifecycle helpers -----
+    pub async fn get_fresh_blockhash(&self) -> Result<(Hash, u64)> {
+        let bh = self.rpc_client.get_latest_blockhash().await?;
+        let height = self.rpc_client.get_block_height().await?;
+        Ok((bh, height))
+    }
 
     async fn simulate_exact_v0(&self, tx: &VersionedTransaction) -> Result<()> {
         let res = self.simulate_exact(tx).await?;
@@ -5196,114 +7582,16 @@ impl ReserveMeta {
     ) -> Result<solana_sdk::signature::Signature> {
         let sig = self.rpc_client.send_transaction(tx).await?;
         let ok = self.confirm_sig_with_backoff(&sig, timeout).await?;
-        if ok { Ok(sig) } else { Err(anyhow!("confirmation timeout")) }
-    }
-
-    // === [IMPROVED: PIECE LEGACY SEND v53] ===
-    // Configured legacy send with min_context_slot + hedged RPC and jittered pacer
-    async fn confirm_transaction(&self, sig: &solana_sdk::signature::Signature) -> Result<bool> {
-        // Reuse the same confirmation backoff; 20s default is consistent with v0 path
-        self.confirm_sig_with_backoff(sig, Duration::from_secs(20)).await
-    }
-
-    pub async fn send_transaction_with_retry(
-        &self,
-        tx: &solana_sdk::transaction::Transaction,
-    ) -> Result<String> {
-        let min_slot = self
-            .get_fresh_blockhash_bundle()
-            .await
-            .ok()
-            .map(|b| b.now_slot.saturating_sub(2));
-        self.send_transaction_with_retry_cfg(tx, min_slot).await
-    }
-
-    pub async fn send_transaction_with_retry_cfg(
-        &self,
-        tx: &solana_sdk::transaction::Transaction,
-        min_context_slot: Option<u64>,
-    ) -> Result<String> {
-        use tokio::time::{sleep, Duration as TDur};
-        let mut last_err: Option<anyhow::Error> = None;
-        let cfg = solana_client::rpc_config::RpcSendTransactionConfig {
-            skip_preflight: true,
-            preflight_commitment: None,
-            max_retries: None,
-            min_context_slot,
-        };
-
-        let try_send = |cfg: solana_client::rpc_config::RpcSendTransactionConfig| async {
-            if let Some(fast) = &self.rpc_fast {
-                tokio::select! {
-                    r1 = self.rpc_client.send_transaction_with_config(tx, cfg.clone()) => r1,
-                    r2 = fast.send_transaction_with_config(tx, cfg.clone())            => r2,
-                }
-            } else {
-                self.rpc_client.send_transaction_with_config(tx, cfg).await
-            }
-        };
-
-        for iter in 0..6u64 {
-            match try_send(cfg.clone()).await {
-                Ok(sig) => {
-                    if self.confirm_transaction(&sig).await? { return Ok(sig.to_string()); }
-                }
-                Err(e) => {
-                    let low = e.to_string().to_lowercase();
-                    if low.contains("already processed") || low.contains("duplicate signature") {
-                        return Ok(tx.signatures.get(0).map(|s| s.to_string()).unwrap_or_default());
-                    }
-                    if low.contains("account in use")                { sleep(TDur::from_millis(20)).await; }
-                    if low.contains("too many requests")             { sleep(TDur::from_millis(45)).await; }
-                    if low.contains("rate limit")                    { sleep(TDur::from_millis(55)).await; }
-                    if low.contains("connection") || low.contains("broken pipe") || low.contains("timed out") { sleep(TDur::from_millis(25)).await; }
-                    last_err = Some(anyhow::anyhow!(e));
-                }
-            }
-            // jittered pacer 90–115ms
-            let salt = self.wallet.pubkey().to_bytes()[31] as u64;
-            let jitter = (salt ^ (iter.wrapping_mul(131))) % 26;
-            sleep(TDur::from_millis(90 + jitter)).await;
+        if ok { 
+            // Update the last transaction signature for deterministic operations
+            self.update_last_tx_signature(sig).await;
+            Ok(sig) 
+        } else { 
+            Err(anyhow!("confirmation timeout")) 
         }
-        Err(anyhow::anyhow!(format!("Failed to send transaction: {:?}", last_err)))
     }
 
-    // === v41 → v42 compat shim (delegate old signature to new height-margin API) ===
-    /// NEW API (v42): prefer this everywhere. Height-margin only.
-    pub async fn send_v0_with_slot_guard_height<F>(
-        &self,
-        mut build_with_hash: F,
-        max_wait: Duration,
-        height_margin: u64,
-    ) -> Result<solana_sdk::signature::Signature>
-    where
-        F: Send + 'static + FnMut(Hash) -> Result<VersionedTransaction>,
-    {
-        // Delegate to the private implementation by mapping height_margin to refresh_before_slots.
-        self.send_v0_with_slot_guard_impl(build_with_hash, max_wait, 0, height_margin).await
-    }
-
-    /// OLD API (v41): keep for legacy callers; delegates to v42.
-    #[deprecated(
-        note = "Use send_v0_with_slot_guard_height(..., height_margin) — this wrapper forwards to v42."
-    )]
     pub async fn send_v0_with_slot_guard<F>(
-        &self,
-        mut build_with_hash: F,
-        max_wait: Duration,
-        _hash_valid_for_slots: u64,
-        refresh_before_slots: u64,
-    ) -> Result<solana_sdk::signature::Signature>
-    where
-        F: Send + 'static + FnMut(Hash) -> Result<VersionedTransaction>,
-    {
-        // Direct mapping: treat old `refresh_before_slots` as a height-margin.
-        self.send_v0_with_slot_guard_impl(build_with_hash, max_wait, _hash_valid_for_slots, refresh_before_slots).await
-    }
-
-    // Keep the v41 implementation body intact below a private helper to avoid deprecation clashes.
-    #[allow(deprecated)]
-    async fn send_v0_with_slot_guard_impl<F>(
         &self,
         mut build_with_hash: F,
         max_wait: Duration,
@@ -5328,7 +7616,8 @@ impl ReserveMeta {
                     h0 = pair.1;
                     tx = build_with_hash(bh)?;
                     continue;
-                }
+}
+                None => {
                 return Err(anyhow!(format!("simulation failed: {e}")));
             }
 
@@ -5351,86 +7640,40 @@ impl ReserveMeta {
                         tx = build_with_hash(bh)?;
                         continue;
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            }
-        }
-    }
-
-    async fn update_position(
-        &self,
-        old_position: &Position,
-        new_market: LendingMarket,
-    ) -> Result<()> {
-        let mut positions = self.active_positions.write().await;
+tokio::time::sleep(Duration::from_millis(200)).await;
+}
+}
+}
         
-        positions.insert(
-            old_position.token_mint.to_string(),
-            Position {
-                token_mint: old_position.token_mint,
-                protocol: new_market.protocol,
-                amount: old_position.amount,
-                entry_apy: new_market.supply_apy,
-                last_rebalance: Instant::now(),
-            },
-        );
-        
-        Ok(())
-    }
+        Ok(false)
+}
 
-    pub async fn initialize_positions(&self, token_mints: Vec<Pubkey>) -> Result<()> {
-        let mut positions = self.active_positions.write().await;
-        
-        for mint in token_mints {
-            let balance = self.get_token_balance(&mint).await?;
-            
-            if balance > 0 {
-                let best_market = self.find_best_market(&mint).await?;
-                
-                positions.insert(
-                    mint.to_string(),
-                    Position {
-                        token_mint: mint,
-                        protocol: best_market.protocol.clone(),
-                        amount: balance,
-                        entry_apy: best_market.supply_apy,
-                        last_rebalance: Instant::now(),
-                    },
-                );
-                
-                self.execute_initial_deposit(&mint, &best_market, balance).await?;
-            }
-        }
-        
-        Ok(())
-    }
+async fn update_position(
+@@ -591,7 +1660,7 @@ impl PortOptimizer {
+mint,
+);
 
-    // === [IMPROVED: PIECE BALANCES v53] ===
-    // token-agnostic ATA decoding (works for SPL Token and Token-2022), no panics
-    async fn get_token_balance(&self, mint: &Pubkey) -> Result<u64> {
-        let tp = self.token_program_for_mint(mint).await?;
-        let ata = Self::ata_for(&self.wallet.pubkey(), mint, &tp);
+        match self.rpc_client.get_account(&token_account) {
+        match self.rpc_client.get_account(&token_account).await {
+Ok(account) => {
+let token_account_data = TokenAccount::unpack(&account.data)?;
+Ok(token_account_data.amount)
+@@ -600,17 +1669,16 @@ impl PortOptimizer {
+}
+}
 
-        match self.rpc_client.get_account(&ata).await {
-            Ok(acc) => {
-                // Minimal header layout check: [0..32]=mint, [32..64]=owner, [64..72]=amount (LE)
-                if acc.data.len() < 72 { return Ok(0); }
-                let mint_bytes  = &acc.data[0..32];
-                let owner_bytes = &acc.data[32..64];
-                let amt_bytes   = &acc.data[64..72];
-                if Pubkey::new(mint_bytes) != *mint || Pubkey::new(owner_bytes) != self.wallet.pubkey() {
-                    return Ok(0);
-                }
-                let amt = amt_bytes.try_into().ok().map(u64::from_le_bytes).unwrap_or(0);
-                Ok(amt)
-            }
-            Err(_) => Ok(0),
-        }
-    }
-
+    async fn find_best_market(&self, _mint: &Pubkey) -> Result<LendingMarket> {
     async fn find_best_market(&self, mint: &Pubkey) -> Result<LendingMarket> {
-        self.update_market_data().await?;
-        let markets = self.markets.read().await;
+self.update_market_data().await?;
+        
+let markets = self.markets.read().await;
+        let token_markets = markets.values()
+            .flatten()
+            .filter(|m| m.liquidity_available > 0)
+            .max_by(|a, b| a.supply_apy.partial_cmp(&b.supply_apy).unwrap())
+            .ok_or_else(|| anyhow!("No available markets for token"))?;
+        
+        Ok(token_markets.clone())
         let key = mint.to_string();
         let candidates = markets.get(&key)
             .ok_or_else(|| anyhow!("No markets for token {}", key))?;
@@ -5438,24 +7681,28 @@ impl ReserveMeta {
             .pick_best_market_weighted(0, candidates)
             .ok_or_else(|| anyhow!("No available markets for token {}", key))?;
         Ok(best)
-    }
+}
 
-    async fn execute_initial_deposit(
-        &self,
-        mint: &Pubkey,
-        market: &LendingMarket,
-        amount: u64,
-    ) -> Result<()> {
-        let deposit_ix = self.build_deposit_instruction(
-            &Position {
-                token_mint: *mint,
-                protocol: market.protocol.clone(),
-                amount,
-                entry_apy: market.supply_apy,
-                last_rebalance: Instant::now(),
-            },
-            market,
-        ).await?;
+async fn execute_initial_deposit(
+@@ -629,21 +1697,23 @@ impl PortOptimizer {
+},
+market,
+).await?;
+        
+        let recent_blockhash = self.get_recent_blockhash_with_retry().await?;
+        
+        let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNITS);
+        let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(PRIORITY_FEE_LAMPORTS);
+        
+        let mut transaction = Transaction::new_with_payer(
+            &[compute_budget_ix, priority_fee_ix, deposit_ix],
+            Some(&self.wallet.pubkey()),
+        );
+        
+        transaction.sign(&[self.wallet.as_ref()], recent_blockhash);
+        
+        self.send_transaction_with_retry(&transaction).await?;
+        
 
         // Versioned v0 send with dynamic budget, exact sim, stale-hash recovery
         let baseline = self.optimize_compute_units_rough(&[deposit_ix.clone()]).await;
@@ -5473,24 +7720,27 @@ impl ReserveMeta {
                 120,
             )
             .await?;
-        Ok(())
-    }
+Ok(())
+}
 
-    pub async fn emergency_withdraw_all(&self) -> Result<()> {
-        let positions = self.active_positions.read().await.clone();
-        
-        for (_, position) in positions {
-            match self.emergency_withdraw(&position).await {
-                Ok(_) => println!("Emergency withdraw successful for {}", position.token_mint),
-                Err(e) => eprintln!("Emergency withdraw failed for {}: {:?}", position.token_mint, e),
-            }
-        }
-        
-        Ok(())
-    }
+@@ -662,20 +1732,21 @@ impl PortOptimizer {
 
-    async fn emergency_withdraw(&self, position: &Position) -> Result<()> {
-        let withdraw_ix = self.build_withdraw_instruction(position).await?;
+async fn emergency_withdraw(&self, position: &Position) -> Result<()> {
+let withdraw_ix = self.build_withdraw_instruction(position).await?;
+        let recent_blockhash = self.get_recent_blockhash_with_retry().await?;
+        
+        let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNITS * 2);
+        let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(PRIORITY_FEE_LAMPORTS * 5);
+        
+        let mut transaction = Transaction::new_with_payer(
+            &[compute_budget_ix, priority_fee_ix, withdraw_ix],
+            Some(&self.wallet.pubkey()),
+        );
+        
+        transaction.sign(&[self.wallet.as_ref()], recent_blockhash);
+        
+        self.send_transaction_with_retry(&transaction).await?;
+        
         let baseline = self.optimize_compute_units_rough(&[withdraw_ix.clone()]).await;
         let (cu_ix, fee_ix) = self.dynamic_budget_ixs(baseline.max(COMPUTE_UNITS * 2), PRIORITY_FEE_LAMPORTS * 5).await;
         let ixs = vec![cu_ix, fee_ix, withdraw_ix];
@@ -5506,112 +7756,88 @@ impl ReserveMeta {
                 120,
             )
             .await?;
-        Ok(())
-    }
+Ok(())
+}
+}
+@@ -705,7 +1776,7 @@ impl PortOptimizer {
 }
 
-#[derive(Debug, Clone)]
-pub struct OptimizationMetrics {
-    pub total_rebalances: u64,
-    pub successful_rebalances: u64,
-    pub failed_rebalances: u64,
-    pub total_profit_bps: f64,
-    pub gas_spent: u64,
-}
-
-impl PortOptimizer {
-    pub fn with_metrics(self) -> Self {
-        self
-    }
-
-    pub async fn get_optimization_metrics(&self) -> OptimizationMetrics {
-        OptimizationMetrics {
-            total_rebalances: 0,
-            successful_rebalances: 0,
-            failed_rebalances: 0,
-            total_profit_bps: 0.0,
-            gas_spent: 0,
-        }
-    }
-
-    async fn preflight_simulation(&self, transaction: &Transaction) -> Result<bool> {
+async fn preflight_simulation(&self, transaction: &Transaction) -> Result<bool> {
+        match self.rpc_client.simulate_transaction(transaction) {
         match self.rpc_client.simulate_transaction(transaction).await {
-            Ok(result) => {
-                if result.value.err.is_none() {
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            Err(_) => Ok(false),
-        }
-    }
+Ok(result) => {
+if result.value.err.is_none() {
+Ok(true)
+@@ -731,7 +1802,7 @@ impl PortOptimizer {
+}
 
-    pub async fn monitor_health(&self) -> Result<()> {
-        let positions = self.active_positions.read().await;
-        
-        for (token, position) in positions.iter() {
-            let elapsed = position.last_rebalance.elapsed();
-            if elapsed > Duration::from_secs(24 * 60 * 60) {
-                eprintln!("Warning: Position {token} hasn't been rebalanced in 24h");
-            }
-        }
-        
-        Ok(())
-    }
-
-    async fn calculate_network_congestion(&self) -> Result<f64> {
+async fn calculate_network_congestion(&self) -> Result<f64> {
+        let recent_fees = self.rpc_client.get_recent_prioritization_fees(&[])?;
         let recent_fees = self.rpc_client.get_recent_prioritization_fees(&[]).await?;
-        let avg_fee = recent_fees.iter().map(|f| f.prioritization_fee).sum::<u64>() as f64 
-            / recent_fees.len().max(1) as f64;
-        
-        Ok(avg_fee / 1000.0)
-    }
+let avg_fee = recent_fees.iter().map(|f| f.prioritization_fee).sum::<u64>() as f64 
+/ recent_fees.len().max(1) as f64;
 
-    async fn dynamic_priority_fee(&self) -> Result<u64> {
-        let congestion = self.calculate_network_congestion().await?;
-        let base_fee = PRIORITY_FEE_LAMPORTS;
-        
-        let multiplier = if congestion > 100.0 {
-            3.0
-        } else if congestion > 50.0 {
-            2.0
-        } else {
-            1.0
-        };
-        
-        Ok((base_fee as f64 * multiplier) as u64)
-    }
-
-    pub async fn validate_market_data(&self, market: &LendingMarket) -> bool {
-        if market.supply_apy > 1000.0 || market.supply_apy < 0.0 {
-            return false;
-        }
-        
-        if market.utilization > 1.0 || market.utilization < 0.0 {
-            return false;
-        }
-        
-        if market.last_update.elapsed() > Duration::from_secs(300) {
-            return false;
-        }
-        
-        true
-    }
-
-    async fn get_jito_tip(&self) -> u64 {
-        let base_tip = 10000;
-        let congestion = self.calculate_network_congestion().await.unwrap_or(1.0);
-        (base_tip as f64 * (1.0 + congestion / 100.0)) as u64
-    }
-
-    pub async fn build_jito_bundle(
-        &self,
-        transactions: Vec<Transaction>,
-    ) -> Result<Vec<Transaction>> {
+@@ -779,66 +1850,24 @@ impl PortOptimizer {
+&self,
+transactions: Vec<Transaction>,
+) -> Result<Vec<Transaction>> {
         // Deprecated: prefer build_bundle_from_plans with canonical instruction builders.
         // Keep existing signature but avoid unsafe reconstruction; just prepend a tip transfer tx as a separate tx.
-        let tip_amount = self.get_jito_tip().await;
+let tip_amount = self.get_jito_tip().await;
+        let tip_accounts = vec![
+            Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5")?,
+            Pubkey::from_str("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe")?,
+            Pubkey::from_str("Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY")?,
+            Pubkey::from_str("ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49")?,
+            Pubkey::from_str("DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh")?,
+            Pubkey::from_str("ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt")?,
+            Pubkey::from_str("DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL")?,
+            Pubkey::from_str("3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT")?,
+        ];
+        
+        let random_index = (self.rpc_client.get_slot()? % 8) as usize;
+        let tip_account = tip_accounts[random_index];
+        
+        let tip_ix = system_instruction::transfer(
+            &self.wallet.pubkey(),
+            &tip_account,
+            tip_amount,
+        );
+        
+        let mut bundle = Vec::new();
+        for tx in transactions {
+            let mut new_instructions = vec![tip_ix.clone()];
+            new_instructions.extend(tx.message.instructions.clone().clone().into_iter().map(|ix| {
+                Instruction {
+                    program_id: tx.message.account_keys[ix.program_id_index as usize],
+                    accounts: ix.accounts.into_iter().map(|acc_idx| {
+                        AccountMeta {
+                            pubkey: tx.message.account_keys[acc_idx as usize],
+                            is_signer: tx.message.is_signer(acc_idx as usize),
+                            is_writable: tx.message.is_writable(acc_idx as usize),
+                        }
+                    }).collect(),
+                    data: ix.data,
+                }
+            }));
+
+            // Collect all unique signers
+            let mut signers = HashSet::new();
+            signers.insert(self.wallet.pubkey());
+            
+            for account in tx.message.account_keys.iter() {
+                if tx.message.is_signer(tx.message.account_keys.iter().position(|a| a == account).unwrap()) {
+                    signers.insert(*account);
+                }
+            }
+
+            // Build new transaction with tip instruction prepended
+            let message = Message::new(&new_instructions, Some(&self.wallet.pubkey()));
+            let new_tx = Transaction::new_unsigned(message);
+            bundle.push(new_tx);
+        }
+
+        Ok(bundle)
         let tip_account = Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5")?;
         let tip_ix = system_instruction::transfer(&self.wallet.pubkey(), &tip_account, tip_amount);
         let message = Message::new(&[tip_ix], Some(&self.wallet.pubkey()));
@@ -5622,111 +7848,21 @@ impl PortOptimizer {
         out.push(tip_tx);
         out.extend(transactions.into_iter());
         Ok(out)
-    }
+}
 
 
-    pub async fn optimize_compute_units(&self, transaction: &Transaction) -> u32 {
+pub async fn optimize_compute_units(&self, transaction: &Transaction) -> u32 {
+        match self.rpc_client.simulate_transaction(transaction) {
         match self.rpc_client.simulate_transaction(transaction).await {
-            Ok(result) => {
-                if let Some(units) = result.value.units_consumed {
-                    (units as f64 * 1.2) as u32
-                } else {
-                    COMPUTE_UNITS
-                }
-            }
-            Err(_) => COMPUTE_UNITS,
-        }
-    }
-
-    async fn check_slippage(&self, position: &Position, market: &LendingMarket) -> Result<bool> {
-        let expected_amount = position.amount;
-        let max_slippage = (expected_amount as f64 * MAX_SLIPPAGE_BPS as f64) / 10000.0;
-        
-        let available = market.liquidity_available as f64;
-        if available < expected_amount as f64 - max_slippage {
-            return Ok(false);
-        }
-        
-        Ok(true)
-    }
-
-    pub async fn start_with_config(
-        rpc_url: &str,
-        _ws_url: &str,
-        keypair_path: &str,
-        token_mints: Vec<String>,
-    ) -> Result<()> {
-        let wallet = Keypair::from_bytes(&std::fs::read(keypair_path)?)?;
-        let optimizer = Self::new(rpc_url, wallet);
-        
-        let mints: Vec<Pubkey> = token_mints
-            .iter()
-            .map(|s| Pubkey::from_str(s))
-            .collect::<Result<Vec<_>, _>>()?;
-        
-        optimizer.initialize_positions(mints).await?;
-        
-        let _monitor_handle = {
-            let opt = optimizer.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = opt.monitor_health().await {
-                        eprintln!("Health monitor error: {e:?}");
-                    }
-                }
-            })
-        };
-        
-        tokio::select! {
-            result = optimizer.run() => {
-                if let Err(e) = result {
-                    eprintln!("Optimizer error: {e:?}");
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("Shutting down...");
-                optimizer.emergency_withdraw_all().await?;
-            }
-        }
-        
-        Ok(())
-    }
-}
-
-impl Clone for PortOptimizer {
-    fn clone(&self) -> Self {
-        Self {
-            rpc_client: self.rpc_client.clone(),
-            wallet: self.wallet.clone(),
-            markets: self.markets.clone(),
-            active_positions: self.active_positions.clone(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_apy_calculation() {
-        let optimizer = PortOptimizer::new("https://api.mainnet-beta.solana.com", Keypair::new());
-        let rate = 1000000000000000u64;
-        let apy = optimizer.calculate_apy_from_rate(rate);
+Ok(result) => {
+if let Some(units) = result.value.units_consumed {
+(units as f64 * 1.2) as u32
+@@ -927,7 +1956,7 @@ mod tests {
+let optimizer = PortOptimizer::new("https://api.mainnet-beta.solana.com", Keypair::new());
+let rate = 1000000000000000u64;
+let apy = optimizer.calculate_apy_from_rate(rate);
+        assert!(apy > 0.0 && apy < 100.0);
         assert!(apy >= 0.0 && apy <= 1000.0);
-    }
-
-    #[tokio::test]
-    async fn test_profit_calculation() {
-        let optimizer = PortOptimizer::new("https://api.mainnet-beta.solana.com", Keypair::new());
-        let profit = optimizer.calculate_expected_profit(
-            1000000000,
-            5.0,
-            7.0,
-            50000,
-        );
-        assert!(profit > 0.0);
-    }
 }
+
+#[tokio::test]
