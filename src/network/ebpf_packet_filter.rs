@@ -1,7 +1,287 @@
-// ===== Verifier-friendly bounded readers =====
+// ===== Flash prefix classifier map (2-byte key) =====
+#[map]
+static FLASH_PREFIXES: HashMap<[u8; 2], u8> = HashMap::with_max_entries(64, 0); // userland-controlled
+
+// ===== Verifier-friendly bounded readers (upgraded) =====
 #[inline(always)]
 fn load_bytes<'a>(payload: &'a [u8], off: usize, n: usize) -> Result<&'a [u8], ()> {
-    if off.checked_add(n).ok_or(())? > payload.len() { return Err(()); }
+    // Fast fail on overflow and length
+    let end = off.checked_add(n).ok_or(())?;
+    if end > payload.len() { return Err(()); }
+    // Safety: slice bounds checked above; no unaligned loads performed here
+    Ok(&payload[off..end])
+}
+
+#[inline(always)]
+fn load_u16_le(payload: &[u8], off: usize) -> Result<u16, ()> {
+    let b = load_bytes(payload, off, 2)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
+}
+
+#[inline(always)]
+fn load_u32_le(payload: &[u8], off: usize) -> Result<u32, ()> {
+    let b = load_bytes(payload, off, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[inline(always)]
+fn load_u32_be(payload: &[u8], off: usize) -> Result<u32, ()> {
+    let b = load_bytes(payload, off, 4)?;
+    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[inline(always)]
+fn copy_32(payload: &[u8], off: usize, dst: &mut [u8; 32]) -> Result<(), ()> {
+    let s = load_bytes(payload, off, 32)?;
+    // Safety: bounds verified; memcpy is verifier-friendly
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), dst.as_mut_ptr(), 32) };
+    Ok(())
+}
+
+#[inline(always)]
+fn parse_compact_u16_bounded(payload: &[u8], off: &mut usize) -> Result<u16, ()> {
+    let b0 = *load_bytes(payload, *off, 1)?.get(0).ok_or(())?;
+    if b0 < 0x80 {
+        *off += 1;
+        Ok(b0 as u16)
+    } else if b0 < 0xFE {
+        let b1 = *load_bytes(payload, *off + 1, 1)?.get(0).ok_or(())?;
+        let v = ((b0 & 0x7F) as u16) | ((b1 as u16) << 7);
+        *off += 2;
+        Ok(v)
+    } else {
+        let v = load_u16_le(payload, *off + 1)?;
+        *off += 3;
+        Ok(v)
+    }
+}
+
+#[inline(always)]
+fn calculate_transaction_hash(signature: &[u8; 64]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let p: u64 = 0x100000001b3;
+    // Unrolled to keep verifier happy & fast in BPF
+    let mut i = 0;
+    while i < 64 {
+        // load 8 bytes safely
+        let chunk = u64::from_le_bytes([
+            signature[i], signature[i+1], signature[i+2], signature[i+3],
+            signature[i+4], signature[i+5], signature[i+6], signature[i+7],
+        ]);
+        // fold 8 bytes into h (FNV-1a per byte without loop; XOR+mul on 8 bytes)
+        h ^= (chunk        & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>8)   & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>16)  & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>24)  & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>32)  & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>40)  & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>48)  & 0xFF) as u64; h = h.wrapping_mul(p);
+        h ^= ((chunk>>56)  & 0xFF) as u64; h = h.wrapping_mul(p);
+        i += 8;
+    }
+    // SplitMix64 post-mix to decorrelate near-collisions
+    let mut z = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+// ===== Per-slot congestion stats (per-CPU) =====
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SlotStats { epoch_ns: u64, pkts: u32 }
+
+#[map]
+static SLOT_STATS_PCPU: PerCpuArray<SlotStats> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn slot_congestion(now: u64) -> u32 {
+    unsafe {
+        if let Some(s) = SLOT_STATS_PCPU.get_ptr_mut(0) {
+            let rollover = now.wrapping_sub((*s).epoch_ns) > SLOT_NS;
+            if rollover { (*s).epoch_ns = now; (*s).pkts = 0; }
+            (*s).pkts = (*s).pkts.wrapping_add(1);
+            (*s).pkts
+        } else { 0 }
+    }
+}
+
+#[inline(always)]
+fn dynamic_thresholds(pkts: u32) -> (u64, u32) {
+    if pkts > 50_000 { (300_000_000u64, 300_000u32) }
+    else if pkts > 20_000 { (150_000_000u64, 250_000u32) }
+    else { (100_000_000u64, 200_000u32) }
+}
+
+#[inline(always)]
+fn classify_mev_type_v2(event: &PacketEvent, corr_flags: u8, is_bundle_flow: bool) -> u8 {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let pkts = slot_congestion(now);
+    let (lam_min, cu_min) = dynamic_thresholds(pkts);
+    // Liquidation signature
+    if (event.compute_units as u32) > cu_min + 100_000 && event.accounts_count > 8 && event.lamports > lam_min + 50_000_000 { return 4; }
+    // Arbitrage
+    if is_dex_program(&event.program_id) && event.instructions_count >= 2 && (event.compute_units as u32) > cu_min && event.lamports > lam_min { return 2; }
+    // Sandwich with bundle flow
+    if is_dex_program(&event.program_id) && is_bundle_flow && (event.compute_units as u32) > cu_min && event.lamports > lam_min / 2 { return 3; }
+    // DEX trade
+    if is_dex_program(&event.program_id) && event.lamports > lam_min / 4 { return 1; }
+    // Flash loan correlated pattern overrides
+    if detect_flash_loan_correlated(event, corr_flags) { return 2; }
+    0
+}
+
+// Priority-aware AF_XDP redirect wrapper
+#[inline(always)]
+fn redirect_priority(ctx: &XdpContext, event: &PacketEvent) -> u32 {
+    let qid: u32 = (event.hash as u32) & 0x3F;
+    unsafe { XSK_SOCKS.redirect(ctx, qid) }
+}
+
+// ===== Hot/Cold cache: per-CPU ring + shared LRU keyed by (sig_hash ^ slot_bucket) =====
+const HOT_RING: usize = 128; // power of two
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HotRing { slots: [u64; HOT_RING], head: u32, epoch_ns: u64 }
+
+#[map]
+static HOT_PCPU: PerCpuArray<HotRing> = PerCpuArray::with_max_entries(1, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ColdVal { ts: u64 }
+
+#[map]
+static COLD_LRU: LruHashMap<u64, ColdVal> = LruHashMap::with_max_entries(16384, 0);
+
+#[inline(always)]
+fn slot_bucket_ns(now: u64) -> u64 { now / SLOT_NS }
+
+#[inline(always)]
+fn composite_tx_key(sig_hash: u64, now: u64) -> u64 { sig_hash ^ slot_bucket_ns(now).rotate_left(13) }
+
+#[inline(always)]
+fn cache_ttl_ns(event: &PacketEvent) -> u64 {
+    let base = match event.mev_type { 3 => 5_000_000_000, 2 => 3_000_000_000, 4 => 10_000_000_000, 1 => 2_000_000_000, _ => 1_000_000_000 };
+    if event.priority < 5 { base / 2 } else { base }
+}
+
+#[inline(always)]
+fn hot_cold_cache_check(now: u64, key: u64, ttl: u64) -> bool {
+    let mut hit = false;
+    unsafe {
+        if let Some(h) = HOT_PCPU.get_ptr_mut(0) {
+            // probe last 16 entries
+            let mut i = 0usize;
+            while i < 16 { let idx = ((*h).head as usize).wrapping_sub(i) & (HOT_RING - 1); if (*h).slots[idx] == key { hit = true; break; } i += 1; }
+            let idx = ((*h).head as usize) & (HOT_RING - 1); (*h).slots[idx] = key; (*h).head = (*h).head.wrapping_add(1);
+        }
+    }
+    if hit { return true; }
+    unsafe {
+        if let Some(v) = COLD_LRU.get(&key) { if now.wrapping_sub((*v).ts) < ttl { return true; } }
+        let val = ColdVal { ts: now }; let _ = COLD_LRU.insert(&key, &val, 0);
+    }
+    false
+}
+
+// ===== Oracle whitelist v2 (exact match + pattern) =====
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OracleTag { _rsvd: u8 }
+
+#[map]
+static ORACLE_WHITELIST: HashMap<[u8; 32], OracleTag> = HashMap::with_max_entries(64, 0);
+
+#[inline(always)]
+fn is_oracle_exact(program_id: &[u8; 32]) -> bool { unsafe { ORACLE_WHITELIST.get(program_id).is_some() } }
+
+#[inline(always)]
+fn oracle_update_pattern(event: &PacketEvent) -> bool { event.lamports == 0 && event.accounts_count <= 6 && event.compute_units >= 150_000 }
+
+#[inline(always)]
+fn detect_oracle_update_v2(event: &PacketEvent) -> bool { is_oracle_exact(&event.program_id) && oracle_update_pattern(event) }
+
+// ===== Per-CPU score histogram for adaptive routing =====
+const HIST_BUCKETS: usize = 32; // 0..31
+const HIST_WINDOW_NS: u64 = 1_000_000_000; // ~1s
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScoreHist { counts: [u32; HIST_BUCKETS], total: u32, epoch_ns: u64 }
+
+#[map]
+static SCORE_HIST_PCPU: PerCpuArray<ScoreHist> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn score_to_bucket(score: u32) -> usize {
+    let s = if score > 100_000 { 100_000 } else { score } as u64;
+    ((s * ((HIST_BUCKETS as u64) - 1)) / 100_000u64) as usize
+}
+
+#[inline(always)]
+fn hist_add(now: u64, score: u32) {
+    unsafe {
+        if let Some(h) = SCORE_HIST_PCPU.get_ptr_mut(0) {
+            if now.wrapping_sub((*h).epoch_ns) > HIST_WINDOW_NS { (*h).counts = [0u32; HIST_BUCKETS]; (*h).total = 0; (*h).epoch_ns = now; }
+            let b = score_to_bucket(score);
+            (*h).counts[b] = (*h).counts[b].wrapping_add(1);
+            (*h).total = (*h).total.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(always)]
+fn hist_percentile(pct: u32) -> usize {
+    unsafe {
+        if let Some(h) = SCORE_HIST_PCPU.get_ptr(0) {
+            let total = (*h).total; if total == 0 { return HIST_BUCKETS - 1; }
+            let target = ((total as u64) * (pct as u64)).saturating_div(100) as u32;
+            let mut accum = 0u32; let mut i = 0usize;
+            while i < HIST_BUCKETS { accum = accum.wrapping_add((*h).counts[i]); if accum >= target { return i; } i += 1; }
+            return HIST_BUCKETS - 1;
+        }
+        HIST_BUCKETS - 1
+    }
+}
+
+#[inline(always)]
+fn adaptive_routing(score: u32, est_latency_ns: u64) -> u8 {
+    let p95_bucket = hist_percentile(95);
+    let cur_bucket = score_to_bucket(score);
+    let hi = cur_bucket >= p95_bucket;
+    let latency_bump = est_latency_ns < 1_000; // < 1us
+    let mut tier = 0u8; // 0 normal, 1 priority, 2 ultra, 3 dedicated
+    if hi { tier = 3; } else if cur_bucket + 2 >= p95_bucket { tier = 2; } else if cur_bucket + 5 >= p95_bucket { tier = 1; }
+    if latency_bump && tier < 3 { tier += 1; }
+    tier
+}
+
+// ===== Hardened scoring without FP and spoofing =====
+#[map]
+static PROGRAM_PREFIX_HITS: LruHashMap<u64, u32> = LruHashMap::with_max_entries(2048, 0);
+
+#[inline(always)]
+fn ilog2_u64(mut v: u64) -> u32 { let mut r = 0u32; while v >= 2 { v >>= 1; r += 1; } r }
+
+#[inline(always)]
+fn ilog10_scaled(x: u64) -> u32 { if x <= 1 { return 0; } let l2 = ilog2_u64(x); (l2 as u32).saturating_mul(1233) >> 12 }
+
+#[inline(always)]
+fn rarity_penalty(program_hits: u32) -> u16 { if program_hits > 1000 { 200 } else if program_hits > 200 { 100 } else { 0 } }
+
+#[inline(always)]
+fn calculate_transaction_score_hardened(event: &PacketEvent, program_hits: u32) -> u32 {
+    let mev = calculate_mev_score(event) as u32;
+    let profit_clamped = if event.expected_profit > 100_000_000_000 { 100_000_000_000 } else { event.expected_profit };
+    let profit_log = ilog10_scaled(profit_clamped.saturating_add(1)) * 1000; // scaled
+    let prio = (event.priority as u32).saturating_mul(800);
+    let latency = { let adv = estimate_latency_advantage(event); let cap = if adv > 5000 { 0 } else { 5000 - adv as u32 }; cap };
+    let base = mev.saturating_add(profit_log.min(10_000)).saturating_add(prio).saturating_add(latency);
+    let penalty = rarity_penalty(program_hits) as u32;
+    base.saturating_sub(penalty).min(100_000)
+}
 
 // ===== Flash loan correlation flags and helpers =====
 const FL_BORROW: u8 = 0x01;
@@ -112,13 +392,14 @@ fn signature_stage(_ctx: &XdpContext) -> Result<(), ()> {
 fn hot_path_decision(ctx: &XdpContext, payload: &[u8], event: &mut PacketEvent) -> u32 {
     let now = unsafe { bpf_ktime_get_ns() };
     if mark_bundle_flow(now, payload) { event.flags |= 0x01; }
-    classify_mev_type(event);
-    event.priority = mev_priority_sigmoid(event);
     let ttl = get_cache_duration(event);
     if bloom_check_set(now, ttl, event.hash) {
         // Keep policy simple: drop at XDP for duplicates
         return xdp_action::XDP_DROP;
     }
+    // Hot/cold cache keyed by slot bucket to avoid cross-slot collisions
+    let key = composite_tx_key(event.hash, now);
+    if hot_cold_cache_check(now, key, cache_ttl_ns(event)) { return xdp_action::XDP_DROP; }
     // Flash-loan correlation using bounded proxies
     let mut corr: u8 = 0;
     correlate_flash_bits(&event.program_id, event.data_len, event.accounts_count, &mut corr);
@@ -131,6 +412,18 @@ fn hot_path_decision(ctx: &XdpContext, payload: &[u8], event: &mut PacketEvent) 
         event.mev_type = 4; // Liquidation/flash bucket re-used for signal
         event.priority = event.priority.saturating_add(2).min(15);
     }
+    // v2 classification with dynamic thresholds
+    let is_bundle = (event.flags & 0x01) != 0;
+    event.mev_type = classify_mev_type_v2(event, corr, is_bundle);
+    event.priority = mev_priority_sigmoid(event);
+    // Oracle updates v2: flag and slight deprioritization avoidance by keeping routing tier
+    if detect_oracle_update_v2(event) { event.flags |= 0x20; event.priority = event.priority.saturating_add(1).min(15); }
+    // Hardened score + histogram + adaptive routing tier
+    let mut hits = 0u32;
+    unsafe { if let Some(h) = PROGRAM_PREFIX_HITS.get(&borrower_prefix8) { hits = *h; } let new_hits = hits.saturating_add(1); let _ = PROGRAM_PREFIX_HITS.insert(&borrower_prefix8, &new_hits, 0); }
+    let score = calculate_transaction_score_hardened(event, hits);
+    hist_add(now, score);
+    let tier = adaptive_routing(score, estimate_latency_advantage(event));
     // Emit lite event
     let lite = PacketEventLite { ts: event.timestamp, src_ip: event.src_ip, dst_ip: event.dst_ip,
         src_port: event.src_port, dst_port: event.dst_port, lamports: event.lamports,
@@ -139,9 +432,8 @@ fn hot_path_decision(ctx: &XdpContext, payload: &[u8], event: &mut PacketEvent) 
         program_id_prefix: [event.program_id[0],event.program_id[1],event.program_id[2],event.program_id[3]] };
     unsafe { HOT_HEADERS.output(ctx, &lite, 0); }
     // AF_XDP redirect for ultra-priority
-    if event.priority >= 13 || optimize_packet_routing(event) >= 2 {
-        let qid: u32 = (event.hash as u32) & 0x3F;
-        let act = unsafe { XSK_SOCKS.redirect(ctx, qid) };
+    if tier >= 2 || event.priority >= 13 || optimize_packet_routing(event) >= 2 {
+        let act = redirect_priority(ctx, event);
         if act != 0 { return act; }
     }
     xdp_action::XDP_PASS
@@ -249,23 +541,104 @@ fn parse_compact_u16_bounded(payload: &[u8], off: &mut usize) -> Result<u16, ()>
     }
 }
 
-#![no_std]
 #![no_main]
 
 use aya_bpf::{
     bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
-    helpers::{bpf_ktime_get_ns, bpf_get_prandom_u32},
+    helpers::{bpf_ktime_get_ns, bpf_get_prandom_u32, bpf_get_smp_processor_id},
     macros::{classifier, map, xdp},
-    maps::{HashMap, PerfEventArray, Queue, LruHashMap, PerCpuArray, XskMap, ProgramArray},
+    maps::{HashMap, PerfEventArray, Queue, LruHashMap, PerCpuArray, XskMap, ProgramArray, Array},
     programs::{TcContext, XdpContext, ProbeContext},
     BpfContext,
 };
+
+// ===== AF_XDP queue selection config =====
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XskCfg { 
+    qmask: u32,  // Queue mask (e.g., 0x3F for 64 queues)
+    strategy: u32 // bit0=CPU, bit1=HASH, bit2=HYBRID 
+}
+
+// Single-element array for config (userland sets qmask=stride_mask like 0x3F for 64 queues)
+#[map]
+static XSK_CFG: Array<XskCfg> = Array::with_max_entries(1, 0);
+
+// ===== Per-CPU emission budget =====
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EmitBudget { 
+    last_refill: u64, 
+    refill_ns: u64, 
+    tokens: u32, 
+    burst: u32 
+}
+
+#[map]
+static EMIT_BUDGET: PerCpuArray<EmitBudget> = PerCpuArray::with_max_entries(1, 0);
+
+// ===== Early drop configuration =====
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DropCfg { 
+    min_lamports: u64, 
+    min_cu: u32, 
+    max_accs: u8, 
+    enable: u8 
+}
+
+#[map]
+static DROP_CFG: Array<DropCfg> = Array::with_max_entries(1, 0);
+
+// ===== Program tagging =====
+const TAG_DEX:    u8 = 0x01;
+const TAG_LEND:   u8 = 0x02;
+const TAG_TOKEN:  u8 = 0x04;
+const TAG_ORACLE: u8 = 0x08;
+const TAG_NFT:    u8 = 0x10;
+
+#[map]
+static PROGRAM_TAGS: HashMap<[u8; 32], u8> = HashMap::with_max_entries(512, 0);
+
 use aya_log_ebpf::info;
 use core::{mem, mem::size_of};
 use memoffset::offset_of;
 
 mod bindings {
     pub use aya_bpf::bindings::*;
+}
+
+#[inline(always)]
+#[inline(always)]
+fn flow_prehash(event: &PacketEvent) -> u32 {
+    // Tiny Jenkins-like mixer on 4-tuple for stable distribution
+    let mut a = event.src_ip ^ ((event.dst_ip.rotate_left(13)) as u32);
+    a = a.wrapping_add(((event.src_port as u32) << 16) ^ (event.dst_port as u32));
+    a ^= a.rotate_left(15).wrapping_add(0x9e3779b9);
+    a ^= (a >> 16);
+    a = a.wrapping_mul(0x7feb352d);
+    a ^= (a >> 15);
+    a = a.wrapping_mul(0x846ca68b);
+    a ^ (a >> 16)
+}
+
+#[inline(always)]
+fn select_xsk_qid(event: &PacketEvent) -> u32 {
+    let cpu = unsafe { bpf_get_smp_processor_id() } as u32;
+    let cfg = unsafe { XSK_CFG.get(0) };
+    let (qmask, strat) = if let Some(c) = cfg {
+        (unsafe{(*c)}.qmask, unsafe{(*c)}.strategy)
+    } else { (0x3F, 0x04) }; // default: 64 queues & HYBRID
+
+    let hash_q = (flow_prehash(event) ^ (event.hash as u32)) & qmask;
+    if (strat & 0x01) != 0 && (strat & 0x02) == 0 { // CPU-only
+        return cpu & qmask;
+    }
+    if (strat & 0x02) != 0 && (strat & 0x01) == 0 { // HASH-only
+        return hash_q;
+    }
+    // HYBRID: ultra-prio → CPU-local, else HASH
+    if event.priority >= 14 { (cpu & qmask) } else { hash_q }
 }
 
 #[inline(always)]
@@ -278,10 +651,74 @@ fn is_solana_port(p: u16) -> bool {
 }
 
 #[inline(always)]
+#[inline(always)]
+fn emit_lite_throttled(ctx: &XdpContext, lite: &PacketEventLite, prio: u8) {
+    // Ultra priority bypasses throttling
+    if prio >= 14 {
+        unsafe { HOT_HEADERS.output(ctx, lite, 0); }
+        return;
+    }
+    
+    let now = unsafe { bpf_ktime_get_ns() };
+    unsafe {
+        if let Some(b) = EMIT_BUDGET.get_ptr_mut(0) {
+            // Lazy init (refill 250us, burst 512)
+            if (*b).refill_ns == 0 { 
+                (*b).refill_ns = 250_000; 
+                (*b).burst = 512; 
+                (*b).tokens = 512; 
+                (*b).last_refill = now; 
+            }
+            
+            let elapsed = now.wrapping_sub((*b).last_refill);
+            if elapsed >= (*b).refill_ns {
+                // Refill proportional to elapsed but clamp to burst
+                let mut add = (elapsed / (*b).refill_ns) as u32;
+                if add == 0 { add = 1; }
+                let t = (*b).tokens.saturating_add(add);
+                (*b).tokens = if t > (*b).burst { (*b).burst } else { t };
+                (*b).last_refill = now;
+            }
+            
+            if (*b).tokens > 0 {
+                (*b).tokens -= 1;
+                HOT_HEADERS.output(ctx, lite, 0);
+            }
+        } else {
+            HOT_HEADERS.output(ctx, lite, 0);
+        }
+    }
+}
+
+#[inline(always)]
 fn should_deep_parse_udp(dst_port: u16, payload: &[u8]) -> bool {
     if !is_solana_port(dst_port) { return false; }
     if payload.len() < 24 { return false; }
     is_quic_like(payload)
+}
+
+#[inline(always)]
+fn unlikely_cheap_drop(ev: &PacketEvent) -> bool {
+    if let Some(cfg) = unsafe { DROP_CFG.get(0) } {
+        let c = unsafe { *cfg };
+        if c.enable == 0 { return false; }
+        let low_val = ev.lamports < c.min_lamports;
+        let low_cu  = ev.compute_units < c.min_cu;
+        let few_acc = ev.accounts_count <= c.max_accs;
+        let simple  = ev.instructions_count <= 1;
+        let low_pri = ev.priority <= 2;
+        return (low_val & low_cu & few_acc & simple) | (low_val & low_pri);
+    }
+    false
+}
+
+// ===== Program tag helpers =====
+#[inline(always)]
+fn program_has_tag(program_id: &[u8; 32], mask: u8) -> bool {
+    unsafe {
+        if let Some(v) = PROGRAM_TAGS.get(program_id) { return (*v & mask) != 0; }
+    }
+    false
 }
 
 // ===== Adaptive Bloom (per-CPU rotating) + global LRU =====
