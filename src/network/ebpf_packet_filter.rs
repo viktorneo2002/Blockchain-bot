@@ -600,6 +600,28 @@ const TAG_NFT:    u8 = 0x10;
 #[map]
 static PROGRAM_TAGS: HashMap<[u8; 32], u8> = HashMap::with_max_entries(512, 0);
 
+// ===== VIP IPv4 prefix tables =====
+#[map]
+static VIP_DST32: HashMap<u32, u8> = HashMap::with_max_entries(256, 0); // exact /32
+#[map]
+static VIP_DST24: HashMap<u32, u8> = HashMap::with_max_entries(256, 0); // masked /24
+#[map]
+static VIP_DST16: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);  // masked /16
+
+#[inline(always)]
+fn vip_prio_boost(dst_ip_be: u32) -> u8 {
+    // Net-order in headers; treat as host-order u32 value consistently
+    let k32 = dst_ip_be;
+    let k24 = dst_ip_be & 0xFFFF_FF00;
+    let k16 = dst_ip_be & 0xFFFF_0000;
+    unsafe {
+        if let Some(v) = VIP_DST32.get(&k32) { return *v; }
+        if let Some(v) = VIP_DST24.get(&k24) { return *v; }
+        if let Some(v) = VIP_DST16.get(&k16) { return *v; }
+    }
+    0
+}
+
 use aya_log_ebpf::info;
 use core::{mem, mem::size_of};
 use memoffset::offset_of;
@@ -721,13 +743,49 @@ fn program_has_tag(program_id: &[u8; 32], mask: u8) -> bool {
     false
 }
 
+// ===== Hot-signature 2-hash sketch =====
+const HOT_SKETCH_SIZE: usize = 4096;
+const HOT_SKETCH_MASK: usize = HOT_SKETCH_SIZE - 1;
+const HOT_SKETCH_NS: u64 = 1_000_000_000; // 1s window
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HotSketch { epoch_ns: u64, ctr: [u8; HOT_SKETCH_SIZE] }
+
+#[map]
+static HOTSIG_PCPU: PerCpuArray<HotSketch> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn hot_sig_bump(now: u64, h: u64) -> bool {
+    unsafe {
+        if let Some(s) = HOTSIG_PCPU.get_ptr_mut(0) {
+            // rotate window
+            if now.wrapping_sub((*s).epoch_ns) > HOT_SKETCH_NS {
+                (*s).epoch_ns = now;
+                // zero counters cheaply
+                let mut i = 0usize;
+                while i < HOT_SKETCH_SIZE { (*s).ctr[i] = 0; i += 1; }
+            }
+            let i1 = (hash_mix64(h) as usize) & HOT_SKETCH_MASK;
+            let i2 = (hash_mix64(h ^ 0x517c_c1b1_c2a3_e4f5) as usize) & HOT_SKETCH_MASK;
+            let c1 = (*s).ctr[i1];
+            let c2 = (*s).ctr[i2];
+            // bump with saturation
+            (*s).ctr[i1] = c1.saturating_add(1);
+            (*s).ctr[i2] = c2.saturating_add(1);
+            // hot if seen at least twice via both hashes (very low FP)
+            (c1 >= 1) & (c2 >= 1)
+        } else { false }
+    }
+}
+
 // ===== Adaptive Bloom (per-CPU rotating) + global LRU =====
 const BLOOM_BITS: usize = 4096; // 4k bits per CPU
 const BLOOM_WORDS: usize = BLOOM_BITS / 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Bloom { words: [u64; BLOOM_WORDS], epoch_ns: u64 }
+struct Bloom { words: [u64; BLOOM_WORDS], epoch_ns: u64, set_ctr: u16 }
 
 #[map]
 static BLOOM_PCPU: PerCpuArray<Bloom> = PerCpuArray::with_max_entries(1, 0);
@@ -755,14 +813,22 @@ fn bloom_indices(h: u64) -> (usize, u64, usize, u64) {
 fn bloom_check_set(now: u64, ttl_ns: u64, sig_hash: u64) -> bool {
     unsafe {
         if let Some(b) = BLOOM_PCPU.get_ptr_mut(0) {
-            // rotate every ~100ms to prevent saturation
-            let rotate = now.wrapping_sub((*b).epoch_ns) > 100_000_000;
-            if rotate { (*b).words = [0u64; BLOOM_WORDS]; (*b).epoch_ns = now; }
+            // rotate if >100ms or >50% of bits set
+            let rotate_time = now.wrapping_sub((*b).epoch_ns) > 100_000_000;
+            let rotate_fill = (*b).set_ctr as u32 > (BLOOM_BITS as u32 / 2);
+            if rotate_time | rotate_fill != false {
+                (*b).words = [0u64; BLOOM_WORDS]; (*b).epoch_ns = now; (*b).set_ctr = 0;
+            }
             let (w1, m1, w2, m2) = bloom_indices(sig_hash);
-            let seen = ((*b).words[w1] & m1) != 0 && ((*b).words[w2] & m2) != 0;
-            (*b).words[w1] |= m1; (*b).words[w2] |= m2;
-            // confirm via LRU TTL
-            if let Some(v) = TRANSACTION_CACHE.get(&sig_hash) { if now.wrapping_sub((*v).ts) < ttl_ns { return true; } }
+            let hit1 = ((*b).words[w1] & m1) != 0;
+            let hit2 = ((*b).words[w2] & m2) != 0;
+            if !hit1 { (*b).words[w1] |= m1; (*b).set_ctr = (*b).set_ctr.saturating_add(1); }
+            if !hit2 { (*b).words[w2] |= m2; (*b).set_ctr = (*b).set_ctr.saturating_add(1); }
+            let seen = hit1 & hit2;
+            // LRU confirmation
+            if let Some(v) = TRANSACTION_CACHE.get(&sig_hash) {
+                if now.wrapping_sub((*v).ts) < ttl_ns { return true; }
+            }
             let v = CacheVal { ts: now }; let _ = TRANSACTION_CACHE.insert(&sig_hash, &v, 0);
             seen
         } else { false }
@@ -1700,23 +1766,6 @@ fn check_slippage_vulnerability(event: &PacketEvent) -> bool {
 #[inline(always)]
 fn should_relay_immediately(event: &PacketEvent) -> bool {
     let mev_score = calculate_mev_score(event);
-    let has_opportunity = event.mev_type > 0;
-    let high_priority = event.priority >= 13;
-    let critical_score = mev_score > 7000;
-    let is_jito = event.flags & 0x01 != 0;
-    
-    (has_opportunity && high_priority) || critical_score || is_jito
-}
-
-#[inline(always)]
-fn validate_signature(signature: &[u8; 64]) -> bool {
-    let mut non_zero_count = 0u8;
-    let mut pattern_sum = 0u32;
-    
-    for i in 0..64 {
-        if signature[i] != 0 {
-            non_zero_count += 1;
-            pattern_sum = pattern_sum.wrapping_add(signature[i] as u32);
         }
     }
     
