@@ -1,176 +1,50 @@
-//! Dark Pool Integration for Solana MEV Bot
-//! 
-//! This module implements a proper dark pool integration with RFQ (Request-for-Quote) systems
-//! for MEV protection and private order matching. Unlike public DEX aggregators, this provides
-//! true dark pool functionality with order privacy and anti-MEV mechanisms.
-//!
-//! Key Features:
-//! - RFQ-based private order matching
-//! - MEV protection through encrypted order commitment schemes
-//! - Integration with Hashflow, Phoenix, and other private liquidity venues
-//! - Zero-knowledge order privacy
-//! - Professional market maker integration
-//! - Robust error handling with no panics
-
 use crate::types::{Order, OrderSide, Route, Pool, Protocol, DarkPoolError, DarkPoolConfig};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_sdk::{
     pubkey::Pubkey,
-    signature::{Keypair, Signature},
+    signature::{Keypair, Signature, Signer},
     transaction::Transaction,
-    instruction::{AccountMeta, Instruction},
+    instruction::{Instruction, AccountMeta},
+    commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
-    system_program,
-    rent::Rent,
-    clock::Clock,
-    sysvar,
-    ed25519_instruction,
-    secp256k1_instruction,
+    system_instruction,
+    message::Message,
+    // v0 + LUT
+    transaction::VersionedTransaction,
+    message::v0::Message as V0Message,
+    address_lookup_table::AddressLookupTableAccount,
 };
+use solana_transaction_status::UiTransactionEncoding;
+use spl_associated_token_account::{get_associated_token_address, instruction::create_associated_token_account};
 use std::{
     sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}},
-    collections::{HashMap, BTreeMap},
+    collections::HashMap,
     time::{SystemTime, UNIX_EPOCH, Duration},
     str::FromStr,
 };
 use tokio::{
-    sync::{RwLock, Semaphore, broadcast, mpsc},
-    time::{sleep, Duration, interval},
-    net::{TcpListener, TcpStream},
-};
-use tokio_tungstenite::{
-    accept_async, connect_async,
-    tungstenite::protocol::Message,
-    WebSocketStream,
+    sync::{RwLock, Semaphore},
+    time::{sleep, interval},
 };
 use arrayref::array_ref;
-use borsh::{BorshDeserialize, BorshSerialize};
-use serde::{Deserialize, Serialize};
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use futures_util::{SinkExt, StreamExt};
+use borsh::{BorshSerialize, BorshDeserialize};
 use spl_token::instruction as token_instruction;
 use log::{info, warn, error, debug};
-use anyhow::{Result, anyhow};
-use sha2::{Sha256, Digest};
-use secp256k1::{SecretKey, PublicKey, Message, Secp256k1, All};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use aes_gcm::aead::{Aead, NewAead};
-use rand::{Rng, thread_rng};
-use serde::{Serialize, Deserialize};
 
-// Dark Pool Configuration Constants
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-const MAX_SLIPPAGE_BPS: u16 = 50; // 0.5% for dark pool precision
-const MIN_LIQUIDITY_USD: u64 = 100_000; // Higher minimum for institutional trades
-const MAX_ROUTE_LENGTH: usize = 2; // Dark pools prefer direct matching
-const RFQ_TIMEOUT_MS: u64 = 5_000; // Fast RFQ response time
-const ORDER_COMMITMENT_TIMEOUT_MS: u64 = 15_000; // Order commitment validity
-const MAX_CONCURRENT_RFQS: usize = 50; // Higher concurrency for dark pools
-const QUOTE_VALIDITY_SECONDS: u64 = 30; // Quote expires after 30 seconds
-const MEV_PROTECTION_DELAY_MS: u64 = 100; // Anti-MEV randomization delay
-const MAX_ORDER_SIZE_USD: u64 = 10_000_000; // Institutional order size limit
-const MIN_MARKET_MAKER_STAKE: u64 = 1_000_000 * 1_000_000; // 1M tokens
-const MIN_MARKET_MAKER_REPUTATION: f64 = 0.85;
-const QUOTE_VALIDITY_DURATION: u64 = 30; // seconds
-const MAX_QUOTE_COLLECTION_TIME: u64 = 5; // seconds
+const MAX_SLIPPAGE_BPS: u16 = 500; // 5%
+const MIN_LIQUIDITY_USD: u64 = 10_000;
+const MAX_ROUTE_LENGTH: usize = 3;
+const POOL_REFRESH_INTERVAL_MS: u64 = 30_000;
+const ORDER_TIMEOUT_MS: u64 = 30_000;
+const MAX_CONCURRENT_ORDERS: usize = 10;
 
-// Oracle constants
-const PYTH_SOL_USD_FEED: &str = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG";
-const PYTH_USDC_USD_FEED: &str = "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD";
-const PRICE_STALENESS_THRESHOLD: i64 = 60; // 1 minute
-
-// WebSocket constants
-const DEFAULT_WS_PORT: u16 = 8080;
-const MAX_WS_CONNECTIONS: usize = 100;
-const HEARTBEAT_INTERVAL: u64 = 30; // seconds
-
-// Real Dark Pool Program IDs (Production Ready)
-const HASHFLOW_PROGRAM_ID: &str = "CRhtqXk98ATqo1R8gLg7qcpEMuvoPzqD5GNicPPqLMD"; // Real Hashflow mainnet
-const PHOENIX_PROGRAM_ID: &str = "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY"; // Real Phoenix mainnet
-const CONVERGENCE_RFQ_ID: &str = "CNvpEQrAU7oEtAK3WNMtpE9S8r5WrsDbfSLtPpedybLQ"; // Convergence RFQ protocol
-const ARCIUM_DARK_POOL_ID: &str = "ARCiumdKVLgNUNCTe1rLK1vVQZCp7x4MhBBbBs2qT6he"; // Arcium dark pool
-
-// Cryptographic Constants
-const ORDER_COMMITMENT_NONCE_SIZE: usize = 12;
-const ENCRYPTED_ORDER_SIZE: usize = 256;
-const SIGNATURE_SIZE: usize = 64;
-const MARKET_MAKER_BOND_LAMPORTS: u64 = 100_000_000_000; // 100 SOL bond requirement
-
-// Network Performance Constants
-const RPC_BATCH_SIZE: usize = 25;
-const MAX_RETRY_ATTEMPTS: usize = 5;
-const EXPONENTIAL_BACKOFF_BASE_MS: u64 = 100;
-const CIRCUIT_BREAKER_THRESHOLD: u64 = 10;
-const HEALTH_CHECK_INTERVAL_SEC: u64 = 10;
-
-/// Private order with cryptographic commitment for dark pool execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivateOrder {
-    pub commitment_hash: [u8; 32],
-    pub encrypted_details: Vec<u8>,
-    pub signature: [u8; 64],
-    pub market_maker_pubkey: Pubkey,
-    pub expires_at: u64,
-    pub nonce: [u8; ORDER_COMMITMENT_NONCE_SIZE],
-}
-
-/// RFQ (Request for Quote) structure for dark pool trading
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RFQRequest {
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
-    pub side: OrderSide,
-    pub amount: u64,
-    pub max_slippage_bps: u16,
-    pub requester: Pubkey,
-    pub timestamp: u64,
-    pub commitment_hash: [u8; 32],
-}
-
-/// RFQ Quote structure for dark pool trading
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RFQQuote {
-    market_maker: Pubkey,
-    base_mint: Pubkey,
-    quote_mint: Pubkey,
-    price: u64,
-    size: u64,
-    side: OrderSide,
-    expires_at: u64,
-    signature: Vec<u8>,
-    nonce: u64,
-    quote_id: String,
-    oracle_price: Option<i64>,
-    spread_bps: u16,
-}
-
-/// Market maker quote response to RFQ
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarketMakerQuote {
-    pub rfq_id: [u8; 32],
-    pub price: u64,
-    pub size: u64,
-    pub market_maker: Pubkey,
-    pub quote_signature: [u8; 64],
-    pub expires_at: u64,
-    pub execution_fee: u64,
-}
-
-/// Verified market maker with staking requirements
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct VerifiedMarketMaker {
-    pubkey: Pubkey,
-    stake_amount: u64,
-    reputation_score: f64,
-    success_rate: f64,
-    last_activity: u64,
-    is_active: bool,
-    websocket_endpoint: Option<String>,
-    authentication_key: PublicKey,
-    supported_pairs: Vec<(Pubkey, Pubkey)>,
-    min_order_size: u64,
-    max_order_size: u64,
-}
+// DEX Program IDs
+const PHOENIX_PROGRAM_ID: &str = "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jVFowvyE";
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwVSgEff7S9uEBk";
+const SERUM_PROGRAM_ID: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+const RAYDIUM_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 
 #[derive(Clone)]
 pub struct DarkPoolIntegration {
@@ -179,87 +53,22 @@ pub struct DarkPoolIntegration {
     config: Arc<RwLock<DarkPoolConfig>>,
     pools: Arc<RwLock<HashMap<String, Arc<PoolInfo>>>>,
     pending_orders: Arc<RwLock<HashMap<[u8; 32], Order>>>,
-    order_commitments: Arc<RwLock<HashMap<[u8; 32], (u64, [u8; 32])>>>,
     execution_semaphore: Arc<Semaphore>,
     circuit_breaker: Arc<CircuitBreaker>,
     metrics: Arc<Metrics>,
-    secp_ctx: Secp256k1<All>,
-    encryption_key: Key,
     shutdown: Arc<AtomicBool>,
-    // New fields for production-ready features
-    market_makers: Arc<RwLock<HashMap<Pubkey, VerifiedMarketMaker>>>,
-    ws_connections: Arc<RwLock<HashMap<Pubkey, WebSocketConnection>>>,
-    rfq_sender: broadcast::Sender<RFQRequest>,
-    quote_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<RFQQuote>>>,
-    oracle_feeds: Arc<RwLock<HashMap<String, OracleFeed>>>,
 }
 
-/// WebSocket connection for market maker communication
-#[derive(Clone, Debug)]
-struct WebSocketConnection {
-    endpoint: String,
-    last_heartbeat: Arc<AtomicU64>,
-    is_connected: Arc<AtomicBool>,
-    message_sender: Option<mpsc::UnboundedSender<Message>>,
-}
-
-/// Oracle price feed data
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OracleFeed {
-    feed_id: String,
-    price_account: Pubkey,
-    last_price: Arc<AtomicU64>,
-    last_update: Arc<AtomicU64>,
-    confidence: Arc<AtomicU64>,
-    expo: i32,
-}
-
-/// Market maker registration request
-#[derive(Debug, Serialize, Deserialize)]
-struct MarketMakerRegistration {
-    pubkey: Pubkey,
-    stake_proof: Vec<u8>,
-    websocket_endpoint: String,
-    authentication_signature: Vec<u8>,
-    supported_pairs: Vec<(Pubkey, Pubkey)>,
-    min_order_size: u64,
-    max_order_size: u64,
-}
-
-/// WebSocket message types for RFQ communication
-#[derive(Debug, Serialize, Deserialize)]
-enum WSMessage {
-    RFQRequest(RFQRequest),
-    RFQQuote(RFQQuote),
-    MarketMakerRegistration(MarketMakerRegistration),
-    Heartbeat { timestamp: u64 },
-    OrderExecution { order_id: String, signature: String },
-    Error { message: String, code: u16 },
-}
-
-/// Dark pool liquidity venue information
 #[derive(Debug)]
-struct DarkPoolVenue {
+struct PoolInfo {
     address: Pubkey,
-    protocol: DarkPoolProtocol,
-    min_order_size: u64,
-    max_order_size: u64,
+    protocol: Protocol,
+    base_reserve: AtomicU64,
+    quote_reserve: AtomicU64,
     fee_bps: u16,
     last_update: AtomicU64,
     success_count: AtomicU64,
     failure_count: AtomicU64,
-    total_volume: AtomicU64,
-    average_fill_time_ms: AtomicU64,
-}
-
-/// Dark pool specific protocols
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DarkPoolProtocol {
-    HashflowRFQ,
-    PhoenixPrivate,
-    ConvergenceRFQ,
-    ArciumDarkPool,
-    CustomPrivatePool(Pubkey),
 }
 
 struct CircuitBreaker {
@@ -269,21 +78,12 @@ struct CircuitBreaker {
     config: DarkPoolConfig,
 }
 
-/// Enhanced metrics for dark pool operations
-struct DarkPoolMetrics {
+struct Metrics {
     total_orders: AtomicU64,
     successful_orders: AtomicU64,
     failed_orders: AtomicU64,
     total_volume: AtomicU64,
     total_gas_used: AtomicU64,
-    // Dark pool specific metrics
-    rfq_requests: AtomicU64,
-    rfq_responses: AtomicU64,
-    private_matches: AtomicU64,
-    mev_attacks_prevented: AtomicU64,
-    average_fill_time_ms: AtomicU64,
-    market_maker_slashings: AtomicU64,
-    commitment_violations: AtomicU64,
 }
 
 impl DarkPoolIntegration {
@@ -298,116 +98,54 @@ impl DarkPoolIntegration {
         ));
         
         let config = config.unwrap_or_default();
-        
-        // Initialize cryptographic components for order privacy
-        let secp_ctx = Secp256k1::new();
-        let mut rng = thread_rng();
-        let encryption_key = Key::<Aes256Gcm>::from_slice(&rng.gen::<[u8; 32]>());
-        let encryption_key = Arc::new(*encryption_key);
         let circuit_breaker = Arc::new(CircuitBreaker::new(config.clone()));
-        
-        let (rfq_sender, _) = broadcast::channel(1000);
-        let (quote_sender, quote_receiver) = mpsc::channel(1000);
-        
-        // Initialize oracle feeds
-        let oracle_feeds = Arc::new(RwLock::new(HashMap::new()));
-        
-        // Initialize market maker registry
-        let market_makers = Arc::new(RwLock::new(HashMap::new()));
-        
-        // Initialize WebSocket connections
-        let ws_connections = Arc::new(RwLock::new(HashMap::new()));
         
         let integration = Self {
             rpc_client,
             wallet: Arc::new(wallet),
             config: Arc::new(RwLock::new(config)),
-            // Dark pool specific components
-            verified_market_makers: Arc::new(RwLock::new(HashMap::new())),
-            active_rfqs: Arc::new(RwLock::new(HashMap::new())),
-            pending_quotes: Arc::new(RwLock::new(HashMap::new())),
-            private_orders: Arc::new(RwLock::new(HashMap::new())),
-            order_commitments: Arc::new(RwLock::new(HashMap::new())),
-            execution_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RFQS)),
+            pools: Arc::new(RwLock::new(HashMap::new())),
+            pending_orders: Arc::new(RwLock::new(HashMap::new())),
+            execution_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_ORDERS)),
             circuit_breaker,
-            metrics: Arc::new(DarkPoolMetrics::new()),
-            secp_ctx,
-            encryption_key,
+            metrics: Arc::new(Metrics::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
-            market_makers,
-            ws_connections,
-            rfq_sender,
-            quote_receiver,
-            oracle_feeds,
         };
         
-        // Initialize verified market makers from on-chain data
-        integration.initialize_market_makers().await?;
-        
-        // Start oracle price update loop
-        integration.start_oracle_update_loop().await;
-        
-        // Start background tasks with proper error handling
-        let rfq_processor = integration.clone();
+        // Start background tasks
+        let pool_updater = integration.clone();
         tokio::spawn(async move {
-            if let Err(e) = rfq_processor.rfq_processing_loop().await {
-                error!("RFQ processing loop failed: {}", e);
-            }
-        });
-        
-        let commitment_monitor = integration.clone();
-        tokio::spawn(async move {
-            if let Err(e) = commitment_monitor.monitor_order_commitments().await {
-                error!("Order commitment monitoring failed: {}", e);
-            }
+            pool_updater.pool_update_loop().await;
         });
         
         let metrics_reporter = integration.clone();
         tokio::spawn(async move {
-            if let Err(e) = metrics_reporter.report_metrics_loop().await {
-                error!("Metrics reporting failed: {}", e);
-            }
+            metrics_reporter.report_metrics_loop().await;
         });
         
         let health_monitor = integration.clone();
         tokio::spawn(async move {
-            if let Err(e) = health_monitor.monitor_dark_pool_health().await {
-                error!("Health monitoring failed: {}", e);
-            }
+            health_monitor.monitor_pool_health().await;
         });
         
         Ok(integration)
     }
 
-    /// Execute order through dark pool RFQ system with MEV protection
-    pub async fn execute_private_order(&self, order: Order) -> Result<Signature, DarkPoolError> {
+    pub async fn execute_order(&self, order: Order) -> Result<Signature, DarkPoolError> {
         if self.circuit_breaker.is_open() {
             return Err(DarkPoolError::CircuitBreakerOpen);
         }
-        
-        // Validate order size for dark pool requirements
-        self.validate_order_size(&order)?;
         
         let _permit = self.execution_semaphore.acquire().await
             .map_err(|_| DarkPoolError::OrderTimeout)?;
         
         self.metrics.total_orders.fetch_add(1, Ordering::Relaxed);
+        let order_id = self.generate_order_id(&order);
         
-        // Create order commitment for MEV protection
-        let commitment = self.create_order_commitment(&order).await?;
-        let order_id = commitment.commitment_hash;
+        // Add to pending orders
+        self.pending_orders.write().await.insert(order_id, order.clone());
         
-        // Store commitment first for anti-MEV protection
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            .as_secs();
-        
-        self.order_commitments.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire commitment lock: {}", e)))?
-            .insert(order_id, (timestamp, commitment.commitment_hash));
-        
-        let result = match self.execute_rfq_order(order, commitment).await {
+        let result = match self.execute_order_internal(order).await {
             Ok(signature) => {
                 self.metrics.successful_orders.fetch_add(1, Ordering::Relaxed);
                 self.circuit_breaker.record_success();
@@ -420,143 +158,351 @@ impl DarkPoolIntegration {
             }
         };
         
-        // Clean up commitment
-        self.order_commitments.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire cleanup lock: {}", e)))?
-            .remove(&order_id);
+        // Remove from pending orders
+        self.pending_orders.write().await.remove(&order_id);
         
         result
     }
 
-    /// Execute order through RFQ system with proper dark pool mechanics
-    async fn execute_rfq_order(&self, order: Order, commitment: OrderCommitment) -> Result<Signature, DarkPoolError> {
-        let start_time = SystemTime::now();
-        
-        // Check order expiry with proper error handling
-        if let Some(expires_at) = order.expires_at {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            .as_secs();
-        
-        // Store RFQ for tracking
-        self.active_rfqs.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire RFQ lock: {}", e)))?
-            .insert(rfq_id, Vec::new());
-        
-        // Send to all verified market makers
-        let market_makers = self.market_makers.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read market makers: {}", e)))?;
-        
-        for (_, market_maker) in market_makers.iter() {
-            if market_maker.stake_amount >= MIN_MARKET_MAKER_STAKE {
-                if let Err(e) = self.send_rfq_to_market_maker(&rfq, market_maker).await {
-                    warn!("Failed to send RFQ to market maker {}: {}", market_maker.pubkey, e);
+    async fn execute_order_internal(&self, order: Order) -> Result<Signature, DarkPoolError> {
+        // Expiry hard-stop
+        if let Some(exp) = order.expires_at {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if now > exp { return Err(DarkPoolError::OrderExpired); }
+        }
+
+        // Build candidate routes
+        let mut routes = self.find_best_routes(&order).await?;
+        if routes.is_empty() { return Err(DarkPoolError::NoValidRoute); }
+
+        // Try up to top 3 routes; enforce per-route freshness before firing
+        let mut last_err: Option<DarkPoolError> = None;
+
+        for (idx, route) in routes.drain(..).take(3).enumerate() {
+            self.ensure_route_fresh(&route).await?;
+
+            match self.execute_route(&order, &route).await {
+                Ok(sig) => {
+                    info!("Executed via route#{idx} (hops={})", route.path.len());
+                    self.metrics.total_volume.fetch_add(order.amount, Ordering::Relaxed);
+                    return Ok(sig);
+                }
+                Err(DarkPoolError::TransactionFailed(e)) => {
+                    let cls = self.classify_exec_error(&e);
+                    warn!("route#{idx} failed: class={cls} err={e}");
+                    last_err = Some(DarkPoolError::TransactionFailed(e));
+
+                    // Pivot logic:
+                    // - price/liquidity/slippage → switch route immediately
+                    // - contention → tiny sleep then try next route (not same)
+                    // - blockhash/under_cu handled in execute_route; if still failed, switch
+                    // - account_setup → next route (ATA helper already in path)
+                    match cls {
+                        "route_bad_price" | "account_setup" => continue,     // next route
+                        "contention" | "blockhash" | "under_cu" | "other" => continue,
+                        _ => continue,
+                    }
+                }
+                Err(e) => {
+                    warn!("route#{idx} failed: {:?}", e);
+                    last_err = Some(e);
+                    continue;
                 }
             }
         }
-        
-        Ok(rfq_id)
+
+        Err(last_err.unwrap_or(DarkPoolError::AllRoutesFailed))
     }
-    
-    /// Validate order size meets dark pool requirements
-    fn validate_order_size(&self, order: &Order) -> Result<(), DarkPoolError> {
-        let order_value_estimate = order.amount; // Simplified - should use real price oracle
-        
-        if order_value_estimate < MIN_LIQUIDITY_USD {
-            return Err(DarkPoolError::OrderTooSmall);
-        }
-        
-        if order_value_estimate > MAX_ORDER_SIZE_USD {
-            return Err(DarkPoolError::OrderTooLarge);
-        }
-        
-        Ok(())
-    }
-    
+
     async fn find_best_routes(&self, order: &Order) -> Result<Vec<Route>, DarkPoolError> {
-        // For dark pools, we don't route through public pools
-        // Instead, we use RFQ system for private order matching
-        warn!("Legacy route finding called - dark pools use RFQ system instead");
-            // Remove the mock return - this was placeholder logic
-        // Return actual routes found
-        Ok(all_routes)
-        
-        // Sort by price (best first)
-        direct_routes.sort_by_key(|r| match order.side {
-            OrderSide::Buy => r.estimated_price,
-            OrderSide::Sell => u64::MAX - r.estimated_price,
-        });
-        
-        // Consider multi-hop routes if beneficial
+        let pools = self.pools.read().await;
+        let mut direct_routes = Vec::new();
+        let mut multi_hop_routes = Vec::new();
+
+        // Direct routes
+        for (_key, pool_info) in pools.iter() {
+            if self.matches_order(pool_info, order) {
+                let est_price = self.calculate_price_with_slippage(
+                    pool_info.base_reserve.load(Ordering::Relaxed),
+                    pool_info.quote_reserve.load(Ordering::Relaxed),
+                    order.amount,
+                    pool_info.fee_bps,
+                    order.side.clone(),
+                );
+
+                let pool = Pool {
+                    address: pool_info.address,
+                    protocol: pool_info.protocol.clone(),
+                    base_mint: order.base_mint,
+                    quote_mint: order.quote_mint,
+                    fee_bps: pool_info.fee_bps,
+                };
+
+                direct_routes.push(Route {
+                    path: vec![pool],
+                    estimated_price: est_price,
+                    estimated_gas: 0,
+                });
+            }
+        }
+
+        // Multi-hop if useful
         if direct_routes.is_empty() || self.should_check_multi_hop(&order).await {
             multi_hop_routes = self.find_multi_hop_routes(order, &pools).await?;
         }
-        
-        // Combine and sort all routes
-        let mut all_routes = direct_routes;
-        all_routes.extend(multi_hop_routes);
-        
-        // Filter routes by price limit if specified
+
+        // Combine
+        let mut all = direct_routes;
+        all.extend(multi_hop_routes);
+
+        // EV scoring (gas + staleness + reliability)
+        for r in &mut all {
+            let (ev_micro, gas_cu) = self.score_route_ev(order, r).await?;
+            r.estimated_gas = gas_cu;
+            r.estimated_price = ev_micro;
+        }
+
+        // Limit filter (post-EV)
         if let Some(limit_price) = order.limit_price {
-            all_routes.retain(|route| {
-                match order.side {
-                    OrderSide::Buy => route.estimated_price <= limit_price,
-                    OrderSide::Sell => route.estimated_price >= limit_price,
-                }
+            all.retain(|route| match order.side {
+                OrderSide::Buy  => route.estimated_price <= limit_price,
+                OrderSide::Sell => route.estimated_price >= limit_price,
             });
         }
-        
-        Ok(all_routes)
+
+        // Best first
+        all.sort_by_key(|r| match order.side {
+            OrderSide::Buy  => r.estimated_price,
+            OrderSide::Sell => u64::MAX - r.estimated_price,
+        });
+
+        Ok(all)
     }
 
     async fn execute_route(&self, order: &Order, route: &Route) -> Result<Signature, DarkPoolError> {
-        let instructions = self.build_route_instructions(order, route).await?;
-        let recent_blockhash = self.rpc_client.get_latest_blockhash().await
+        // Data-plane ixs (includes ATA ensures + per-hop minOut)
+        let route_ixs = self.build_route_instructions(order, route).await?;
+
+        // Base CU/tip from config + tiny adaptive scaler
+        let hops = route.path.len() as u32;
+        let base_cu = 70_000u32 + 110_000u32.saturating_mul(hops);
+        let mut cu_limit = self.clamp_cu(base_cu);
+        let mut cu_price = self.adaptive_cu_price().await;
+
+        // Prepare compute budget + route ixs
+        let mut all_ixs = self.build_with_compute_budget(&route_ixs, cu_limit, cu_price);
+
+        // Optional: v0 compile using LUTs from env (DARKPOOL_LUTS=pubkey1,pubkey2,...)
+        let mut use_v0 = false;
+        let mut alt_accounts: Vec<AddressLookupTableAccount> = Vec::new();
+        if let Ok(lut_env) = std::env::var("DARKPOOL_LUTS") {
+            let keys = lut_env.split(',').filter(|s| !s.is_empty());
+            for k in keys {
+                if let Ok(pk) = Pubkey::from_str(k.trim()) {
+                    if let Ok(resp) = self.rpc_client.get_address_lookup_table(&pk).await {
+                        if let Some(alt) = resp.value { alt_accounts.push(alt); }
+                    }
+                }
+            }
+            use_v0 = !alt_accounts.is_empty();
+        }
+
+        // Build initial tx (legacy or v0) for simulate
+        let mut recent_blockhash = self.rpc_client.get_latest_blockhash().await
             .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
-        
-        // Add compute budget
-        let mut all_instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
-            ComputeBudgetInstruction::set_compute_unit_price(1000),
-        ];
-        all_instructions.extend(instructions);
-        
-        let transaction = Transaction::new_signed_with_payer(
-            &all_instructions,
-            Some(&self.wallet.pubkey()),
-            &[&*self.wallet],
-            recent_blockhash,
-        );
-        
-        // Send with retry
-        let mut retries = 0;
-        let max_retries = 3;
-        
-        loop {
-            match self.rpc_client.send_and_confirm_transaction(&transaction).await {
-                Ok(signature) => {
-                    // Update pool success count
-                    for pool in &route.path {
-                        let key = format!("{}:{:?}", pool.address, pool.protocol);
-                        if let Some(pool_info) = self.pools.read().await.get(&key) {
-                            pool_info.success_count.fetch_add(1, Ordering::Relaxed);
+
+        enum BuiltTx<'a> { Legacy(Transaction), V0(VersionedTransaction, &'a V0Message) }
+
+        let mut v0_msg_storage: Option<V0Message> = None;
+        let mut built = if use_v0 {
+            let msg = V0Message::try_compile(
+                &self.wallet.pubkey(),
+                &all_ixs,
+                &alt_accounts,
+                recent_blockhash,
+            ).map_err(|e| DarkPoolError::SerializationError(format!("v0 compile: {e}")))?;
+            let tx = VersionedTransaction::try_new(msg.clone(), &[&*self.wallet])
+                .map_err(|e| DarkPoolError::SerializationError(format!("v0 sign: {e}")))?;
+            v0_msg_storage = Some(msg);
+            BuiltTx::V0(tx, v0_msg_storage.as_ref().unwrap())
+        } else {
+            let tx = Transaction::new_signed_with_payer(
+                &all_ixs,
+                Some(&self.wallet.pubkey()),
+                &[&*self.wallet],
+                recent_blockhash,
+            );
+            BuiltTx::Legacy(tx)
+        };
+
+        // ---- Pre-send simulation (no sig verify) → auto-tune CU limit ----
+        match &built {
+            BuiltTx::Legacy(tx) => {
+                if let Ok(sim) = self.rpc_client.simulate_transaction_with_config(
+                    tx,
+                    RpcSimulateTransactionConfig {
+                        sig_verify: Some(false),
+                        replace_recent_blockhash: Some(true),
+                        commitment: Some(CommitmentConfig::processed()),
+                        encoding: Some(UiTransactionEncoding::Base64),
+                        ..Default::default()
+                    }
+                ).await {
+                    if let Some(units) = sim.value.units_consumed {
+                        let tuned = self.clamp_cu((units as u32).saturating_mul(12) / 10);
+                        if tuned > cu_limit {
+                            cu_limit = tuned;
+                            all_ixs = self.build_with_compute_budget(&route_ixs, cu_limit, cu_price);
                         }
                     }
-                    
-                    // Update gas metrics
-                    let fee = transaction.message.header.num_required_signatures as u64 * 5000;
-                    self.metrics.total_gas_used.fetch_add(fee, Ordering::Relaxed);
-                    
-                    return Ok(signature);
                 }
-                Err(e) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        return Err(DarkPoolError::TransactionFailed(e.to_string()));
+            }
+            BuiltTx::V0(tx, _msg) => {
+                if let Ok(sim) = self.rpc_client.simulate_transaction_with_config(
+                    tx,
+                    RpcSimulateTransactionConfig {
+                        sig_verify: Some(false),
+                        replace_recent_blockhash: Some(true),
+                        commitment: Some(CommitmentConfig::processed()),
+                        encoding: Some(UiTransactionEncoding::Base64),
+                        ..Default::default()
                     }
-                    warn!("Transaction failed (attempt {}/{}): {}", retries, max_retries, e);
-                    sleep(Duration::from_millis(500 * retries)).await;
+                ).await {
+                    if let Some(units) = sim.value.units_consumed {
+                        let tuned = self.clamp_cu((units as u32).saturating_mul(12) / 10);
+                        if tuned > cu_limit {
+                            cu_limit = tuned;
+                            all_ixs = self.build_with_compute_budget(&route_ixs, cu_limit, cu_price);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rebuild tx with tuned CU
+        recent_blockhash = self.rpc_client.get_latest_blockhash().await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+        built = if use_v0 {
+            let msg = V0Message::try_compile(
+                &self.wallet.pubkey(),
+                &all_ixs,
+                &alt_accounts,
+                recent_blockhash,
+            ).map_err(|e| DarkPoolError::SerializationError(format!("v0 compile: {e}")))?;
+            let tx = VersionedTransaction::try_new(msg.clone(), &[&*self.wallet])
+                .map_err(|e| DarkPoolError::SerializationError(format!("v0 sign: {e}")))?;
+            v0_msg_storage = Some(msg);
+            BuiltTx::V0(tx, v0_msg_storage.as_ref().unwrap())
+        } else {
+            let tx = Transaction::new_signed_with_payer(
+                &all_ixs,
+                Some(&self.wallet.pubkey()),
+                &[&*self.wallet],
+                recent_blockhash,
+            );
+            BuiltTx::Legacy(tx)
+        };
+
+        // ---- Send with retries; fresh blockhash + re-sign each time ----
+        let mut attempt: u32 = 0;
+        let max_retries: u32 = 6;
+
+        loop {
+            attempt += 1;
+
+            recent_blockhash = self.rpc_client.get_latest_blockhash().await
+                .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+
+            let sig = match &built {
+                BuiltTx::Legacy(_tx) => {
+                    let tx = Transaction::new_signed_with_payer(
+                        &all_ixs,
+                        Some(&self.wallet.pubkey()),
+                        &[&*self.wallet],
+                        recent_blockhash,
+                    );
+                    match self.rpc_client.send_transaction_with_config(
+                        &tx,
+                        RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+                            ..Default::default()
+                        }
+                    ).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            if attempt >= max_retries {
+                                return Err(DarkPoolError::TransactionFailed(e.to_string()));
+                            }
+                            let delay_ms = self.small_jitter_ms(40) + 60u64 * attempt as u64;
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            if attempt == 3 || attempt == 5 {
+                                cu_price = cu_price.saturating_add(50);
+                                all_ixs = self.build_with_compute_budget(&route_ixs, cu_limit, cu_price);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                BuiltTx::V0(_tx, _msg) => {
+                    let msg = V0Message::try_compile(
+                        &self.wallet.pubkey(),
+                        &all_ixs,
+                        &alt_accounts,
+                        recent_blockhash,
+                    ).map_err(|e| DarkPoolError::SerializationError(format!("v0 compile: {e}")))?;
+                    let vtx = VersionedTransaction::try_new(msg, &[&*self.wallet])
+                        .map_err(|e| DarkPoolError::SerializationError(format!("v0 sign: {e}")))?;
+                    match self.rpc_client.send_transaction_with_config(
+                        &vtx,
+                        RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+                            ..Default::default()
+                        }
+                    ).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            if attempt >= max_retries {
+                                return Err(DarkPoolError::TransactionFailed(e.to_string()));
+                            }
+                            let delay_ms = self.small_jitter_ms(40) + 60u64 * attempt as u64;
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            if attempt == 3 || attempt == 5 {
+                                cu_price = cu_price.saturating_add(50);
+                                all_ixs = self.build_with_compute_budget(&route_ixs, cu_limit, cu_price);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if self.get_transaction_confirmation(&sig).await? {
+                for pool in &route.path {
+                    let key = format!("{}:{:?}", pool.address, pool.protocol);
+                    if let Some(pi) = self.pools.read().await.get(&key) {
+                        pi.success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.metrics.total_gas_used.fetch_add((cu_price as u64) * (cu_limit as u64), Ordering::Relaxed);
+                self.metrics.total_volume.fetch_add(order.amount, Ordering::Relaxed);
+                return Ok(sig);
+            } else {
+                for pool in &route.path {
+                    let key = format!("{}:{:?}", pool.address, pool.protocol);
+                    if let Some(pi) = self.pools.read().await.get(&key) {
+                        pi.failure_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if attempt >= max_retries {
+                    return Err(DarkPoolError::TransactionFailed("confirmation failed".into()));
+                }
+                let delay_ms = self.small_jitter_ms(60) + 90u64 * attempt as u64;
+                sleep(Duration::from_millis(delay_ms)).await;
+                if attempt == 2 || attempt == 4 {
+                    cu_price = cu_price.saturating_add(75);
+                    all_ixs = self.build_with_compute_budget(&route_ixs, cu_limit, cu_price);
                 }
             }
         }
@@ -570,11 +516,25 @@ impl DarkPoolIntegration {
         let mut instructions = Vec::new();
         let mut current_mint = order.base_mint;
         let mut current_amount = order.amount;
-        
+
+        // Ensure source ATA exists for first hop input
+        let src_ata_ixs = self.ensure_ata_if_needed(&self.wallet.pubkey(), &current_mint).await?;
+        instructions.extend(src_ata_ixs);
+
+        let max_slip = {
+            // prefer order override, else config
+            let cfg = self.config.read().await;
+            u16::min(order.max_slippage_bps, cfg.max_slippage_bps)
+        };
+
         for (i, pool) in route.path.iter().enumerate() {
-            let is_last = i == route.path.len() - 1;
+            let is_last = i + 1 == route.path.len();
             let next_mint = if is_last { order.quote_mint } else { route.path[i + 1].base_mint };
-            
+
+            // Ensure destination ATA exists for this hop
+            let dst_ata_ixs = self.ensure_ata_if_needed(&self.wallet.pubkey(), &next_mint).await?;
+            instructions.extend(dst_ata_ixs);
+
             match pool.protocol {
                 Protocol::Phoenix => {
                     let ix = self.build_phoenix_swap_instruction(
@@ -583,6 +543,7 @@ impl DarkPoolIntegration {
                         next_mint,
                         current_amount,
                         order.side.clone(),
+                        max_slip,
                     ).await?;
                     instructions.push(ix);
                 }
@@ -593,6 +554,7 @@ impl DarkPoolIntegration {
                         next_mint,
                         current_amount,
                         order.side.clone(),
+                        max_slip,
                     ).await?;
                     instructions.push(ix);
                 }
@@ -603,6 +565,7 @@ impl DarkPoolIntegration {
                         next_mint,
                         current_amount,
                         order.side.clone(),
+                        max_slip,
                     ).await?;
                     instructions.push(ix);
                 }
@@ -613,30 +576,38 @@ impl DarkPoolIntegration {
                         next_mint,
                         current_amount,
                         order.side.clone(),
+                        max_slip,
                     ).await?;
                     instructions.push(ix);
                 }
             }
-            
-            // Update for next iteration
-            current_mint = next_mint;
-            // Estimate output amount for next hop
+
+            // For next hop, estimate output with pool reserves to update amount
             if !is_last {
+                let key = format!("{}:{:?}", pool.address, pool.protocol);
                 let pool_info = self.pools.read().await
-                    .get(&format!("{}:{:?}", pool.address, pool.protocol))
-                    .ok_or(DarkPoolError::PoolNotFound)?
-                    .clone();
-                
-                current_amount = self.estimate_output_amount(
+                    .get(&key).ok_or(DarkPoolError::PoolNotFound)?.clone();
+
+                let est_out = self.estimate_output_amount(
                     pool_info.base_reserve.load(Ordering::Relaxed),
                     pool_info.quote_reserve.load(Ordering::Relaxed),
                     current_amount,
                     pool.fee_bps,
                     order.side.clone(),
                 );
+
+                // enforce per-hop minOut to avoid cascading slippage blowup
+                let min_out = (est_out as u128 * (10_000u128 - max_slip as u128) / 10_000u128) as u64;
+                if min_out == 0 {
+                    return Err(DarkPoolError::NoLiquidity);
+                }
+                current_amount = min_out;
+                current_mint = next_mint;
+            } else {
+                current_mint = next_mint;
             }
         }
-        
+
         Ok(instructions)
     }
 
@@ -646,21 +617,15 @@ impl DarkPoolIntegration {
         input_mint: Pubkey,
         output_mint: Pubkey,
         amount: u64,
-        side: OrderSide,
+        _side: OrderSide,
+        max_slippage_bps: u16,
     ) -> Result<Instruction, DarkPoolError> {
         let program_id = Pubkey::from_str(PHOENIX_PROGRAM_ID)
             .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        
-        let user_source = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &input_mint,
-        );
-        
-        let user_destination = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &output_mint,
-        );
-        
+
+        let user_source = get_associated_token_address(&self.wallet.pubkey(), &input_mint);
+        let user_destination = get_associated_token_address(&self.wallet.pubkey(), &output_mint);
+
         let accounts = vec![
             AccountMeta::new(pool.address, false),
             AccountMeta::new(user_source, false),
@@ -668,22 +633,18 @@ impl DarkPoolIntegration {
             AccountMeta::new_readonly(self.wallet.pubkey(), true),
             AccountMeta::new_readonly(spl_token::id(), false),
         ];
-        
+
         #[derive(BorshSerialize)]
         struct PhoenixSwapData {
             instruction: u8,
             amount: u64,
             minimum_out: u64,
         }
-        
-        let minimum_out = (amount * (10000 - side.max_slippage_bps as u64)) / 10000;
-        
-        let data = PhoenixSwapData {
-            instruction: 1, // Swap instruction
-            amount,
-            minimum_out,
-        };
-        
+
+        let minimum_out = (amount as u128 * (10_000u128 - max_slippage_bps as u128) / 10_000u128) as u64;
+
+        let data = PhoenixSwapData { instruction: 1, amount, minimum_out };
+
         Ok(Instruction {
             program_id,
             accounts,
@@ -699,20 +660,14 @@ impl DarkPoolIntegration {
         output_mint: Pubkey,
         amount: u64,
         side: OrderSide,
+        max_slippage_bps: u16,
     ) -> Result<Instruction, DarkPoolError> {
         let program_id = Pubkey::from_str(WHIRLPOOL_PROGRAM_ID)
             .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        
-        let user_source = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &input_mint,
-        );
-        
-        let user_destination = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &output_mint,
-        );
-        
+
+        let user_source = get_associated_token_address(&self.wallet.pubkey(), &input_mint);
+        let user_destination = get_associated_token_address(&self.wallet.pubkey(), &output_mint);
+
         let accounts = vec![
             AccountMeta::new_readonly(program_id, false),
             AccountMeta::new(self.wallet.pubkey(), true),
@@ -721,7 +676,7 @@ impl DarkPoolIntegration {
             AccountMeta::new(user_destination, false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ];
-        
+
         #[derive(BorshSerialize)]
         struct WhirlpoolSwapData {
             amount: u64,
@@ -730,9 +685,10 @@ impl DarkPoolIntegration {
             amount_specified_is_input: bool,
             a_to_b: bool,
         }
-        
-        let other_amount_threshold = (amount * (10000 - side.max_slippage_bps as u64)) / 10000;
-        
+
+        let other_amount_threshold =
+            (amount as u128 * (10_000u128 - max_slippage_bps as u128) / 10_000u128) as u64;
+
         let data = WhirlpoolSwapData {
             amount,
             other_amount_threshold,
@@ -740,7 +696,7 @@ impl DarkPoolIntegration {
             amount_specified_is_input: true,
             a_to_b: matches!(side, OrderSide::Sell),
         };
-        
+
         Ok(Instruction {
             program_id,
             accounts,
@@ -756,22 +712,16 @@ impl DarkPoolIntegration {
         output_mint: Pubkey,
         amount: u64,
         side: OrderSide,
+        _max_slippage_bps: u16,
     ) -> Result<Instruction, DarkPoolError> {
         let program_id = Pubkey::from_str(SERUM_PROGRAM_ID)
             .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        
+
         let market_info = self.fetch_serum_market_info(&pool.address).await?;
-        
-        let user_source = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &input_mint,
-        );
-        
-        let user_destination = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &output_mint,
-        );
-        
+
+        let user_source = get_associated_token_address(&self.wallet.pubkey(), &input_mint);
+        let user_destination = get_associated_token_address(&self.wallet.pubkey(), &output_mint);
+
         let accounts = vec![
             AccountMeta::new(pool.address, false),
             AccountMeta::new(market_info.request_queue, false),
@@ -786,7 +736,7 @@ impl DarkPoolIntegration {
             AccountMeta::new(self.wallet.pubkey(), true),
             AccountMeta::new_readonly(spl_token::id(), false),
         ];
-        
+
         #[derive(BorshSerialize)]
         struct SerumNewOrderV3 {
             side: u8,
@@ -798,18 +748,12 @@ impl DarkPoolIntegration {
             client_order_id: u64,
             limit: u16,
         }
-        
-        let (limit_price, max_coin_qty, max_pc_qty) = self.calculate_serum_order_params(
-            &market_info,
-            amount,
-            side.clone(),
-        ).await?;
-        
+
+        let (limit_price, max_coin_qty, max_pc_qty) =
+            self.calculate_serum_order_params(&market_info, amount, side.clone()).await?;
+
         let data = SerumNewOrderV3 {
-            side: match side {
-                OrderSide::Buy => 0,
-                OrderSide::Sell => 1,
-            },
+            side: match side { OrderSide::Buy => 0, OrderSide::Sell => 1 },
             limit_price,
             max_coin_qty,
             max_native_pc_qty_including_fees: max_pc_qty,
@@ -818,7 +762,7 @@ impl DarkPoolIntegration {
             client_order_id: 0,
             limit: 10,
         };
-        
+
         Ok(Instruction {
             program_id,
             accounts,
@@ -833,23 +777,17 @@ impl DarkPoolIntegration {
         input_mint: Pubkey,
         output_mint: Pubkey,
         amount: u64,
-        side: OrderSide,
+        _side: OrderSide,
+        max_slippage_bps: u16,
     ) -> Result<Instruction, DarkPoolError> {
         let program_id = Pubkey::from_str(RAYDIUM_PROGRAM_ID)
             .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        
+
         let amm_info = self.fetch_raydium_amm_info(&pool.address).await?;
-        
-        let user_source = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &input_mint,
-        );
-        
-        let user_destination = spl_associated_token_account::get_associated_token_address(
-            &self.wallet.pubkey(),
-            &output_mint,
-        );
-        
+
+        let user_source = get_associated_token_address(&self.wallet.pubkey(), &input_mint);
+        let user_destination = get_associated_token_address(&self.wallet.pubkey(), &output_mint);
+
         let accounts = vec![
             AccountMeta::new_readonly(spl_token::id(), false),
             AccountMeta::new(pool.address, false),
@@ -870,22 +808,22 @@ impl DarkPoolIntegration {
             AccountMeta::new(user_destination, false),
             AccountMeta::new_readonly(self.wallet.pubkey(), true),
         ];
-        
+
         #[derive(BorshSerialize)]
         struct RaydiumSwapInstruction {
             instruction: u8,
             amount_in: u64,
             minimum_amount_out: u64,
         }
-        
-        let minimum_out = (amount * (10000 - side.max_slippage_bps as u64)) / 10000;
-        
+
+        let minimum_out = (amount as u128 * (10_000u128 - max_slippage_bps as u128) / 10_000u128) as u64;
+
         let data = RaydiumSwapInstruction {
-            instruction: 9, // Swap instruction
+            instruction: 9,
             amount_in: amount,
             minimum_amount_out: minimum_out,
         };
-        
+
         Ok(Instruction {
             program_id,
             accounts,
@@ -944,22 +882,26 @@ impl DarkPoolIntegration {
         amount: u64,
         side: OrderSide,
     ) -> Result<(u64, u64, u64), DarkPoolError> {
-        // Fetch current market prices
-        let bids_account = self.rpc_client.get_account(&market_info.bids).await
+        let keys = vec![market_info.bids, market_info.asks];
+        let accs = self.rpc_client.get_multiple_accounts(&keys).await
             .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
-        let asks_account = self.rpc_client.get_account(&market_info.asks).await
-            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
-        
-        let (best_bid, best_ask) = self.extract_serum_prices(&bids_account.data, &asks_account.data)?;
-        
+
+        let bids_data = accs.get(0).and_then(|o| o.as_ref()).ok_or(DarkPoolError::InvalidMarketData)?;
+        let asks_data = accs.get(1).and_then(|o| o.as_ref()).ok_or(DarkPoolError::InvalidMarketData)?;
+
+        let (best_bid, best_ask) = self.extract_serum_prices(&bids_data.data, &asks_data.data)?;
+
+        let cfg = self.config.read().await;
+        let bps = u64::from(cfg.max_slippage_bps);
+
         let limit_price = match side {
-            OrderSide::Buy => (best_ask * 105) / 100, // 5% above ask
-            OrderSide::Sell => (best_bid * 95) / 100, // 5% below bid
+            OrderSide::Buy  => best_ask.saturating_mul(10_000 + bps) / 10_000,
+            OrderSide::Sell => best_bid.saturating_mul(10_000 - bps) / 10_000,
         };
-        
+
         let max_coin_qty = amount;
-        let max_pc_qty = (amount * limit_price) / 1_000_000;
-        
+        let max_pc_qty   = amount.saturating_mul(limit_price) / 1_000_000;
+
         Ok((limit_price, max_coin_qty, max_pc_qty))
     }
 
@@ -981,758 +923,16 @@ impl DarkPoolIntegration {
         Ok((best_bid, best_ask))
     }
 
-    /// Initialize verified market makers from on-chain data
-    async fn initialize_market_makers(&self) -> Result<(), DarkPoolError> {
-        // Initialize oracle feeds for price validation
-        self.initialize_oracle_feeds().await?;
+    fn matches_order(&self, pool_info: &PoolInfo, order: &Order) -> bool {
+        // Check if pool matches the order's mints
+        let base_mint = order.base_mint;
+        let quote_mint = order.quote_mint;
         
-        // Start WebSocket server for market maker connections
-        self.start_websocket_server().await?;
-        
-        // Load registered market makers from on-chain registry
-        self.load_registered_market_makers().await?;
-        
-        info!("Initialized market maker registry with oracle feeds and WebSocket server");
-        Ok(())
+        // For now, we assume pools are correctly mapped
+        // In production, you'd verify this against on-chain data
+        true
     }
 
-    /// Initialize real oracle price feeds for validation
-    async fn initialize_oracle_feeds(&self) -> Result<(), DarkPoolError> {
-        let mut oracle_feeds = self.oracle_feeds.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire oracle lock: {}", e)))?;
-        
-        // Initialize SOL/USD price feed
-        let sol_feed = OracleFeed {
-            feed_id: "SOL/USD".to_string(),
-            price_account: Pubkey::from_str(PYTH_SOL_USD_FEED)
-                .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?,
-            last_price: Arc::new(AtomicU64::new(0)),
-            last_update: Arc::new(AtomicU64::new(0)),
-            confidence: Arc::new(AtomicU64::new(0)),
-            expo: -8, // SOL price has 8 decimal places
-        };
-        oracle_feeds.insert("SOL/USD".to_string(), sol_feed);
-        
-        // Initialize USDC/USD price feed
-        let usdc_feed = OracleFeed {
-            feed_id: "USDC/USD".to_string(),
-            price_account: Pubkey::from_str(PYTH_USDC_USD_FEED)
-                .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?,
-            last_price: Arc::new(AtomicU64::new(0)),
-            last_update: Arc::new(AtomicU64::new(0)),
-            confidence: Arc::new(AtomicU64::new(0)),
-            expo: -6, // USDC price has 6 decimal places
-        };
-        oracle_feeds.insert("USDC/USD".to_string(), usdc_feed);
-        
-        info!("Initialized {} oracle price feeds", oracle_feeds.len());
-        Ok(())
-    }
-
-    /// Start WebSocket server for market maker connections
-    async fn start_websocket_server(&self) -> Result<(), DarkPoolError> {
-        let addr = format!("127.0.0.1:{}", DEFAULT_WS_PORT);
-        let listener = TcpListener::bind(&addr).await
-            .map_err(|e| DarkPoolError::RpcError(format!("Failed to bind WebSocket server: {}", e)))?;
-        
-        info!("WebSocket server listening on {}", addr);
-        
-        let integration = self.clone();
-        tokio::spawn(async move {
-            integration.websocket_server_loop(listener).await;
-        });
-        
-        Ok(())
-    }
-
-    /// WebSocket server loop for handling market maker connections
-    async fn websocket_server_loop(&self, listener: TcpListener) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("New WebSocket connection from: {}", addr);
-                    let integration = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = integration.handle_websocket_connection(stream).await {
-                            error!("WebSocket connection error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to accept WebSocket connection: {}", e);
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }
-
-    /// Handle individual WebSocket connection
-    async fn handle_websocket_connection(&self, stream: TcpStream) -> Result<(), DarkPoolError> {
-        let ws_stream = accept_async(stream).await
-            .map_err(|e| DarkPoolError::RpcError(format!("WebSocket handshake failed: {}", e)))?;
-        
-        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-        let mut market_maker_pubkey: Option<Pubkey> = None;
-        
-        // Send welcome message
-        let welcome = WSMessage::Heartbeat { 
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        };
-        let welcome_json = serde_json::to_string(&welcome)
-            .map_err(|e| DarkPoolError::SerializationError(e.to_string()))?;
-        ws_sender.send(Message::Text(welcome_json)).await
-            .map_err(|e| DarkPoolError::RpcError(format!("Failed to send welcome: {}", e)))?;
-        
-        // Handle incoming messages
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = self.handle_ws_message(&text, &mut ws_sender, &mut market_maker_pubkey).await {
-                        error!("Failed to handle WebSocket message: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    info!("WebSocket connection closed by client");
-                    break;
-                }
-                Ok(_) => {} // Ignore other message types
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    break;
-                }
-            }
-        }
-        
-        // Clean up connection
-        if let Some(pubkey) = market_maker_pubkey {
-            if let Ok(mut connections) = self.ws_connections.write().await {
-                connections.remove(&pubkey);
-            }
-            info!("Market maker {} disconnected", pubkey);
-        }
-        
-        Ok(())
-    }
-
-    /// Load registered market makers from on-chain registry
-    async fn load_registered_market_makers(&self) -> Result<(), DarkPoolError> {
-        // In production, this would query an on-chain market maker registry program
-        // For now, we'll allow dynamic registration through WebSocket
-        info!("Market maker registry ready for dynamic registration");
-        Ok(())
-    }
-    
-    /// Handle WebSocket messages from market makers
-    async fn handle_ws_message(
-        &self,
-        message: &str,
-        ws_sender: &mut futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
-        market_maker_pubkey: &mut Option<Pubkey>,
-    ) -> Result<(), DarkPoolError> {
-        let ws_message: WSMessage = serde_json::from_str(message)
-            .map_err(|e| DarkPoolError::SerializationError(e.to_string()))?;
-        
-        match ws_message {
-            WSMessage::MarketMakerRegistration(registration) => {
-                self.handle_market_maker_registration(registration, ws_sender, market_maker_pubkey).await?;
-            }
-            WSMessage::RFQQuote(quote) => {
-                self.handle_rfq_quote_response(quote).await?;
-            }
-            WSMessage::Heartbeat { timestamp: _ } => {
-                // Update heartbeat timestamp
-                if let Some(pubkey) = market_maker_pubkey {
-                    if let Ok(connections) = self.ws_connections.read().await {
-                        if let Some(connection) = connections.get(pubkey) {
-                            connection.last_heartbeat.store(
-                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                Ordering::Relaxed
-                            );
-                        }
-                    }
-                }
-            }
-            WSMessage::Error { message, code } => {
-                warn!("Market maker error {}: {}", code, message);
-            }
-            _ => {
-                warn!("Unexpected WebSocket message type");
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Handle market maker registration
-    async fn handle_market_maker_registration(
-        &self,
-        registration: MarketMakerRegistration,
-        ws_sender: &mut futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
-        market_maker_pubkey: &mut Option<Pubkey>,
-    ) -> Result<(), DarkPoolError> {
-        // Verify market maker signature
-        if !self.verify_market_maker_signature(&registration).await? {
-            let error_msg = WSMessage::Error {
-                message: "Invalid authentication signature".to_string(),
-                code: 401,
-            };
-            let error_json = serde_json::to_string(&error_msg)
-                .map_err(|e| DarkPoolError::SerializationError(e.to_string()))?;
-            ws_sender.send(Message::Text(error_json)).await
-                .map_err(|e| DarkPoolError::RpcError(format!("Failed to send error: {}", e)))?;
-            return Err(DarkPoolError::InvalidMarketMaker);
-        }
-        
-        // Verify stake requirements
-        let stake_amount = self.verify_market_maker_stake(&registration.pubkey).await?;
-        if stake_amount < MIN_MARKET_MAKER_STAKE {
-            let error_msg = WSMessage::Error {
-                message: "Insufficient stake amount".to_string(),
-                code: 402,
-            };
-            let error_json = serde_json::to_string(&error_msg)
-                .map_err(|e| DarkPoolError::SerializationError(e.to_string()))?;
-            ws_sender.send(Message::Text(error_json)).await
-                .map_err(|e| DarkPoolError::RpcError(format!("Failed to send error: {}", e)))?;
-            return Err(DarkPoolError::InvalidMarketMaker);
-        }
-        
-        // Create verified market maker
-        let verified_mm = VerifiedMarketMaker {
-            pubkey: registration.pubkey,
-            stake_amount,
-            reputation_score: 1.0, // Start with perfect score
-            success_rate: 0.0,
-            last_activity: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            is_active: true,
-            websocket_endpoint: Some(registration.websocket_endpoint.clone()),
-            authentication_key: self.secp_ctx.public_key_from_slice(&registration.authentication_signature[..33])
-                .map_err(|e| DarkPoolError::InvalidMarketMaker)?,
-            supported_pairs: registration.supported_pairs,
-            min_order_size: registration.min_order_size,
-            max_order_size: registration.max_order_size,
-        };
-        
-        // Store market maker
-        self.market_makers.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire MM lock: {}", e)))?
-            .insert(registration.pubkey, verified_mm);
-        
-        // Store WebSocket connection
-        let connection = WebSocketConnection {
-            endpoint: registration.websocket_endpoint,
-            last_heartbeat: Arc::new(AtomicU64::new(
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-            )),
-            is_connected: Arc::new(AtomicBool::new(true)),
-            message_sender: None, // Would store the sender in production
-        };
-        
-        self.ws_connections.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire WS lock: {}", e)))?
-            .insert(registration.pubkey, connection);
-        
-        *market_maker_pubkey = Some(registration.pubkey);
-        info!("Market maker {} registered successfully", registration.pubkey);
-        
-        Ok(())
-    }
-
-    /// Send RFQ to specific market maker
-    async fn send_rfq_to_market_maker(
-        &self,
-        rfq: &RFQRequest,
-        market_maker: &VerifiedMarketMaker,
-    ) -> Result<(), DarkPoolError> {
-        // Send RFQ via WebSocket if connected
-        if let Some(endpoint) = &market_maker.websocket_endpoint {
-            let ws_message = WSMessage::RFQRequest(rfq.clone());
-            let message_json = serde_json::to_string(&ws_message)
-                .map_err(|e| DarkPoolError::SerializationError(e.to_string()))?;
-            
-            // In production, send via established WebSocket connection
-            // For now, we'll simulate the response
-            self.simulate_market_maker_quote(rfq, market_maker).await?;
-        }
-        
-        let rfq_id = rfq.commitment_hash;
-        let mm_pubkey = market_maker.pubkey;
-        
-        // Simulate network delay
-        tokio::time::sleep(Duration::from_millis(10 + thread_rng().gen_range(0..50))).await;
-        
-        // Generate mock quote based on market maker's quality
-        if thread_rng().gen_bool(market_maker.success_rate) {
-            let quote = self.generate_mock_quote(rfq, market_maker).await?;
-            
-            // Add quote to pending collection
-            self.pending_quotes.write().await
-                .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire quotes lock: {}", e)))?
-                .entry(rfq_id)
-                .or_insert_with(Vec::new)
-                .push(quote);
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate mock quote for testing (replace with real market maker integration)
-    async fn generate_mock_quote(
-        &self,
-        rfq: &RFQRequest,
-        market_maker: &VerifiedMarketMaker,
-    ) -> Result<RFQQuote, DarkPoolError> {
-        let mut rng = thread_rng();
-        
-        // Base price with spread based on market maker quality
-        let spread_bps = 5 + rng.gen_range(0..15); // 0.05% to 0.2% spread
-        let base_price = 1_000_000; // Simplified - should use real oracle price
-        
-        let quote_price = match rfq.side {
-            OrderSide::Buy => base_price + (base_price * spread_bps / 10000),
-            OrderSide::Sell => base_price - (base_price * spread_bps / 10000),
-        };
-        
-        // Get real oracle price for quote generation
-        let oracle_price = self.get_oracle_price(&rfq.base_mint, &rfq.quote_mint).await?
-            .unwrap_or(base_price);
-        
-        let quote_id = format!("quote_{}_{}", market_maker.pubkey, rng.gen::<u32>());
-        
-        Ok(RFQQuote {
-            market_maker: market_maker.pubkey,
-            base_mint: rfq.base_mint,
-            quote_mint: rfq.quote_mint,
-            price: quote_price,
-            size: rfq.amount,
-            side: rfq.side.clone(),
-            expires_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() + QUOTE_VALIDITY_DURATION,
-            signature: self.sign_quote_data(&quote_price, &rfq.amount, &market_maker.authentication_key).await?,
-            nonce: rng.gen(),
-            quote_id,
-            oracle_price: Some(oracle_price),
-            spread_bps: spread_bps as u16,
-        })
-    }
-    
-    /// Hash quote data for signature verification
-    fn hash_quote_data(&self, rfq: &RFQRequest, price: u64, amount: u64) -> Result<Vec<u8>, DarkPoolError> {
-        let mut hasher = Sha256::new();
-        hasher.update(&rfq.commitment_hash);
-        hasher.update(&price.to_le_bytes());
-        hasher.update(&amount.to_le_bytes());
-        hasher.update(&rfq.timestamp.to_le_bytes());
-        
-        let hash = hasher.finalize();
-        Ok(hash.to_vec())
-    }
-    
-    /// Collect quotes from market makers with timeout
-    async fn collect_rfq_quotes(&self, rfq_id: &[u8; 32]) -> Result<Vec<RFQQuote>, DarkPoolError> {
-        // Wait for quotes with timeout
-        let start_time = SystemTime::now();
-        let timeout_duration = Duration::from_secs(RFQ_TIMEOUT_SECONDS);
-        
-        while start_time.elapsed()
-            .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            < timeout_duration
-        {
-            let quotes = self.pending_quotes.read().await
-                .map_err(|e| DarkPoolError::LockError(format!("Failed to read quotes: {}", e)))?
-                .get(rfq_id)
-                .cloned()
-                .unwrap_or_default();
-            
-            // Return if we have sufficient quotes or timeout approaching
-            if !quotes.is_empty() {
-                let remaining_time = timeout_duration - start_time.elapsed()
-                    .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?;
-                
-                if quotes.len() >= MIN_QUOTES_REQUIRED || remaining_time < Duration::from_millis(100) {
-                    return Ok(quotes);
-                }
-            }
-            
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        
-        // Timeout reached, return whatever quotes we have
-        Ok(self.pending_quotes.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read quotes: {}", e)))?
-            .get(rfq_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-    
-    /// Select best quote based on price and market maker reputation
-    async fn select_best_quote(
-        &self,
-        quotes: &[RFQQuote],
-        order: &Order,
-    ) -> Result<RFQQuote, DarkPoolError> {
-        if quotes.is_empty() {
-            return Err(DarkPoolError::NoMarketMakerQuotes);
-        }
-        
-        let market_makers = self.market_makers.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read market makers: {}", e)))?;
-        
-        let mut scored_quotes: Vec<(f64, &RFQQuote)> = quotes
-            .iter()
-            .filter_map(|quote| {
-                // Check quote expiry
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()?
-                    .as_secs();
-                
-                if quote.expires_at <= now {
-                    return None;
-                }
-                
-                let mm = market_makers.get(&quote.market_maker)?;
-                
-                // Score based on price and reputation
-                let price_score = match order.side {
-                    OrderSide::Buy => 1.0 / (quote.price as f64),   // Lower price is better for buys
-                    OrderSide::Sell => quote.price as f64,          // Higher price is better for sells
-                };
-                
-                let reputation_score = mm.success_rate;
-                let stake_score = (mm.stake_amount as f64 / MIN_MARKET_MAKER_STAKE as f64).min(2.0);
-                
-                // Weighted score: 60% price, 25% reputation, 15% stake
-                let total_score = price_score * 0.6 + reputation_score * 0.25 + stake_score * 0.15;
-                
-                Some((total_score, quote))
-            })
-            .collect();
-        
-        if scored_quotes.is_empty() {
-            return Err(DarkPoolError::AllQuotesExpired);
-        }
-        
-        // Sort by score (descending)
-        scored_quotes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        
-        Ok(scored_quotes[0].1.clone())
-    }
-    
-    /// Verify market maker quote signature and eligibility
-    async fn verify_market_maker_quote(&self, quote: &RFQQuote) -> Result<(), DarkPoolError> {
-        // Verify market maker is still eligible
-        if !self.verify_market_maker_eligibility(&quote.market_maker).await? {
-            return Err(DarkPoolError::InvalidMarketMaker);
-        }
-        
-        // In production, verify secp256k1 signature
-        // For now, just check quote hasn't expired
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            .as_secs();
-        
-        if quote.expires_at <= now {
-            return Err(DarkPoolError::QuoteExpired);
-        }
-        
-        Ok(())
-    }
-    
-    /// Verify market maker eligibility (stake, reputation, activity) with real on-chain validation
-    async fn verify_market_maker_eligibility(&self, market_maker_pubkey: &Pubkey) -> Result<bool, DarkPoolError> {
-        let market_makers = self.market_makers.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read market makers: {}", e)))?;
-        
-        if let Some(market_maker) = market_makers.get(market_maker_pubkey) {
-            // Re-verify stake amount on-chain (in case it changed)
-            let current_stake = self.verify_market_maker_stake(market_maker_pubkey).await?;
-            if current_stake < MIN_MARKET_MAKER_STAKE {
-                warn!("Market maker {} stake fell below minimum", market_maker_pubkey);
-                return Ok(false);
-            }
-            
-            // Check reputation threshold
-            if market_maker.reputation_score < MIN_MARKET_MAKER_REPUTATION {
-                return Ok(false);
-            }
-            
-            // Check if market maker is active
-            if !market_maker.is_active {
-                return Ok(false);
-            }
-            
-            // Check WebSocket connection health
-            let ws_connections = self.ws_connections.read().await
-                .map_err(|e| DarkPoolError::LockError(format!("Failed to read WS connections: {}", e)))?;
-            
-            if let Some(connection) = ws_connections.get(market_maker_pubkey) {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                let last_heartbeat = connection.last_heartbeat.load(Ordering::Relaxed);
-                
-                // Check if connection is stale (no heartbeat in 2 minutes)
-                if now - last_heartbeat > 120 {
-                    warn!("Market maker {} connection is stale", market_maker_pubkey);
-                    return Ok(false);
-                }
-            }
-            
-            // Check recent activity (within last 24 hours)
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-                .as_secs();
-            
-            if now - market_maker.last_activity > 86400 {
-                return Ok(false);
-            }
-            
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-    
-    /// Execute private trade with MEV protection
-    async fn execute_private_trade(
-        &self,
-        order: &Order,
-        quote: &MarketMakerQuote,
-        commitment: &OrderCommitment,
-    ) -> Result<Signature, DarkPoolError> {
-        // Step 1: Anti-MEV delay (randomized)
-        let delay_ms = MIN_ANTI_MEV_DELAY_MS + thread_rng().gen_range(0..ANTI_MEV_DELAY_VARIANCE_MS);
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        
-        // Step 2: Build private trade transaction
-        let trade_tx = self.build_private_trade_transaction(order, quote, commitment).await?;
-        
-        // Step 3: Submit with priority fee for faster inclusion
-        let signature = self.rpc_client
-            .send_and_confirm_transaction(&trade_tx)
-            .await
-            .map_err(|e| DarkPoolError::TransactionFailed(e.to_string()))?;
-        
-        info!("Private trade executed: {}", signature);
-        Ok(signature)
-    }
-    
-    /// Build transaction for private trade execution
-    async fn build_private_trade_transaction(
-        &self,
-        order: &Order,
-        quote: &MarketMakerQuote,
-        commitment: &OrderCommitment,
-    ) -> Result<Transaction, DarkPoolError> {
-        // In production, this would interact with real dark pool programs
-        // For simulation, create a basic transfer transaction
-        
-        let recent_blockhash = self.rpc_client
-            .get_latest_blockhash()
-            .await
-            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
-        
-        // Create instruction for commitment verification and trade execution
-        let instruction = self.build_trade_instruction(order, quote, commitment).await?;
-        
-        let transaction = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&self.wallet.pubkey()),
-            &[&*self.wallet],
-            recent_blockhash,
-        );
-        
-        Ok(transaction)
-    }
-    
-    /// Build instruction for trade execution
-    async fn build_trade_instruction(
-        &self,
-        order: &Order,
-        quote: &MarketMakerQuote,
-        commitment: &OrderCommitment,
-    ) -> Result<Instruction, DarkPoolError> {
-        // In production, this would be a call to a dark pool program
-        // For simulation, create a memo instruction with trade details
-        
-        let trade_memo = format!(
-            "DarkPoolTrade:{}:{}:{}",
-            bs58::encode(commitment.commitment_hash).into_string(),
-            quote.price,
-            quote.amount
-        );
-        
-        Ok(Instruction::new_with_bytes(
-            spl_memo::id(),
-            trade_memo.as_bytes(),
-            vec![AccountMeta::new_readonly(self.wallet.pubkey(), true)],
-        ))
-    }
-    
-    /// Update market maker reputation after trade
-    async fn update_market_maker_reputation(
-        &self,
-        market_maker: &Pubkey,
-        success: bool,
-    ) -> Result<(), DarkPoolError> {
-        let mut market_makers = self.verified_market_makers.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire market maker lock: {}", e)))?;
-        
-        if let Some(mm) = market_makers.get_mut(market_maker) {
-            mm.total_trades += 1;
-            if success {
-                mm.successful_trades += 1;
-            }
-            mm.success_rate = mm.successful_trades as f64 / mm.total_trades as f64;
-            
-            mm.last_active = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-                .as_secs();
-        }
-        
-        Ok(())
-    }
-
-    /// Background task to process RFQ requests
-    async fn rfq_processing_loop(&self) -> Result<(), DarkPoolError> {
-        let mut interval = interval(Duration::from_millis(100));
-        
-        while !self.shutdown.load(Ordering::Relaxed) {
-            interval.tick().await;
-            
-            // Clean up expired RFQs and quotes
-            self.cleanup_expired_rfqs().await?;
-            self.cleanup_expired_quotes().await?;
-        }
-        
-        Ok(())
-    }
-    
-    /// Monitor order commitments for MEV protection
-    async fn monitor_order_commitments(&self) -> Result<(), DarkPoolError> {
-        let mut interval = interval(Duration::from_millis(1000));
-        
-        while !self.shutdown.load(Ordering::Relaxed) {
-            interval.tick().await;
-            
-            // Clean up old commitments
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-                .as_secs();
-            
-            let mut commitments = self.order_commitments.write().await
-                .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire commitment lock: {}", e)))?;
-            
-            commitments.retain(|_, (timestamp, _)| now - *timestamp < ORDER_COMMITMENT_TTL_SECONDS);
-        }
-        
-        Ok(())
-    }
-    
-    /// Monitor dark pool health and metrics
-    async fn monitor_dark_pool_health(&self) -> Result<(), DarkPoolError> {
-        let mut interval = interval(Duration::from_secs(30));
-        
-        while !self.shutdown.load(Ordering::Relaxed) {
-            interval.tick().await;
-            
-            // Check market maker health
-            self.health_check_market_makers().await?;
-            
-            // Update circuit breaker based on recent performance
-            self.update_circuit_breaker_state().await?;
-        }
-        
-        Ok(())
-    }
-    
-    /// Clean up expired RFQ requests
-    async fn cleanup_expired_rfqs(&self) -> Result<(), DarkPoolError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            .as_secs();
-        
-        let mut rfqs = self.active_rfqs.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire RFQ lock: {}", e)))?;
-        
-        rfqs.retain(|_, rfq| now - rfq.timestamp < RFQ_TIMEOUT_SECONDS);
-        
-        Ok(())
-    }
-    
-    /// Clean up expired quotes
-    async fn cleanup_expired_quotes(&self) -> Result<(), DarkPoolError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            .as_secs();
-        
-        let mut quotes = self.pending_quotes.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire quotes lock: {}", e)))?;
-        
-        for (_, quote_list) in quotes.iter_mut() {
-            quote_list.retain(|quote| quote.expires_at > now);
-        }
-        
-        // Remove empty quote lists
-        quotes.retain(|_, quote_list| !quote_list.is_empty());
-        
-        Ok(())
-    }
-    
-    /// Health check for market makers
-    async fn health_check_market_makers(&self) -> Result<(), DarkPoolError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-            .as_secs();
-        
-        let market_makers = self.verified_market_makers.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read market makers: {}", e)))?;
-        
-        let active_count = market_makers
-            .values()
-            .filter(|mm| now - mm.last_active < 3600)
-            .count();
-        
-        self.metrics.active_market_makers.store(active_count as u64, Ordering::Relaxed);
-        
-        if active_count < MIN_ACTIVE_MARKET_MAKERS {
-            warn!("Low market maker activity: {} active", active_count);
-        }
-        
-        Ok(())
-    }
-    
-    /// Update circuit breaker based on recent performance
-    async fn update_circuit_breaker_state(&self) -> Result<(), DarkPoolError> {
-        let total_orders = self.metrics.total_orders.load(Ordering::Relaxed);
-        let failed_orders = self.metrics.failed_orders.load(Ordering::Relaxed);
-        
-        if total_orders > 0 {
-            let failure_rate = failed_orders as f64 / total_orders as f64;
-            if failure_rate > 0.5 {
-                warn!("High failure rate detected: {:.2}%", failure_rate * 100.0);
-            }
-        }
-        
-        Ok(())
-    }
-    
     fn calculate_price_with_slippage(
         &self,
         base_reserve: u64,
@@ -1813,14 +1013,11 @@ impl DarkPoolIntegration {
         let mut routes = Vec::new();
         
         // Common intermediate tokens (USDC, USDT, SOL)
-        let usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-            .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        let usdt = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
-            .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        let sol = Pubkey::from_str("So11111111111111111111111111111111111111112")
-            .map_err(|e| DarkPoolError::InvalidPubkey(e.to_string()))?;
-        
-        let intermediates = vec![usdc, usdt, sol];
+        let intermediates = vec![
+            Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap(), // USDC
+            Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap(), // USDT
+            Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap(), // SOL
+        ];
         
         for intermediate in intermediates {
             if intermediate == order.base_mint || intermediate == order.quote_mint {
@@ -1912,19 +1109,36 @@ impl DarkPoolIntegration {
     }
 
     async fn pool_update_loop(&self) {
-        let mut interval = interval(Duration::from_millis(POOL_REFRESH_INTERVAL_MS));
-        
+        let mut ticker = interval(Duration::from_millis(POOL_REFRESH_INTERVAL_MS));
         while !self.shutdown.load(Ordering::Relaxed) {
-            interval.tick().await;
-            
-            let pools = self.pools.read().await.clone();
-            for (key, pool_info) in pools {
-                if self.shutdown.load(Ordering::Relaxed) {
-                    break;
+            ticker.tick().await;
+
+            let snapshot = {
+                let pools = self.pools.read().await;
+                pools.values().cloned().collect::<Vec<_>>()
+            };
+            if snapshot.is_empty() { continue; }
+
+            // Group by protocol
+            let mut phoenix = Vec::new();
+            let mut whirl = Vec::new();
+            let mut serum = Vec::new();
+            let mut raydium = Vec::new();
+
+            for pi in snapshot {
+                match pi.protocol {
+                    Protocol::Phoenix   => phoenix.push(pi),
+                    Protocol::Whirlpool => whirl.push(pi),
+                    Protocol::Serum     => serum.push(pi),
+                    Protocol::Raydium   => raydium.push(pi),
                 }
-                
-                let _ = self.refresh_pool_reserves(pool_info).await;
             }
+
+            // Batch refresh per protocol; errors are logged, not fatal
+            if let Err(e) = self.refresh_batch_phoenix(&phoenix).await { warn!("phoenix batch: {e:?}"); }
+            if let Err(e) = self.refresh_batch_whirlpool(&whirl).await { warn!("whirlpool batch: {e:?}"); }
+            if let Err(e) = self.refresh_batch_serum(&serum).await { warn!("serum batch: {e:?}"); }
+            if let Err(e) = self.refresh_batch_raydium(&raydium).await { warn!("raydium batch: {e:?}"); }
         }
     }
 
@@ -1948,10 +1162,7 @@ impl DarkPoolIntegration {
             pool_info.base_reserve.store(base_reserve, Ordering::Relaxed);
             pool_info.quote_reserve.store(quote_reserve, Ordering::Relaxed);
             pool_info.last_update.store(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                 Ordering::Relaxed,
             );
         }
@@ -1975,10 +1186,7 @@ impl DarkPoolIntegration {
             pool_info.base_reserve.store(base_reserve, Ordering::Relaxed);
             pool_info.quote_reserve.store(quote_reserve, Ordering::Relaxed);
             pool_info.last_update.store(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                 Ordering::Relaxed,
             );
         }
@@ -2006,10 +1214,7 @@ impl DarkPoolIntegration {
                 pool_info.base_reserve.store(base_reserve, Ordering::Relaxed);
                 pool_info.quote_reserve.store(quote_reserve, Ordering::Relaxed);
                 pool_info.last_update.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                     Ordering::Relaxed,
                 );
             }
@@ -2038,10 +1243,7 @@ impl DarkPoolIntegration {
                 pool_info.base_reserve.store(base_reserve, Ordering::Relaxed);
                 pool_info.quote_reserve.store(quote_reserve, Ordering::Relaxed);
                 pool_info.last_update.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                     Ordering::Relaxed,
                 );
             }
@@ -2051,45 +1253,49 @@ impl DarkPoolIntegration {
     }
 
     async fn refresh_pool_with_retries(&self, address: &Pubkey, protocol: Protocol) -> Result<(), DarkPoolError> {
-        let mut retries = 0;
-        let max_retries = 3;
-        
-        while retries < max_retries {
-            let pool_info = Arc::new(PoolInfo {
-                address: *address,
-                protocol: protocol.clone(),
-                base_reserve: AtomicU64::new(0),
-                quote_reserve: AtomicU64::new(0),
-                fee_bps: match protocol {
-                    Protocol::Phoenix => 30,
-                    Protocol::Whirlpool => 30,
-                    Protocol::Serum => 30,
-                    Protocol::Raydium => 25,
-                },
-                last_update: AtomicU64::new(0),
-                success_count: AtomicU64::new(0),
-                failure_count: AtomicU64::new(0),
-            });
-            
-            match self.refresh_pool_reserves(pool_info.clone()).await {
-                Ok(_) => {
-                    let key = format!("{}:{:?}", address, protocol);
-                    self.pools.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire pool lock: {}", e)))?
-            .insert(key, pool_info);
-                    return Ok(());
-                }
-                Err(e) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        return Err(e);
+        let mut retries = 0u32;
+        let max_retries = 3u32;
+
+        loop {
+            // If existing, refresh in-place; else insert new
+            let key = format!("{}:{:?}", address, protocol);
+            if let Some(existing) = self.pools.read().await.get(&key).cloned() {
+                match self.refresh_pool_reserves(existing.clone()).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        retries += 1;
+                        if retries >= max_retries { return Err(e); }
+                        sleep(Duration::from_millis(120 * retries as u64)).await;
+                        continue;
                     }
-                    sleep(Duration::from_millis(500 * retries)).await;
+                }
+            } else {
+                let pool_info = Arc::new(PoolInfo {
+                    address: *address,
+                    protocol: protocol.clone(),
+                    base_reserve: AtomicU64::new(0),
+                    quote_reserve: AtomicU64::new(0),
+                    fee_bps: match protocol {
+                        Protocol::Phoenix | Protocol::Whirlpool | Protocol::Serum => 30,
+                        Protocol::Raydium => 25,
+                    },
+                    last_update: AtomicU64::new(0),
+                    success_count: AtomicU64::new(0),
+                    failure_count: AtomicU64::new(0),
+                });
+                match self.refresh_pool_reserves(pool_info.clone()).await {
+                    Ok(_) => {
+                        self.pools.write().await.insert(key, pool_info);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        retries += 1;
+                        if retries >= max_retries { return Err(e); }
+                        sleep(Duration::from_millis(120 * retries as u64)).await;
+                    }
                 }
             }
         }
-        
-        Err(DarkPoolError::MaxRetriesExceeded)
     }
 
     async fn report_metrics_loop(&self) {
@@ -2116,8 +1322,7 @@ impl DarkPoolIntegration {
             );
             
             // Report pool health
-            let pools = self.pools.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read pools: {}", e)))?;
+            let pools = self.pools.read().await;
             for (key, pool_info) in pools.iter() {
                 let pool_success = pool_info.success_count.load(Ordering::Relaxed);
                 let pool_failure = pool_info.failure_count.load(Ordering::Relaxed);
@@ -2160,27 +1365,6 @@ impl DarkPoolIntegration {
         }
     }
 
-    pub async fn get_pending_private_orders(&self) -> Result<Vec<[u8; 32]>, DarkPoolError> {
-        let commitments = self.order_commitments.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read commitments: {}", e)))?;
-        
-        Ok(commitments.keys().cloned().collect())
-    }
-
-    pub async fn cancel_private_order(&self, commitment_hash: [u8; 32]) -> Result<(), DarkPoolError> {
-        let removed = self.order_commitments.write().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to acquire commitment lock: {}", e)))?
-            .remove(&commitment_hash);
-        
-        match removed {
-            Some(_) => {
-                info!("Private order cancelled: {}", bs58::encode(commitment_hash).into_string());
-                Ok(())
-            }
-            None => Err(DarkPoolError::OrderNotFound),
-        }
-    }
-
     pub async fn health_check(&self) -> Result<bool, DarkPoolError> {
         // Check circuit breaker
         if self.circuit_breaker.is_open() {
@@ -2198,12 +1382,8 @@ impl DarkPoolIntegration {
         }
         
         // Check pool freshness
-        let pools = self.pools.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read pools: {}", e)))?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let pools = self.pools.read().await;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let mut stale_pools = 0;
         
         for (key, pool_info) in pools.iter() {
@@ -2228,12 +1408,8 @@ impl DarkPoolIntegration {
         while !self.shutdown.load(Ordering::Relaxed) {
             interval.tick().await;
             
-            let pools = self.pools.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read pools: {}", e)))?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| DarkPoolError::SystemTimeError(e.to_string()))?
-                .as_secs();
+            let pools = self.pools.read().await;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
             
             for (key, pool) in pools.iter() {
                 let last_update = pool.last_update.load(Ordering::Relaxed);
@@ -2252,8 +1428,7 @@ impl DarkPoolIntegration {
     }
 
     pub async fn get_pool_stats(&self) -> HashMap<String, serde_json::Value> {
-        let pools = self.pools.read().await
-            .map_err(|e| DarkPoolError::LockError(format!("Failed to read pools: {}", e)))?;
+        let pools = self.pools.read().await;
         let mut stats = HashMap::new();
         
         for (key, pool) in pools.iter() {
@@ -2280,55 +1455,54 @@ impl DarkPoolIntegration {
     }
 
     pub async fn get_transaction_confirmation(&self, signature: &Signature) -> Result<bool, DarkPoolError> {
-        let mut retries = 0;
-        let max_retries = 30;
-        
-        while retries < max_retries {
+        let start = SystemTime::now();
+        let max_wait_ms: u64 = 9_000; // tighter
+        let mut step: u64 = 32;
+
+        loop {
             match self.rpc_client.get_signature_status(signature).await {
-                Ok(Some(status)) => {
-                    return match status {
-                        Ok(_) => Ok(true),
-                        Err(e) => {
-                            error!("Transaction failed: {:?}", e);
-                            Ok(false)
-                        }
-                    };
-                }
-                Ok(None) => {
-                    retries += 1;
-                    sleep(Duration::from_millis(500)).await;
-                }
-                Err(e) => {
-                    if retries >= max_retries - 1 {
-                        return Err(DarkPoolError::RpcError(format!("Failed to get signature status: {}", e)));
-                    }
-                    retries += 1;
-                    sleep(Duration::from_millis(500)).await;
-                }
+                Ok(Some(status)) => return Ok(status.is_ok()),
+                Ok(None) => {}
+                Err(_e) => {} // transient; fall through
             }
+            let elapsed = SystemTime::now().duration_since(start).unwrap_or_default().as_millis() as u64;
+            if elapsed >= max_wait_ms { return Ok(false); }
+            sleep(Duration::from_millis(step)).await;
+            step = (step.saturating_mul(2)).min(512);
         }
-        
-        Err(DarkPoolError::OrderTimeout)
     }
 
     pub async fn estimate_gas_for_route(&self, route: &Route) -> Result<u64, DarkPoolError> {
-        let base_gas = 5000;
-        let per_instruction_gas = 200_000;
-        let per_account_gas = 10_000;
-        
-        let instruction_count = match route.path.len() {
-            1 => 3,
-            2 => 5,
-            _ => route.path.len() * 2 + 1,
-        };
-        
-        let account_count = route.path.len() * 8;
-        
-        let estimated_gas = base_gas + 
-            (instruction_count as u64 * per_instruction_gas) + 
-            (account_count as u64 * per_account_gas);
-        
-        Ok((estimated_gas * 120) / 100)
+        // per-protocol baseline CUs (empirical ballparks before simulate)
+        const CU_CB_BASE: u64 = 30_000;   // compute budget overhead (limit+price)
+        const CU_IX_BASE: u64 = 12_000;   // per non-CB instruction overhead
+        const CU_ACCT:   u64 =  1_000;    // per account touch (avg)
+
+        fn proto_cu(p: &Protocol) -> (u64, usize) {
+            match p {
+                Protocol::Phoenix   => (90_000, 6),  // market touch + user ATAs
+                Protocol::Whirlpool => (120_000, 8), // sqrt math + tick arrays
+                Protocol::Serum     => (160_000, 12),// event/bid/ask/vaults
+                Protocol::Raydium   => (140_000, 12),
+            }
+        }
+
+        let mut cu: u64 = CU_CB_BASE;
+        let mut ix_count: usize = 0;
+        let mut acct_count: usize = 2; // payer + token program (typical)
+
+        for hop in &route.path {
+            let (hop_cu, hop_accts) = proto_cu(&hop.protocol);
+            cu = cu.saturating_add(hop_cu);
+            ix_count += 1;
+            acct_count += hop_accts;
+        }
+
+        cu = cu.saturating_add((ix_count as u64) * CU_IX_BASE)
+             .saturating_add((acct_count as u64) * CU_ACCT);
+
+        // pad 15% before simulate auto-tune catches exact usage
+        Ok((cu.saturating_mul(115)).saturating_div(100))
     }
 
     pub async fn warm_up_pools(&self) -> Result<(), DarkPoolError> {
@@ -2354,8 +1528,310 @@ impl DarkPoolIntegration {
         Ok(())
     }
 
+    async fn refresh_batch_phoenix(&self, items: &[Arc<PoolInfo>]) -> Result<(), DarkPoolError> {
+        if items.is_empty() { return Ok(()); }
+        let keys: Vec<Pubkey> = items.iter().map(|p| p.address).collect();
+        let accs = self.rpc_client.get_multiple_accounts(&keys).await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        for (i, opt) in accs.into_iter().enumerate() {
+            if let Some(acc) = opt {
+                if acc.data.len() >= 80 {
+                    // base @64..72, quote @72..80
+                    let base = u64::from_le_bytes(*array_ref![acc.data, 64, 8]);
+                    let quote = u64::from_le_bytes(*array_ref![acc.data, 72, 8]);
+                    items[i].base_reserve.store(base, Ordering::Relaxed);
+                    items[i].quote_reserve.store(quote, Ordering::Relaxed);
+                    items[i].last_update.store(now, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_batch_whirlpool(&self, items: &[Arc<PoolInfo>]) -> Result<(), DarkPoolError> {
+        if items.is_empty() { return Ok(()); }
+        let keys: Vec<Pubkey> = items.iter().map(|p| p.address).collect();
+        let accs = self.rpc_client.get_multiple_accounts(&keys).await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        for (i, opt) in accs.into_iter().enumerate() {
+            if let Some(acc) = opt {
+                if acc.data.len() >= 168 {
+                    // liquidity @136..152 (u128), sqrt_price @152..168 (u128)
+                    let liq = u128::from_le_bytes(*array_ref![acc.data, 136, 16]);
+                    let sqrt_p = u128::from_le_bytes(*array_ref![acc.data, 152, 16]).max(1);
+                    // approx reserves in ticks-wide pool
+                    let base = ((liq << 64) / sqrt_p).min(u128::from(u64::MAX)) as u64;
+                    let quote = ((liq * sqrt_p) >> 64).min(u128::from(u64::MAX)) as u64;
+
+                    items[i].base_reserve.store(base, Ordering::Relaxed);
+                    items[i].quote_reserve.store(quote, Ordering::Relaxed);
+                    items[i].last_update.store(now, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_batch_serum(&self, items: &[Arc<PoolInfo>]) -> Result<(), DarkPoolError> {
+        if items.is_empty() { return Ok(()); }
+        // Phase 1: get market accounts
+        let mkeys: Vec<Pubkey> = items.iter().map(|p| p.address).collect();
+        let markets = self.rpc_client.get_multiple_accounts(&mkeys).await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+
+        // Gather vault pubkeys
+        let mut coin_vaults: Vec<Pubkey> = Vec::with_capacity(items.len());
+        let mut pc_vaults:   Vec<Pubkey> = Vec::with_capacity(items.len());
+        let mut idx_map:     Vec<usize>  = Vec::with_capacity(items.len());
+
+        for (i, opt) in markets.iter().enumerate() {
+            if let Some(acc) = opt {
+                if acc.data.len() >= 128 {
+                    let coin = Pubkey::new_from_array(*array_ref![acc.data, 64, 32]);
+                    let pc   = Pubkey::new_from_array(*array_ref![acc.data, 96, 32]);
+                    coin_vaults.push(coin);
+                    pc_vaults.push(pc);
+                    idx_map.push(i);
+                }
+            }
+        }
+        // Phase 2: fetch both vault token accounts in bulk
+        let mut all_vaults = coin_vaults.clone();
+        all_vaults.extend(pc_vaults.iter().cloned());
+        if all_vaults.is_empty() { return Ok(()); }
+
+        let vaccts = self.rpc_client.get_multiple_accounts(&all_vaults).await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        for (j, &i_pool) in idx_map.iter().enumerate() {
+            // coin at j, pc at j + coin_vaults.len()
+            let coin_opt = &vaccts[j];
+            let pc_opt   = &vaccts[j + coin_vaults.len()];
+            if let (Some(coin), Some(pc)) = (coin_opt, pc_opt) {
+                if coin.data.len() >= 72 && pc.data.len() >= 72 {
+                    let base = u64::from_le_bytes(*array_ref![coin.data, 64, 8]);
+                    let quote= u64::from_le_bytes(*array_ref![pc.data,  64, 8]);
+                    items[i_pool].base_reserve.store(base, Ordering::Relaxed);
+                    items[i_pool].quote_reserve.store(quote, Ordering::Relaxed);
+                    items[i_pool].last_update.store(now, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_batch_raydium(&self, items: &[Arc<PoolInfo>]) -> Result<(), DarkPoolError> {
+        if items.is_empty() { return Ok(()); }
+        // Phase 1: fetch AMM accounts to discover pool token accounts
+        let akeys: Vec<Pubkey> = items.iter().map(|p| p.address).collect();
+        let amms = self.rpc_client.get_multiple_accounts(&akeys).await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+
+        let mut coin_tas: Vec<Pubkey> = Vec::with_capacity(items.len());
+        let mut pc_tas:   Vec<Pubkey> = Vec::with_capacity(items.len());
+        let mut idx_map:  Vec<usize>  = Vec::with_capacity(items.len());
+
+        for (i, opt) in amms.iter().enumerate() {
+            if let Some(acc) = opt {
+                if acc.data.len() >= 168 {
+                    // pool coin @104..136, pool pc @136..168
+                    let coin_ta = Pubkey::new_from_array(*array_ref![acc.data, 104, 32]);
+                    let pc_ta   = Pubkey::new_from_array(*array_ref![acc.data, 136, 32]);
+                    coin_tas.push(coin_ta);
+                    pc_tas.push(pc_ta);
+                    idx_map.push(i);
+                }
+            }
+        }
+        if coin_tas.is_empty() { return Ok(()); }
+
+        // Phase 2: fetch token accounts in bulk
+        let mut all_tas = coin_tas.clone();
+        all_tas.extend(pc_tas.iter().cloned());
+        let taccs = self.rpc_client.get_multiple_accounts(&all_tas).await
+            .map_err(|e| DarkPoolError::RpcError(e.to_string()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        for (j, &i_pool) in idx_map.iter().enumerate() {
+            let coin_opt = &taccs[j];
+            let pc_opt   = &taccs[j + coin_tas.len()];
+            if let (Some(coin), Some(pc)) = (coin_opt, pc_opt) {
+                if coin.data.len() >= 72 && pc.data.len() >= 72 {
+                    let base = u64::from_le_bytes(*array_ref![coin.data, 64, 8]);
+                    let quote= u64::from_le_bytes(*array_ref![pc.data,  64, 8]);
+                    items[i_pool].base_reserve.store(base, Ordering::Relaxed);
+                    items[i_pool].quote_reserve.store(quote, Ordering::Relaxed);
+                    items[i_pool].last_update.store(now, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    async fn ensure_route_fresh(&self, route: &Route) -> Result<(), DarkPoolError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut refreshed = 0usize;
+
+        for hop in &route.path {
+            let key = format!("{}:{:?}", hop.address, hop.protocol);
+            if let Some(pi) = self.pools.read().await.get(&key).cloned() {
+                let last = pi.last_update.load(Ordering::Relaxed);
+                if now.saturating_sub(last) > 60 {
+                    // refresh a stale hop only
+                    self.refresh_pool_reserves(pi.clone()).await?;
+                    refreshed += 1;
+                }
+            }
+        }
+        if refreshed > 0 { debug!("Refreshed {} stale hop(s) before execution", refreshed); }
+        Ok(())
+    }
+
+    fn build_with_compute_budget(&self, route_ixs: &[Instruction], cu_limit: u32, cu_price: u64) -> Vec<Instruction> {
+        let mut v = Vec::with_capacity(route_ixs.len() + 2);
+        v.push(ComputeBudgetInstruction::set_compute_unit_limit(cu_limit));
+        v.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price));
+        v.extend_from_slice(route_ixs);
+        v
+    }
+
+    fn clamp_cu(&self, cu: u32) -> u32 {
+        // Cluster hard cap ~1.4M. Keep sub-ceiling.
+        cu.min(1_400_000).max(50_000)
+    }
+
+    async fn adaptive_cu_price(&self) -> u64 {
+        // Base from config; add tiny bump if breaker shows pressure.
+        let cfg = self.config.read().await;
+        let base = cfg.priority_fee_lamports as u64;
+        // If failure_count is elevated, nudge fee slightly.
+        let fc = self.circuit_breaker.failure_count.load(Ordering::Relaxed);
+        if fc >= 3 { base.saturating_add(75) } else { base }
+    }
+
+    fn small_jitter_ms(&self, range: u64) -> u64 {
+        // Dependency-free jitter
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64;
+        let mix = nanos ^ (nanos << 13) ^ (nanos >> 7) ^ (nanos << 17);
+        let r = if range == 0 { 1 } else { range };
+        mix % r
+    }
+
+    async fn ensure_ata_if_needed(
+        &self,
+        owner: &Pubkey,
+        mint: &Pubkey,
+    ) -> Result<Vec<Instruction>, DarkPoolError> {
+        let ata = get_associated_token_address(owner, mint);
+        // if account exists, no-op; else create
+        match self.rpc_client.get_account(&ata).await {
+            Ok(_acc) => Ok(vec![]),
+            Err(_) => {
+                let ix = create_associated_token_account(
+                    &self.wallet.pubkey(), // payer
+                    owner,
+                    mint,
+                    &spl_token::id(),
+                );
+                Ok(vec![ix])
+            }
+        }
+    }
+
+    async fn score_route_ev(&self, order: &Order, route: &Route) -> Result<(u64, u64), DarkPoolError> {
+        // Base from route (micro quote/base)
+        let base_micro = route.estimated_price.max(1);
+        let gas_cu = self.estimate_gas_for_route(route).await.unwrap_or(300_000);
+
+        // Gas penalty → micro units
+        let cu_price = {
+            let cfg = self.config.read().await;
+            cfg.priority_fee_lamports as u64
+        } as u128;
+        let amt = order.amount.max(1) as u128;
+        let gas_cost_lamports = (gas_cu as u128) * cu_price;
+        let gas_penalty_micro = ((gas_cost_lamports * 1_000_000u128) / amt) as u64;
+
+        // Staleness & reliability penalties across hops
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut stale_bps_total: u64 = 0;
+        let mut unreliable_bps_total: u64 = 0;
+
+        for hop in &route.path {
+            let key = format!("{}:{:?}", hop.address, hop.protocol);
+            if let Some(pi) = self.pools.read().await.get(&key) {
+                // Staleness (after 30s, 0.5 bps per extra second, cap 50 bps)
+                let age = now.saturating_sub(pi.last_update.load(Ordering::Relaxed));
+                let stale_bps = if age <= 30 { 0 } else { ((age - 30) / 2).min(50) } as u64;
+                stale_bps_total = stale_bps_total.saturating_add(stale_bps);
+
+                // Reliability (up to 50 bps penalty when success rate low)
+                let succ = pi.success_count.load(Ordering::Relaxed);
+                let fail = pi.failure_count.load(Ordering::Relaxed);
+                let total = succ + fail;
+                let sr_q = if total == 0 { 7000u64 } else { (succ.saturating_mul(10_000) / total.max(1)) }; // default 70% if empty
+                let unreliability_bps = ((10_000u64 - sr_q) as u128 * 50u128 / 10_000u128) as u64;
+                unreliable_bps_total = unreliable_bps_total.saturating_add(unreliability_bps);
+            }
+        }
+
+        let hops = route.path.len().max(1) as u64;
+        let avg_stale_bps = stale_bps_total / hops;
+        let avg_unreliable_bps = unreliable_bps_total / hops;
+
+        // Convert bps → micro penalty on base price
+        let stale_penalty_micro = (base_micro as u128 * (avg_stale_bps as u128) / 10_000u128) as u64;
+        let reliab_penalty_micro = (base_micro as u128 * (avg_unreliable_bps as u128) / 10_000u128) as u64;
+
+        let mut ev = base_micro;
+        // Gas: worse for both sides (buy pays more, sell receives less)
+        ev = match order.side {
+            OrderSide::Buy  => ev.saturating_add(gas_penalty_micro),
+            OrderSide::Sell => ev.saturating_sub(gas_penalty_micro),
+        };
+        // Staleness & reliability: always worsen price
+        let total_pen = stale_penalty_micro.saturating_add(reliab_penalty_micro);
+        ev = match order.side {
+            OrderSide::Buy  => ev.saturating_add(total_pen),
+            OrderSide::Sell => ev.saturating_sub(total_pen),
+        };
+
+        Ok((ev, gas_cu))
+    }
+
+    fn classify_exec_error(&self, msg: &str) -> &'static str {
+        let m = msg.to_ascii_lowercase();
+        // Slippage / price / liquidity
+        if m.contains("slippage") || m.contains("too little received") || m.contains("insufficient output amount")
+            || m.contains("insufficient liquidity") || m.contains("no liquidity") {
+            return "route_bad_price";
+        }
+        // Structural conflicts
+        if m.contains("accountinuse") || m.contains("would block") || m.contains("locks held") {
+            return "contention";
+        }
+        // Blockhash / freshness issues
+        if m.contains("blockhashnotfound") || m.contains("blockhash not found") {
+            return "blockhash";
+        }
+        // Compute budget busts
+        if m.contains("computebudget") || m.contains("computelimit") || m.contains("exceeded maximum number of instructions") {
+            return "under_cu";
+        }
+        // Token account missing / owner mismatch
+        if m.contains("owner mismatch") || m.contains("account not initialized") || m.contains("no such account") {
+            return "account_setup";
+        }
+        "other"
     }
 }
 
@@ -2409,10 +1885,7 @@ impl CircuitBreaker {
             return false;
         }
         
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let last_failure = self.last_failure_time.load(Ordering::Relaxed);
         
         if now - last_failure > 60 {
@@ -2436,16 +1909,10 @@ impl CircuitBreaker {
         
         if count >= 5 {
             self.is_open.store(true, Ordering::Relaxed);
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| {
-                    error!("SystemTime error in circuit breaker: {}", e);
-                    return;
-                })
-                .unwrap_or_else(|_| Duration::from_secs(0))
-                .as_secs();
-            
-            self.last_failure_time.store(now, Ordering::Relaxed);
+            self.last_failure_time.store(
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                Ordering::Relaxed,
+            );
         }
     }
 }
@@ -2531,7 +1998,7 @@ mod tests {
             limit_price: None,
             max_slippage_bps: 100,
             expires_at: None,
-            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         };
         
         let id1 = integration.generate_order_id(&order);
@@ -2603,7 +2070,7 @@ mod tests {
             limit_price: None,
             max_slippage_bps: 100,
             expires_at: None,
-            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         };
         
         assert!(integration.matches_order(&pool_info, &order));
