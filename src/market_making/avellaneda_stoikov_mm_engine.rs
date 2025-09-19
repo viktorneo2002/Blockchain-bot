@@ -1,611 +1,296 @@
-//! Avellaneda-Stoikov Market Making Engine
-//! 
-//! Production-ready implementation of the Avellaneda-Stoikov (2008) market making model
-//! with robust risk management, proper P&L accounting, and mainnet-grade reliability.
-
-use rust_decimal::prelude::*;
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use anchor_lang::prelude::*;
+use pyth_sdk_solana::Price;
+use solana_program::clock::Clock;
+use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
 
-// ===== Configuration Constants =====
-
-/// Maximum price history points to maintain
 const MAX_PRICE_HISTORY: usize = 1000;
-
-/// Window size for volatility estimation
 const VOLATILITY_WINDOW: usize = 100;
+const GAMMA_DEFAULT: f64 = 0.1;
+const KAPPA_DEFAULT: f64 = 1.5;
+const ETA_DEFAULT: f64 = 0.01;
+const MIN_SPREAD_BPS: f64 = 5.0;
+const MAX_SPREAD_BPS: f64 = 200.0;
+const INVENTORY_TARGET: f64 = 0.0;
+const MAX_INVENTORY_RATIO: f64 = 0.8;
+const TICK_SIZE: f64 = 0.00001;
+const LOT_SIZE: f64 = 0.01;
+const VOLATILITY_DECAY: f64 = 0.94;
+const PRICE_IMPACT_COEFFICIENT: f64 = 0.0001;
+const MIN_ORDER_SIZE: f64 = 0.1;
+const MAX_ORDER_SIZE: f64 = 1000.0;
+const RISK_AVERSION_MULTIPLIER: f64 = 2.0;
+const TIME_HORIZON: f64 = 86400.0;
+const VOLATILITY_FLOOR: f64 = 0.0001;
+const VOLATILITY_CEILING: f64 = 0.5;
+const SPREAD_BUFFER: f64 = 1.0001;
+const INVENTORY_SKEW_FACTOR: f64 = 0.5;
+const MAKER_FEE_BPS: f64 = -2.0;
+const TAKER_FEE_BPS: f64 = 5.0;
+const MIN_PROFIT_BPS: f64 = 3.0;
+const ORACLE_CONFIDENCE_THRESHOLD: f64 = 0.02;
+const MAX_PRICE_DEVIATION: f64 = 0.05;
+const EWMA_ALPHA: f64 = 0.1;
+const MICROSTRUCTURE_NOISE: f64 = 0.0001;
 
-/// Default risk aversion parameter (γ)
-const GAMMA_DEFAULT: Decimal = Decimal::from_parts(1, 0, 0, false, 1); // 0.1
+// ===== Elite desk signal/control constants =====
+const TOXICITY_EWMA_ALPHA: f64 = 0.20;           // speed of adverse selection score
+const TOXICITY_HALT_THRESHOLD: f64 = 0.85;       // if reached -> sizes collapse this cycle
+const TOXICITY_WIDEN_BPS: f64 = 30.0;            // max extra spread (bps) at toxicity=1
 
-/// Default order arrival intensity decay parameter (κ)
-const KAPPA_DEFAULT: Decimal = Decimal::from_parts(15, 0, 0, false, 1); // 1.5
+const SLOT_RISK_WIDEN_BPS: f64 = 40.0;           // extra spread (bps) at slot_risk=1
+const SLOT_RISK_SIZE_CUT: f64 = 0.60;            // size reduction at slot_risk=1
 
-/// Default adverse selection parameter (η)
-const ETA_DEFAULT: Decimal = Decimal::from_parts(1, 0, 0, false, 2); // 0.01
+const CONF_WIDEN_MULT: f64 = 2.5;                // spread multiplier vs confidence proximity
+const QUOTE_MIN_CHANGE_TICKS: i64 = 2;           // suppress micro flicker below this step
+const MIN_TOUCH_TICKS: i64 = 1;                  // never cross tighter than 1 tick when equal
 
-/// Minimum spread in basis points
-const MIN_SPREAD_BPS: Decimal = Decimal::from_parts(5, 0, 0, false, 0); // 5.0
+const ALPHA_EWMA: f64 = 0.20;                    // speed of micro-alpha EWMA
+const ALPHA_SKEW_BPS_MAX: f64 = 20.0;            // cap reservation-price skew (bps)
+const MOMENTUM_WINDOW_SHORT: usize = 12;         // short window for sign-consistent drift
 
-/// Maximum spread in basis points
-const MAX_SPREAD_BPS: Decimal = Decimal::from_parts(200, 0, 0, false, 0); // 200.0
+// ===== Advanced edges =====
+const MARKOUT_HORIZON_SECS: i64 = 2;            // horizon for post-fill markout toxicity (seconds)
+const ORACLE_BAND_MULT: f64 = 1.0;              // clamp quotes inside ±(mult * confidence)
+const QUOTE_MIN_TIME_SECS: i64 = 0;             // min secs between re-quotes (engine-level; 0 = off)
 
-/// Target inventory level (neutral position)
-const INVENTORY_TARGET: Decimal = Decimal::ZERO;
+const GAMMA_TOX_WEIGHT: f64 = 1.2;              // gamma boost per unit toxicity
+const GAMMA_VOL_WEIGHT: f64 = 0.8;              // gamma boost per normalized vol
+const GAMMA_DD_WEIGHT: f64 = 0.8;               // gamma boost per drawdown ratio
+const KAPPA_TOX_WEIGHT: f64 = 0.7;              // kappa reduction per toxicity
+const KAPPA_VOL_WEIGHT: f64 = 0.5;              // kappa reduction per normalized vol
 
-/// Maximum inventory ratio before emergency measures
-const MAX_INVENTORY_RATIO: Decimal = Decimal::from_parts(8, 0, 0, false, 1); // 0.8
+// ===== Cross-pool / venue / aging edges =====
+const NETTING_AGGR_WEIGHT: f64 = 0.70;           // weight on external pools in net inventory
+const NETTING_MAX_ABS_RATIO: f64 = 1.50;         // clamp |net_inv| <= 1.5 * max_inventory
 
-/// Volatility floor (minimum volatility)
-const VOLATILITY_FLOOR: Decimal = Decimal::from_parts(1, 0, 0, false, 4); // 0.0001
+const VENUE_SKEW_BPS_MAX: f64 = 15.0;            // per-venue skew cap (bps) vs core quote
+const VENUE_SIZE_SCALE_MIN: f64 = 0.20;          // minimum size scale per venue
+const VENUE_SIZE_SCALE_MAX: f64 = 1.50;          // maximum size scale per venue
 
-/// Volatility ceiling (maximum volatility)
-const VOLATILITY_CEILING: Decimal = Decimal::from_parts(5, 0, 0, false, 1); // 0.5
+const AGING_WIDEN_BPS_PER_SEC: f64 = 6.0;        // widen per second of stale quote
+const AGING_WIDEN_BPS_CAP: f64 = 60.0;           // max aging widen
 
-/// Maker fee in basis points (negative = rebate)
-const MAKER_FEE_BPS: Decimal = Decimal::from_parts(2, 0, 0, true, 0); // -2.0
+// ===== Intent buckets / venue learning / cancel governor =====
+const INTENT_BUCKETS: usize = 5;                 // number of EV buckets for signed markouts
+const INTENT_ALPHA: f64 = 0.15;                  // EWMA speed for bucket counts
+const INTENT_WIDEN_BPS_MAX: f64 = 25.0;          // extra widen at most hostile intent
 
-/// Taker fee in basis points
-const TAKER_FEE_BPS: Decimal = Decimal::from_parts(5, 0, 0, false, 0); // 5.0
+const VENUE_TOX_ALPHA: f64 = 0.15;               // EWMA for venue-level toxicity
+const VENUE_TOX_CAP: f64 = 0.90;                 // cap venue toxicity
+const VENUE_SLIP_ALPHA: f64 = 0.20;              // EWMA for venue slippage (bps)
+const VENUE_SLIP_CAP_BPS: f64 = 50.0;            // cap for slippage estimate
 
-/// Minimum profit requirement in basis points
-const MIN_PROFIT_BPS: Decimal = Decimal::from_parts(3, 0, 0, false, 0); // 3.0
+const FLOW_TOX_WEIGHT_GAMMA: f64 = 0.50;         // additional gamma amplification by hostile flow
+const FLOW_TOX_WEIGHT_KAPPA: f64 = 0.35;         // additional kappa reduction by hostile flow
 
-/// Maximum relative oracle confidence (price uncertainty)
-const MAX_ORACLE_CONFIDENCE_RATIO: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
+const CANCEL_RATE_MAX_PER_SEC: f64 = 30.0;       // tokens/second
+const CANCEL_BURST_MAX: f64 = 60.0;              // token bucket capacity
+const CANCELS_PER_QUOTE_CHANGE: f64 = 2.0;       // assume 2 cancels for bid+ask replace
 
-/// Maximum price deviation from oracle
-const MAX_PRICE_DEVIATION: Decimal = Decimal::from_parts(5, 0, 0, false, 2); // 0.05
+// ===== Queue-position shading & Jito tip optimizer =====
+const QUEUE_EWMA_ALPHA: f64 = 0.25;              // speed for L2 size/queue EWMA
+const QUEUE_POS_SKEW_TICKS_MAX: i64 = 2;         // max +/- ticks from queue position
+const QUEUE_IMB_SKEW_TICKS_MAX: i64 = 2;         // max +/- ticks from L2 imbalance
+const QUEUE_POS_FRONT_THRESH: f64 = 0.30;        // "back of queue" if < 30% ahead
+const QUEUE_POS_BACK_THRESH: f64  = 0.70;        // "front of queue" if > 70% ahead
 
-/// EWMA smoothing factor for volatility
-const EWMA_ALPHA: Decimal = Decimal::from_parts(1, 0, 0, false, 1); // 0.1
+const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+const JITO_TIP_MIN_LAMPORTS: u64 = 10_000;       // 0.00001 SOL (floor)
+const JITO_TIP_MAX_LAMPORTS: u64 = 5_000_000;    // 0.005 SOL (cap)
+const JITO_TIP_POWER: f64 = 1.30;                // convexity of tip vs urgency*EV
+const JITO_TIP_FRACTION_OF_EV: f64 = 0.08;       // tip ~ 8% of EV (tuned)
 
-/// Quote validity duration in milliseconds
-const QUOTE_VALIDITY_MS: u64 = 100;
-
-/// Maximum drawdown before halt (as fraction of max position)
-const MAX_DRAWDOWN_RATIO: Decimal = Decimal::from_parts(1, 0, 0, false, 1); // 0.1
-
-// ===== Error Types =====
-
-#[derive(Error, Debug)]
-pub enum EngineError {
-    #[error("Invalid parameter: {0}")]
-    InvalidParameter(String),
-    
-    #[error("Oracle confidence too low: {confidence} > {threshold}")]
-    LowOracleConfidence { confidence: Decimal, threshold: Decimal },
-    
-    #[error("Price deviation exceeds threshold: {deviation}")]
-    ExcessivePriceDeviation { deviation: Decimal },
-    
-    #[error("Position limit breached: {position} > {limit}")]
-    PositionLimitBreached { position: Decimal, limit: Decimal },
-    
-    #[error("Daily loss limit reached: {loss} > {limit}")]
-    DailyLossLimitReached { loss: Decimal, limit: Decimal },
-    
-    #[error("Order size below minimum: {size} < {min}")]
-    OrderSizeTooSmall { size: Decimal, min: Decimal },
-    
-    #[error("Trading halted: {reason}")]
-    TradingHalted { reason: String },
-    
-    #[error("Invalid quote: {reason}")]
-    InvalidQuote { reason: String },
-    
-    #[error("Stale quote: age {age_ms}ms > {max_ms}ms")]
-    StaleQuote { age_ms: u64, max_ms: u64 },
-    
-    #[error("Math error: {0}")]
-    MathError(String),
-}
-
-// ===== Time Source Abstraction =====
-
-/// Trait for providing timestamps (allows mocking in tests)
-pub trait TimeSource: Send + Sync {
-    /// Get current timestamp in microseconds since epoch
-    fn now_micros(&self) -> i64;
-    
-    /// Get current timestamp in milliseconds since epoch
-    fn now_millis(&self) -> i64 {
-        self.now_micros() / 1000
-    }
-}
-
-/// System time source (production)
-pub struct SystemTimeSource;
-
-impl TimeSource for SystemTimeSource {
-    fn now_micros(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    }
-}
-
-// ===== Market Configuration =====
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MarketConfig {
+#[derive(Clone, Debug)]
+pub struct ASMMEngine {
     pub symbol: String,
     pub base_decimals: u8,
     pub quote_decimals: u8,
-    pub tick_size: Decimal,
-    pub lot_size: Decimal,
-    pub min_order_size: Decimal,
-    pub max_order_size: Decimal,
-    pub maker_fee_rate: Decimal,
-    pub taker_fee_rate: Decimal,
-}
 
-impl MarketConfig {
-    pub fn round_to_tick(&self, price: Decimal) -> Decimal {
-        if self.tick_size == Decimal::ZERO {
-            return price;
-        }
-        (price / self.tick_size).round() * self.tick_size
-    }
-    
-    pub fn round_to_lot(&self, size: Decimal) -> Decimal {
-        if self.lot_size == Decimal::ZERO {
-            return size;
-        }
-        (size / self.lot_size).round() * self.lot_size
-    }
-}
+    // Avellaneda–Stoikov core params
+    pub gamma: f64,
+    pub kappa: f64,
+    pub eta: f64,
 
-// ===== Main Engine =====
+    // Baselines for dynamic tuning
+    pub gamma_base: f64,
+    pub kappa_base: f64,
 
-    pub config: MarketConfig,
-    pub gamma: Decimal,              // Risk aversion parameter
-    pub kappa: Decimal,              // Order arrival intensity decay
-    pub eta: Decimal,                // Adverse selection parameter
-    pub sigma: Decimal,              // Current volatility estimate
-    
-    // Position tracking
-    pub position: Arc<RwLock<PositionTracker>>,
-    
-    // Market data
+    // Vol estimate (annualized, bounded)
+    pub sigma: f64,
+
+    // Inventory & cost basis
+    pub inventory: f64,            // base units (+ long, - short)
+    pub inventory_vwap: f64,       // VWAP of current open position
+    pub target_inventory: f64,
+    pub max_inventory: f64,
+    pub min_inventory: f64,
+
+    // Market & state
     pub price_history: Arc<RwLock<VecDeque<PricePoint>>>,
     pub volatility_estimator: Arc<RwLock<VolatilityEstimator>>,
-    
-    // Risk management
     pub risk_manager: Arc<RwLock<RiskManager>>,
-    
-    // Time management
-    pub time_source: Arc<dyn TimeSource>,
-    pub session_start: i64,          // Session start time in micros
-    pub session_end: i64,            // Session end time in micros
-    pub last_update: i64,            // Last update time in micros
-    
-    // Pricing state
-    pub reservation_price: Decimal,
-    pub optimal_spread: Decimal,
-    pub bid_price: Decimal,
-    pub ask_price: Decimal,
-    pub mid_price: Decimal,
-    pub oracle_price: Decimal,
-    pub oracle_confidence: Decimal,
-    
-    // Order sizing
-    pub order_size_bid: Decimal,
-    pub order_size_ask: Decimal,
-    
-    // Operational state
+
+    pub last_update: i64,          // unix ts for market data
+    pub time_to_close: f64,        // horizon (secs)
+    pub reservation_price: f64,
+    pub optimal_spread: f64,
+    pub bid_price: f64,
+    pub ask_price: f64,
+    pub mid_price: f64,
+    pub oracle_price: f64,
+    pub confidence_interval: f64,
+
+    // Quoted sizes
+    pub order_size_bid: f64,
+    pub order_size_ask: f64,
+
+    // PnL & stats
+    pub realized_pnl: f64,
+    pub unrealized_pnl: f64,
+    pub total_volume: f64,
+    pub trade_count: u64,
+
     pub active: bool,
-    pub last_quote_time: i64,
-    pub metrics: Arc<RwLock<EngineMetrics>>,
+
+    // Micro performance helpers
+    pub last_quote_id: u64,        // monotonic quote tag (for routing/debug)
+
+    // ===== Elite controls (previous round) =====
+    pub slot_risk: f64,            // [0..1]
+    pub toxicity_score: f64,       // [0..1]
+    pub alpha_signal: f64,         // signed micro-alpha
+
+    // Anti-flicker memory
+    pub last_published_bid: f64,
+    pub last_published_ask: f64,
+
+    // ===== New fields =====
+    pub last_quote_ts: i64,                       // when we last finalized quotes
+    pub markouts: VecDeque<FillEvent>,            // pending fills awaiting markout horizon
+
+    // Cross-pool inventory netting
+    pub external_inventory: HashMap<String, f64>, // base qty per external pool/venue
+    pub pool_weights: HashMap<String, f64>,       // [0..1] weight per pool in netting
+
+    // Per-venue parameters (for shadow quotes)
+    pub venues: Vec<VenueParam>,
+
+    // Flow intent classifier stats (EWMA of signed markouts)
+    pub tox_pos_ewma: f64,
+    pub tox_neg_ewma: f64,
+    pub flow_classifier: f64,                      // [-1..1], >0 = hostile/toxic
+
+    // Alpha-bucketed intent model
+    pub intent_pos_buckets: [f64; INTENT_BUCKETS], // EWMA count mass for positive PnL
+    pub intent_neg_buckets: [f64; INTENT_BUCKETS], // EWMA count mass for negative PnL
+
+    // Cancel governor (token bucket)
+    pub cancel_tokens: f64,
+    pub last_cancel_refill_ts: i64,
+
+    // ===== Per-venue L2 state & submission economics =====
+    pub venue_books: HashMap<String, BookState>,  // venue -> L2/queue state
+    pub tip_ref_sol_usd: f64,                     // SOL/USD ref for tip conversion (fallback)
 }
 
-// ===== Position Tracking =====
+#[derive(Clone, Copy, Debug)]
+struct FillEvent {
+    side: OrderSide,
+    price: f64,
+    qty:   f64,
+    ts:    i64,
+}
 
 #[derive(Clone, Debug)]
-pub struct PositionTracker {
-    pub inventory: Decimal,           // Current inventory (signed)
-    pub target_inventory: Decimal,    // Target inventory level
-    pub max_inventory: Decimal,       // Maximum allowed inventory
-    pub min_inventory: Decimal,       // Minimum allowed inventory (negative)
-    
-    // Cost basis tracking
-    pub position_cost: Decimal,       // Total cost of current position
-    pub avg_entry_price: Decimal,     // Average entry price
-    
-    // P&L tracking
-    pub realized_pnl: Decimal,        // Realized P&L from closed positions
-    pub unrealized_pnl: Decimal,      // Unrealized P&L on open position
-    pub fees_paid: Decimal,           // Total fees paid
-    
-    // Volume tracking
-    pub total_buy_volume: Decimal,
-    pub total_sell_volume: Decimal,
-    pub trade_count: u64,
+pub struct VenueParam {
+    pub name: String,
+    pub maker_fee_bps: f64,    // negative for rebate
+    pub taker_fee_bps: f64,
+    pub liquidity_score: f64,  // [0..1], higher is deeper/safer
+    pub slippage_bps: f64,     // expected additional slippage (bps)
+    pub toxicity: f64,         // [0..1] venue-specific adverse selection
+    pub last_update: i64,
 }
 
-impl PositionTracker {
-    pub fn new(max_inventory: Decimal) -> Self {
-        Self {
-            inventory: Decimal::ZERO,
-            target_inventory: INVENTORY_TARGET,
-            max_inventory,
-            min_inventory: -max_inventory,
-            position_cost: Decimal::ZERO,
-            avg_entry_price: Decimal::ZERO,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
-            fees_paid: Decimal::ZERO,
-            total_buy_volume: Decimal::ZERO,
-            total_sell_volume: Decimal::ZERO,
-            trade_count: 0,
-        }
-    }
-    
-    pub fn update_position_buy(
-        &mut self,
-        quantity: Decimal,
-        price: Decimal,
-        fee: Decimal,
-    ) {
-        self.position_cost += quantity * price;
-        self.inventory += quantity;
-        self.fees_paid += fee;
-        self.total_buy_volume += quantity;
-        self.trade_count += 1;
-        
-        if self.inventory != Decimal::ZERO {
-            self.avg_entry_price = self.position_cost / self.inventory;
-        }
-    }
-    
-    pub fn update_position_sell(
-        &mut self,
-        quantity: Decimal,
-        price: Decimal,
-        fee: Decimal,
-    ) {
-        // Calculate realized P&L on this portion
-        if self.inventory > Decimal::ZERO && self.avg_entry_price > Decimal::ZERO {
-            let realized = quantity * (price - self.avg_entry_price);
-            self.realized_pnl += realized;
-        }
-        
-        // Update position
-        let remaining_ratio = (self.inventory - quantity) / self.inventory;
-        self.position_cost *= remaining_ratio;
-        self.inventory -= quantity;
-        self.fees_paid += fee;
-        self.total_sell_volume += quantity;
-        self.trade_count += 1;
-        
-        if self.inventory != Decimal::ZERO {
-            self.avg_entry_price = self.position_cost / self.inventory;
-        } else {
-            self.avg_entry_price = Decimal::ZERO;
-            self.position_cost = Decimal::ZERO;
-        }
-    }
-    
-    pub fn update_unrealized_pnl(&mut self, current_price: Decimal) {
-        if self.inventory != Decimal::ZERO && self.avg_entry_price > Decimal::ZERO {
-            self.unrealized_pnl = self.inventory * (current_price - self.avg_entry_price);
-        } else {
-            self.unrealized_pnl = Decimal::ZERO;
-        }
-    }
-    
-    pub fn total_pnl(&self) -> Decimal {
-        self.realized_pnl + self.unrealized_pnl - self.fees_paid
-    }
-    
-    pub fn inventory_ratio(&self) -> Decimal {
-        if self.max_inventory == Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        self.inventory / self.max_inventory
-    }
+#[derive(Clone, Debug)]
+pub struct VenueQuote {
+    pub venue: String,
+    pub bid_price: f64,
+    pub bid_size: f64,
+    pub ask_price: f64,
+    pub ask_size: f64,
+    pub timestamp: i64,
 }
 
-// ===== Market Data =====
+#[derive(Clone, Debug)]
+pub struct BookState {
+    pub best_bid_qty: f64,  // L2 size at best bid (base units)
+    pub best_ask_qty: f64,  // L2 size at best ask
+    pub our_bid_qty:  f64,  // our posted bid size at venue (if any)
+    pub our_ask_qty:  f64,  // our posted ask size at venue (if any)
+    pub qpos_bid_ahead_frac: f64, // EWMA fraction of queue ahead of us on bid [0..1]
+    pub qpos_ask_ahead_frac: f64, // EWMA fraction on ask [0..1]
+    pub last_update: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct JitoTipPlan {
+    pub use_bundle: bool,
+    pub tip_lamports: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct PricePoint {
-    pub timestamp: i64,      // Microseconds since epoch
-    pub price: Decimal,
-    pub volume: Decimal,
-    pub spread: Decimal,
+    pub timestamp: i64,
+    pub price: f64,
+    pub volume: f64,
+    pub spread: f64,
 }
-
-// ===== Volatility Estimation =====
 
 #[derive(Clone, Debug)]
 pub struct VolatilityEstimator {
-    pub realized_vol: Decimal,        // Realized volatility (annualized)
-    pub ewma_vol: Decimal,            // EWMA volatility estimate
-    pub returns: VecDeque<(i64, Decimal)>,  // (timestamp, log_return)
-    pub ewma_alpha: Decimal,          // EWMA smoothing factor
-}
+    // Annualized realized vol from rolling variance of log-returns
+    pub realized_vol: f64,
+    // GARCH(1,1) volatility proxy (annualized)
+    pub garch_vol: f64,
+    // EWMA volatility proxy (annualized)
+    pub ewma_vol: f64,
 
-impl VolatilityEstimator {
-    pub fn new() -> Self {
-        Self {
-            realized_vol: Decimal::from_str("0.3").unwrap(),  // 30% annualized default
-            ewma_vol: Decimal::from_str("0.3").unwrap(),
-            returns: VecDeque::with_capacity(VOLATILITY_WINDOW),
-            ewma_alpha: EWMA_ALPHA,
-        }
-    }
-    
-    pub fn update(&mut self, timestamp: i64, price: Decimal, prev_price: Decimal) {
-        if price <= Decimal::ZERO || prev_price <= Decimal::ZERO {
-            return;
-        }
-        
-        // Calculate log return
-        let price_f64 = price.to_f64().unwrap_or(0.0);
-        let prev_f64 = prev_price.to_f64().unwrap_or(1.0);
-        let log_return = (price_f64 / prev_f64).ln();
-        let log_return_dec = Decimal::from_f64(log_return).unwrap_or(Decimal::ZERO);
-        
-        // Add to returns history
-        self.returns.push_back((timestamp, log_return_dec));
-        if self.returns.len() > VOLATILITY_WINDOW {
-            self.returns.pop_front();
-        }
-        
-        // Update EWMA volatility
-        let abs_return = log_return_dec.abs();
-        self.ewma_vol = self.ewma_alpha * abs_return + 
-                        (Decimal::ONE - self.ewma_alpha) * self.ewma_vol;
-        
-        // Calculate realized volatility if we have enough data
-        if self.returns.len() >= 20 {
-            self.calculate_realized_volatility();
-        }
-        
-        // Apply bounds
-        self.realized_vol = self.realized_vol.max(VOLATILITY_FLOOR).min(VOLATILITY_CEILING);
-        self.ewma_vol = self.ewma_vol.max(VOLATILITY_FLOOR).min(VOLATILITY_CEILING);
-    }
-    
-    fn calculate_realized_volatility(&mut self) {
-        if self.returns.len() < 2 {
-            return;
-        }
-        
-        // Calculate time-weighted variance
-        let returns_vec: Vec<Decimal> = self.returns.iter().map(|(_, r)| *r).collect();
-        let mean = returns_vec.iter().sum::<Decimal>() / Decimal::from(returns_vec.len());
-        
-        let variance = returns_vec.iter()
-            .map(|r| (*r - mean) * (*r - mean))
-            .sum::<Decimal>() / Decimal::from(returns_vec.len() - 1);
-        
-        // Get time span in days
-        if let (Some(first), Some(last)) = (self.returns.front(), self.returns.back()) {
-            let time_span_micros = last.0 - first.0;
-            let time_span_days = Decimal::from(time_span_micros) / 
-                                 Decimal::from(86_400_000_000i64);  // micros per day
-            
-            if time_span_days > Decimal::ZERO {
-                // Annualize (assuming 365 days)
-                let samples_per_year = Decimal::from(365) * Decimal::from(self.returns.len()) / time_span_days;
-                let variance_f64 = variance.to_f64().unwrap_or(0.0);
-                let samples_f64 = samples_per_year.to_f64().unwrap_or(365.0);
-                let annualized_vol = (variance_f64 * samples_f64).sqrt();
-                self.realized_vol = Decimal::from_f64(annualized_vol).unwrap_or(self.realized_vol);
-            }
-        }
-    }
-    
-    pub fn get_current_volatility(&self) -> Decimal {
-        // Weighted average of realized and EWMA
-        Decimal::from_str("0.7").unwrap() * self.realized_vol + 
-        Decimal::from_str("0.3").unwrap() * self.ewma_vol
-    }
-}
+    // State
+    pub returns: VecDeque<f64>,          // log-returns (most recent at back)
+    pub squared_returns: VecDeque<f64>,  // squared log-returns
 
-// ===== Risk Management =====
+    // GARCH params (kept stable <1.0 persistence)
+    pub alpha: f64,
+    pub beta:  f64,
+    pub omega: f64,
+
+    // Extra robust stats
+    pub ewma_r2: f64,        // EWMA of r^2 (for quick sigma proxy)
+    pub last_return: f64,    // last observed log-return
+}
 
 #[derive(Clone, Debug)]
 pub struct RiskManager {
-    pub max_position_value: Decimal,     // Maximum position value in quote
-    pub max_order_size: Decimal,         // Maximum order size
-    pub daily_loss_limit: Decimal,       // Daily loss limit
-    pub current_daily_pnl: Decimal,      // Current daily P&L
-    pub session_start_pnl: Decimal,      // P&L at session start
-    pub max_drawdown: Decimal,           // Maximum drawdown allowed
-    pub peak_pnl: Decimal,               // Peak P&L for drawdown calculation
-    
-    // Risk state
+    pub max_position_size: f64,
+    pub max_order_size: f64,
+    pub daily_loss_limit: f64,
+    pub current_daily_pnl: f64,
     pub position_limits_breached: bool,
     pub trading_halted: bool,
-    pub halt_reason: String,
     pub last_risk_check: i64,
-    
-    // Rate limiting
-    pub loss_window: VecDeque<(i64, Decimal)>,  // (timestamp, loss)
-    pub max_loss_per_minute: Decimal,
 }
-
-impl RiskManager {
-    pub fn new(max_position_value: Decimal) -> Self {
-        Self {
-            max_position_value,
-            max_order_size: max_position_value * Decimal::from_str("0.1").unwrap(),
-            daily_loss_limit: max_position_value * Decimal::from_str("0.02").unwrap(),
-            current_daily_pnl: Decimal::ZERO,
-            session_start_pnl: Decimal::ZERO,
-            max_drawdown: max_position_value * MAX_DRAWDOWN_RATIO,
-            peak_pnl: Decimal::ZERO,
-            position_limits_breached: false,
-            trading_halted: false,
-            halt_reason: String::new(),
-            last_risk_check: 0,
-            loss_window: VecDeque::new(),
-            max_loss_per_minute: max_position_value * Decimal::from_str("0.005").unwrap(),
-        }
-    }
-    
-    pub fn check_risk_limits(
-        &mut self,
-        position: &PositionTracker,
-        current_price: Decimal,
-        timestamp: i64,
-    ) -> Result<(), EngineError> {
-        self.last_risk_check = timestamp;
-        
-        // Update daily P&L
-        self.current_daily_pnl = position.total_pnl() - self.session_start_pnl;
-        
-        // Check daily loss limit
-        if self.current_daily_pnl < -self.daily_loss_limit {
-            self.trading_halted = true;
-            self.halt_reason = "Daily loss limit breached".to_string();
-            return Err(EngineError::DailyLossLimitReached {
-                loss: -self.current_daily_pnl,
-                limit: self.daily_loss_limit,
-            });
-        }
-        
-        // Check position limits
-        let position_value = position.inventory.abs() * current_price;
-        if position_value > self.max_position_value {
-            self.position_limits_breached = true;
-            return Err(EngineError::PositionLimitBreached {
-                position: position_value,
-                limit: self.max_position_value,
-            });
-        } else {
-            self.position_limits_breached = false;
-        }
-        
-        // Check drawdown
-        let current_pnl = position.total_pnl();
-        if current_pnl > self.peak_pnl {
-            self.peak_pnl = current_pnl;
-        }
-        let drawdown = self.peak_pnl - current_pnl;
-        if drawdown > self.max_drawdown {
-            self.trading_halted = true;
-            self.halt_reason = format!("Maximum drawdown exceeded: {}", drawdown);
-            return Err(EngineError::TradingHalted {
-                reason: self.halt_reason.clone(),
-            });
-        }
-        
-        // Check rate of loss
-        self.update_loss_window(timestamp, current_pnl);
-        if self.is_losing_too_fast() {
-            self.trading_halted = true;
-            self.halt_reason = "Losing too quickly".to_string();
-            return Err(EngineError::TradingHalted {
-                reason: self.halt_reason.clone(),
-            });
-        }
-        
-        Ok(())
-    }
-    
-    fn update_loss_window(&mut self, timestamp: i64, current_pnl: Decimal) {
-        // Add current P&L to window
-        self.loss_window.push_back((timestamp, current_pnl));
-        
-        // Remove old entries (older than 1 minute)
-        let cutoff = timestamp - 60_000_000;  // 60 seconds in microseconds
-        while let Some((t, _)) = self.loss_window.front() {
-            if *t < cutoff {
-                self.loss_window.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-    
-    fn is_losing_too_fast(&self) -> bool {
-        if self.loss_window.len() < 2 {
-            return false;
-        }
-        
-        if let (Some((_, start_pnl)), Some((_, end_pnl))) = 
-            (self.loss_window.front(), self.loss_window.back()) {
-            let loss = end_pnl - start_pnl;
-            return loss < -self.max_loss_per_minute;
-        }
-        
-        false
-    }
-    
-    pub fn reset_daily_metrics(&mut self, current_pnl: Decimal) {
-        self.session_start_pnl = current_pnl;
-        self.current_daily_pnl = Decimal::ZERO;
-        self.peak_pnl = current_pnl;
-        self.trading_halted = false;
-        self.halt_reason.clear();
-    }
-}
-
-// ===== Engine Metrics =====
-
-#[derive(Clone, Debug, Default)]
-pub struct EngineMetrics {
-    pub quotes_generated: u64,
-    pub orders_placed: u64,
-    pub orders_filled: u64,
-    pub orders_cancelled: u64,
-    pub bid_fills: u64,
-    pub ask_fills: u64,
-    pub total_volume: Decimal,
-    pub avg_spread_bps: Decimal,
-    pub time_at_target_inventory: u64,
-    pub max_inventory_reached: Decimal,
-    pub min_inventory_reached: Decimal,
-}
-
-// ===== Quote Generation =====
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Quote {
-    pub bid_price: Decimal,
-    pub bid_size: Decimal,
-    pub ask_price: Decimal,
-    pub ask_size: Decimal,
-    pub mid_price: Decimal,
-    pub spread_bps: Decimal,
-    pub timestamp: i64,
-    pub valid_until: i64,
-}
-
-impl Quote {
-    pub fn is_valid(&self, current_time: i64) -> bool {
-        current_time <= self.valid_until && 
-        self.bid_price > Decimal::ZERO &&
-        self.ask_price > self.bid_price &&
-        self.bid_size > Decimal::ZERO &&
-        self.ask_size > Decimal::ZERO
-    }
-}
-
-// ===== Engine Implementation =====
 
 impl ASMMEngine {
     pub fn new(
-        config: MarketConfig,
-        max_position_value: Decimal,
-        time_source: Arc<dyn TimeSource>,
-        session_duration_hours: i64,
+        symbol: String,
+        base_decimals: u8,
+        quote_decimals: u8,
+        max_inventory: f64,
     ) -> Self {
-        let now = time_source.now_micros();
-        let session_end = now + (session_duration_hours * 3600 * 1_000_000);
-        
-        let max_inventory = max_position_value / Decimal::from(1000);  // Rough estimate
-        let position = Arc::new(RwLock::new(PositionTracker::new(max_inventory)));
         let volatility_estimator = Arc::new(RwLock::new(VolatilityEstimator {
             realized_vol: 0.01,
             garch_vol: 0.01,
@@ -615,722 +300,627 @@ impl ASMMEngine {
             alpha: 0.05,
             beta: 0.94,
             omega: 0.000001,
+            ewma_r2: 0.01f64.powi(2),
+            last_return: 0.0,
         }));
-        let risk_manager = Arc::new(RwLock::new(RiskManager::new(max_position_value)));
-        let metrics = Arc::new(RwLock::new(EngineMetrics::default()));
-        
+
+        let risk_manager = Arc::new(RwLock::new(RiskManager {
+            max_position_size: max_inventory,
+            max_order_size: (max_inventory * 0.1).max(MIN_ORDER_SIZE),
+            daily_loss_limit: (max_inventory * 0.02).max(10.0),
+            current_daily_pnl: 0.0,
+            position_limits_breached: false,
+            trading_halted: false,
+            last_risk_check: 0,
+        }));
+
         Self {
-            config,
+            symbol,
+            base_decimals,
+            quote_decimals,
             gamma: GAMMA_DEFAULT,
             kappa: KAPPA_DEFAULT,
             eta: ETA_DEFAULT,
-            sigma: Decimal::from_str("0.3").unwrap(),  // 30% annualized volatility default
-            position,
+
+            gamma_base: GAMMA_DEFAULT,
+            kappa_base: KAPPA_DEFAULT,
+
+            sigma: 0.01,
+
+            inventory: 0.0,
+            inventory_vwap: 0.0,
+            target_inventory: INVENTORY_TARGET,
+            max_inventory,
+            min_inventory: -max_inventory,
+
             price_history: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_PRICE_HISTORY))),
             volatility_estimator,
             risk_manager,
-            time_source,
-            session_start: now,
-            session_end,
-            last_update: now,
-            reservation_price: Decimal::ZERO,
-            optimal_spread: Decimal::ZERO,
-            bid_price: Decimal::ZERO,
-            ask_price: Decimal::ZERO,
-            mid_price: Decimal::ZERO,
-            oracle_price: Decimal::ZERO,
-            oracle_confidence: Decimal::ZERO,
-            order_size_bid: Decimal::ZERO,
-            order_size_ask: Decimal::ZERO,
+
+            last_update: 0,
+            time_to_close: TIME_HORIZON,
+            reservation_price: 0.0,
+            optimal_spread: 0.0,
+            bid_price: 0.0,
+            ask_price: 0.0,
+            mid_price: 0.0,
+            oracle_price: 0.0,
+            confidence_interval: 0.0,
+            order_size_bid: MIN_ORDER_SIZE,
+            order_size_ask: MIN_ORDER_SIZE,
+            realized_pnl: 0.0,
+            unrealized_pnl: 0.0,
+            total_volume: 0.0,
+            trade_count: 0,
             active: true,
-            last_quote_time: 0,
-            metrics,
+            last_quote_id: 0,
+
+            slot_risk: 0.0,
+            toxicity_score: 0.0,
+            alpha_signal: 0.0,
+            last_published_bid: 0.0,
+            last_published_ask: 0.0,
+
+        last_quote_ts: 0,
+        markouts: VecDeque::with_capacity(2048),
+
+        external_inventory: HashMap::new(),
+        pool_weights: HashMap::new(),
+        venues: Vec::new(),
+
+        tox_pos_ewma: 0.0,
+        tox_neg_ewma: 0.0,
+        flow_classifier: 0.0,
+
+        intent_pos_buckets: [0.0; INTENT_BUCKETS],
+        intent_neg_buckets: [0.0; INTENT_BUCKETS],
+
+        cancel_tokens: CANCEL_BURST_MAX,
+        last_cancel_refill_ts: 0,
+
+        // NEW
+        venue_books: HashMap::new(),
+        tip_ref_sol_usd: 100.0, // conservative default; set via set_tip_ref_sol_usd()
+    }
+    }
+
+    /// === REPLACE: effective_params (adds conf-stress & book-thinness; clamps; zero-thrash) ===
+    fn effective_params(&self) -> (f64, f64) {
+        // Vol normalization versus ceiling
+        let vol_norm = (self.sigma / VOLATILITY_CEILING).clamp(0.0, 1.0);
+
+        // Drawdown snapshot (non-blocking)
+        let dd_ratio = if let Ok(rm) = self.risk_manager.try_read() {
+            if rm.daily_loss_limit > 0.0 && rm.current_daily_pnl < 0.0 {
+                (-rm.current_daily_pnl / rm.daily_loss_limit).clamp(0.0, 1.5)
+            } else { 0.0 }
+        } else { 0.0 };
+
+        // Hostile flow + oracle confidence stress
+        let hostile = self.flow_classifier.clamp(0.0, 1.0);
+        let conf_stress = (self.confidence_interval / ORACLE_CONFIDENCE_THRESHOLD).clamp(0.0, 1.25);
+
+        // Approx "book thinness": if we have any venue snapshot, use min depth proxy
+        let mut thin = 0.0;
+        if let Some((_k, bs)) = self.venue_books.iter().next() {
+            // scale: if both sides ~0 ⇒ thin=1; if each ≥ base_size ⇒ thin→0
+            let base_size = (self.max_inventory * 0.05).max(MIN_ORDER_SIZE);
+            let depth_unit = (bs.best_bid_qty.min(bs.best_ask_qty)) / (base_size + 1e-9);
+            thin = (1.0 - depth_unit.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        }
+
+        // Compose smoothed multipliers
+        let mut gamma_eff = self.gamma_base * (1.0
+            + GAMMA_VOL_WEIGHT * vol_norm
+            + GAMMA_TOX_WEIGHT * self.toxicity_score.clamp(0.0,1.0)
+            + FLOW_TOX_WEIGHT_GAMMA * hostile
+            + GAMMA_DD_WEIGHT * dd_ratio
+            + 0.35 * thin
+            + 0.25 * conf_stress);
+
+        let mut kappa_eff = self.kappa_base * (1.0
+            - KAPPA_TOX_WEIGHT * self.toxicity_score.clamp(0.0,1.0)
+            - KAPPA_VOL_WEIGHT * vol_norm
+            - FLOW_TOX_WEIGHT_KAPPA * hostile
+            - 0.25 * thin
+            - 0.15 * conf_stress);
+
+        // Final clamps to sane ranges (no oscillation)
+        gamma_eff = gamma_eff.clamp(1e-6, 1.0);
+        kappa_eff = kappa_eff.clamp(1e-6, 10.0);
+        (gamma_eff, kappa_eff)
+    }
+
+    fn net_inventory(&self) -> f64 {
+        // own inventory + weighted external pools
+        let mut ext_sum = 0.0;
+        for (k, qty) in self.external_inventory.iter() {
+            let w = *self.pool_weights.get(k).unwrap_or(&1.0);
+            ext_sum += w * qty;
+        }
+        let net = self.inventory + NETTING_AGGR_WEIGHT * ext_sum;
+        // Clamp to avoid over-reaction
+        let max_abs = self.max_inventory * NETTING_MAX_ABS_RATIO;
+        net.clamp(-max_abs, max_abs)
+    }
+
+    pub fn set_external_inventory(&mut self, pool: String, base_qty: f64) {
+        self.external_inventory.insert(pool, base_qty);
+    }
+
+    pub fn set_pool_weight(&mut self, pool: String, weight: f64) {
+        self.pool_weights.insert(pool, weight.clamp(0.0, 1.0));
+    }
+
+    pub fn set_venues(&mut self, venues: Vec<VenueParam>) {
+        self.venues = venues;
+    }
+
+    fn update_flow_classifier(&mut self, pnl: f64) {
+        // Positive pnl at horizon => friendly; negative => hostile
+        let alpha = TOXICITY_EWMA_ALPHA;
+        if pnl >= 0.0 {
+            self.tox_pos_ewma = (1.0 - alpha) * self.tox_pos_ewma + alpha * pnl.min(self.mid_price);
+        } else {
+            let mag = (-pnl).min(self.mid_price);
+            self.tox_neg_ewma = (1.0 - alpha) * self.tox_neg_ewma + alpha * mag;
+        }
+        let denom = (self.tox_pos_ewma + self.tox_neg_ewma).max(1e-9);
+        self.flow_classifier = (self.tox_neg_ewma - self.tox_pos_ewma) / denom; // [-1..1]
+    }
+
+    fn intent_bucket_index(pnl: f64, mid: f64) -> usize {
+        // Map pnl to symmetric buckets using pnl as fraction of mid; robust to scale
+        let x = (pnl / mid.max(TICK_SIZE)).clamp(-0.01, 0.01); // ±1% band
+        // uniform buckets across [-1,1]
+        let s = if x >= 0.0 { x / 0.01 } else { -x / 0.01 };
+        let idx = (s * (INTENT_BUCKETS as f64 - 1.0)).round() as isize;
+        idx.clamp(0, INTENT_BUCKETS as isize - 1) as usize
+    }
+
+    fn update_intent_buckets(&mut self, pnl: f64) {
+        let alpha = INTENT_ALPHA;
+        let idx = ASMMEngine::intent_bucket_index(pnl, self.mid_price);
+        if pnl >= 0.0 {
+            for i in 0..INTENT_BUCKETS {
+                if i == idx { self.intent_pos_buckets[i] = (1.0 - alpha) * self.intent_pos_buckets[i] + alpha * 1.0; }
+                else        { self.intent_pos_buckets[i] = (1.0 - alpha) * self.intent_pos_buckets[i]; }
+            }
+        } else {
+            for i in 0..INTENT_BUCKETS {
+                if i == idx { self.intent_neg_buckets[i] = (1.0 - alpha) * self.intent_neg_buckets[i] + alpha * 1.0; }
+                else        { self.intent_neg_buckets[i] = (1.0 - alpha) * self.intent_neg_buckets[i]; }
+            }
         }
     }
 
-    /// Update market data from oracle price feed
+    fn intent_hostility_widen_bps(&self) -> f64 {
+        // Compare mass in extreme negative bucket vs extreme positive bucket
+        let neg_tail = self.intent_neg_buckets[INTENT_BUCKETS - 1];
+        let pos_tail = self.intent_pos_buckets[INTENT_BUCKETS - 1];
+        let denom = (neg_tail + pos_tail).max(1e-6);
+        let hostility = (neg_tail - pos_tail).max(0.0) / denom; // [0..1]
+        hostility * INTENT_WIDEN_BPS_MAX
+    }
+
+    // Venue toxicity/slippage online updates (callable by router)
+    pub fn note_venue_fill(&mut self, venue: &str, side: OrderSide, price: f64, qty: f64, ts: i64) {
+        let mid = self.mid_price.max(TICK_SIZE);
+        // signed slippage in bps vs mid: positive if we paid above mid for a buy (bad) or sold below mid (bad)
+        let slip_bps = match side {
+            OrderSide::Buy  => ((price - mid) / mid * 10_000.0).max(0.0),
+            OrderSide::Sell => ((mid - price) / mid * 10_000.0).max(0.0),
+        }.min(VENUE_SLIP_CAP_BPS);
+
+        if let Some(v) = self.venues.iter_mut().find(|x| x.name == venue) {
+            // Toxicity: adversarial if immediate drift against us (use last_return sign)
+            let ve = futures::executor::block_on(self.volatility_estimator.read());
+            let adverse = match side { OrderSide::Buy => ve.last_return < 0.0, OrderSide::Sell => ve.last_return > 0.0 };
+            let tox_hit = if adverse { 1.0 } else { 0.0 };
+
+            v.toxicity = ((1.0 - VENUE_TOX_ALPHA) * v.toxicity + VENUE_TOX_ALPHA * tox_hit).min(VENUE_TOX_CAP);
+            v.slippage_bps = ((1.0 - VENUE_SLIP_ALPHA) * v.slippage_bps + VENUE_SLIP_ALPHA * slip_bps)
+                .min(VENUE_SLIP_CAP_BPS);
+            v.last_update = ts;
+        }
+    }
+
+    fn process_markouts(&mut self, now_ts: i64) {
+        // Longer horizon in high vol (caps at 3x)
+        let h_secs = ((MARKOUT_HORIZON_SECS as f64) * (1.0 + 4.0 * self.sigma).clamp(1.0, 3.0)) as i64;
+
+        while let Some(fe) = self.markouts.front().copied() {
+            if now_ts - fe.ts < h_secs { break; }
+            let pnl = match fe.side {
+                OrderSide::Buy  => (self.mid_price - fe.price) * fe.qty,
+                OrderSide::Sell => (fe.price - self.mid_price) * fe.qty,
+            };
+            let hit = if pnl < 0.0 { 1.0 } else { 0.0 };
+            self.toxicity_score = (1.0 - TOXICITY_EWMA_ALPHA) * self.toxicity_score + TOXICITY_EWMA_ALPHA * hit;
+            self.update_flow_classifier(pnl);
+            self.update_intent_buckets(pnl);
+            self.markouts.pop_front();
+        }
+    }
+
+    /// === REPLACE: update_market_data (oracle guards + adaptive confidence + anti-desync) ===
     pub async fn update_market_data(
         &mut self,
-        oracle_price: Decimal,
-        oracle_confidence: Decimal,
-    ) -> Result<(), EngineError> {
-        let current_time = self.time_source.now_micros();
-        
-        // Validate oracle inputs
-        if oracle_price <= Decimal::ZERO {
-            return Err(EngineError::InvalidParameter(
-                "Oracle price must be positive".to_string()
-            ));
+        oracle_price: f64,
+        confidence: f64,
+        timestamp: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !(oracle_price.is_finite()) || oracle_price <= 0.0 {
+            return Err("Invalid oracle price".into());
         }
-        
-        // Check relative confidence
-        let relative_confidence = oracle_confidence / oracle_price;
-        if relative_confidence > MAX_ORACLE_CONFIDENCE_RATIO {
-            return Err(EngineError::LowOracleConfidence {
-                confidence: relative_confidence,
-                threshold: MAX_ORACLE_CONFIDENCE_RATIO,
-            });
+
+        // Regime-adaptive confidence: higher vol allows more band slack; low vol tightens
+        let conf_mult = (0.75 + 2.5 * self.sigma).clamp(0.75, 3.0);
+        let conf_limit = ORACLE_CONFIDENCE_THRESHOLD * conf_mult;
+        if confidence >= conf_limit {
+            return Err("Oracle confidence too HIGH for regime".into());
         }
-        
-        // Check price deviation from last known price
-        if self.mid_price > Decimal::ZERO {
-            let deviation = ((oracle_price - self.mid_price) / self.mid_price).abs();
-            if deviation > MAX_PRICE_DEVIATION {
-                warn!("Large price deviation: {} vs {}", oracle_price, self.mid_price);
-                // Don't reject, but log for monitoring
+
+        // Dynamic deviation guard vs previous oracle
+        if self.oracle_price > 0.0 {
+            let dyn_dev = MAX_PRICE_DEVIATION * (1.0 + 3.0 * self.sigma).clamp(1.0, 3.0);
+            let price_deviation = (oracle_price - self.oracle_price).abs() / self.oracle_price.max(1.0);
+            if price_deviation > dyn_dev {
+                return Err("Oracle price deviation exceeds dynamic threshold".into());
             }
         }
-        
-        // Update price data
-        let prev_price = self.oracle_price;
+
         self.oracle_price = oracle_price;
-        self.oracle_confidence = oracle_confidence;
+        self.confidence_interval = confidence;
         self.mid_price = oracle_price;
-        
-        // Store price point
-        let price_point = PricePoint {
-            timestamp: current_time,
-            price: oracle_price,
-            volume: Decimal::ZERO,
-            spread: self.optimal_spread,
-        };
-        
-        {
-            let mut price_history = self.price_history.write().await;
-            price_history.push_back(price_point);
-            if price_history.len() > MAX_PRICE_HISTORY {
-                price_history.pop_front();
-            }
-        }
-        
-        // Update volatility estimate
-        if prev_price > Decimal::ZERO {
-            let mut vol_estimator = self.volatility_estimator.write().await;
-            vol_estimator.update(current_time, oracle_price, prev_price);
-            self.sigma = vol_estimator.get_current_volatility();
-        }
-        
-        // Update position unrealized P&L
-        {
-            let mut position = self.position.write().await;
-            position.update_unrealized_pnl(oracle_price);
-        }
-        
-        self.last_update = current_time;
-        
-        Ok(())
-    }
 
-    /// Calculate reservation price using canonical Avellaneda-Stoikov formula
-    /// r = S - q * γ * σ² * (T - t)
-    fn calculate_reservation_price(&mut self) -> Result<(), EngineError> {
-        let now = self.time_source.now_micros();
-        
-        // Calculate time to close in days
-        let time_to_close_micros = (self.session_end - now).max(0);
-        let time_to_close_days = Decimal::from(time_to_close_micros) / 
-                                 Decimal::from(86_400_000_000i64);  // micros per day
-        
-        // Get current inventory
-        let inventory = self.position.try_read()
-            .map_err(|_| EngineError::MathError("Failed to read position".to_string()))?
-            .inventory;
-        
-        // Calculate inventory adjustment
-        // Adjustment = q * γ * σ² * (T - t)
-        let inventory_adjustment = inventory * self.gamma * self.sigma * self.sigma * time_to_close_days;
-        
-        // Reservation price = mid_price - inventory_adjustment
-        self.reservation_price = self.mid_price - inventory_adjustment;
-        
-        // Ensure reservation price is reasonable
-        let min_price = self.mid_price * Decimal::from_str("0.95").unwrap();
-        let max_price = self.mid_price * Decimal::from_str("1.05").unwrap();
-        self.reservation_price = self.reservation_price.max(min_price).min(max_price);
-        
-        debug!("Reservation price: {}, Mid: {}, Inventory: {}, Time to close: {} days",
-               self.reservation_price, self.mid_price, inventory, time_to_close_days);
-        
-        Ok(())
-    }
-
-    /// Calculate optimal quotes using canonical Avellaneda-Stoikov formula
-    /// Total spread = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/κ)
-    fn calculate_optimal_quotes(&mut self) -> Result<(), EngineError> {
-        let now = self.time_source.now_micros();
-        
-        // Calculate time to close in days
-        let time_to_close_micros = (self.session_end - now).max(0);
-        let time_to_close_days = Decimal::from(time_to_close_micros) / 
-                                 Decimal::from(86_400_000_000i64);
-        
-        // Canonical Avellaneda-Stoikov spread formula
-        // spread = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/κ)
-        let variance_term = self.gamma * self.sigma * self.sigma * time_to_close_days;
-        
-        // Calculate liquidity term: (2/γ) * ln(1 + γ/κ)
-        let liquidity_ratio = self.gamma / self.kappa;
-        let ln_arg = Decimal::ONE + liquidity_ratio;
-        let ln_value = if ln_arg > Decimal::ZERO {
-            let ln_f64 = ln_arg.to_f64().unwrap_or(1.0).ln();
-            Decimal::from_f64(ln_f64).unwrap_or(Decimal::ZERO)
-        } else {
-            Decimal::ZERO
-        };
-        let liquidity_term = (Decimal::TWO / self.gamma) * ln_value;
-        
-        // Total optimal spread
-        self.optimal_spread = variance_term + liquidity_term;
-        
-        // Apply spread bounds
-        let min_spread = MIN_SPREAD_BPS / Decimal::from(10000) * self.mid_price;
-        let max_spread = MAX_SPREAD_BPS / Decimal::from(10000) * self.mid_price;
-        self.optimal_spread = self.optimal_spread.max(min_spread).min(max_spread);
-        
-        // Calculate half-spread
-        let half_spread = self.optimal_spread / Decimal::TWO;
-        
-        // Set bid and ask prices
-        let raw_bid = self.reservation_price - half_spread;
-        let raw_ask = self.reservation_price + half_spread;
-        
-        // Round to tick size
-        self.bid_price = self.config.round_to_tick(raw_bid);
-        self.ask_price = self.config.round_to_tick(raw_ask);
-        
-        // Ensure minimum profitable spread (accounting for fees)
-        let fee_adjusted_spread = (TAKER_FEE_BPS - MAKER_FEE_BPS + MIN_PROFIT_BPS) / 
-                                  Decimal::from(10000) * self.mid_price;
-        
-        if self.ask_price - self.bid_price < fee_adjusted_spread {
-            let adjustment = (fee_adjusted_spread - (self.ask_price - self.bid_price)) / Decimal::TWO;
-            self.bid_price = self.config.round_to_tick(self.bid_price - adjustment);
-            self.ask_price = self.config.round_to_tick(self.ask_price + adjustment);
-        }
-        
-        // Ensure ask > bid
-        if self.ask_price <= self.bid_price {
-            return Err(EngineError::InvalidQuote {
-                reason: format!("Ask {} <= Bid {}", self.ask_price, self.bid_price),
+        {
+            let mut ph = self.price_history.write().await;
+            ph.push_back(PricePoint {
+                timestamp,
+                price: oracle_price,
+                volume: 0.0,
+                spread: self.optimal_spread,
             });
+            if ph.len() > MAX_PRICE_HISTORY { ph.pop_front(); }
         }
-        
-        // Apply safety bounds
-        let min_bid = self.mid_price * Decimal::from_str("0.9").unwrap();
-        let max_ask = self.mid_price * Decimal::from_str("1.1").unwrap();
-        self.bid_price = self.bid_price.max(min_bid);
-        self.ask_price = self.ask_price.min(max_ask);
-        
-        debug!("Quotes - Bid: {}, Ask: {}, Spread: {} bps",
-               self.bid_price, self.ask_price,
-               (self.ask_price - self.bid_price) / self.mid_price * Decimal::from(10000));
-        
+
+        self.update_volatility(oracle_price).await?;
+        self.process_markouts(timestamp);
+
+        self.calculate_reservation_price(timestamp).await?;
+        self.calculate_optimal_quotes(timestamp).await?;
+
+        self.check_risk_limits(timestamp).await?;
+        self.last_update = timestamp;
         Ok(())
     }
 
-    /// Calculate order sizes with inventory skew and risk limits
-    async fn calculate_order_sizes(&mut self) -> Result<(), EngineError> {
-        let position = self.position.read().await;
-        let risk_manager = self.risk_manager.read().await;
-        
-        // Base order size calculation
-        let max_order = risk_manager.max_order_size;
-        let base_size = max_order * Decimal::from_str("0.05").unwrap();
-        
-        // Volatility adjustment - reduce size in high volatility
-        let vol_factor = Decimal::ONE / (Decimal::ONE + self.sigma * Decimal::from(10));
-        let vol_adjustment = vol_factor.max(Decimal::from_str("0.2").unwrap());
-        
-        // Inventory skew - adjust sizes based on current position
-        let inventory_ratio = position.inventory_ratio();
-        let skew_factor = Decimal::from_str("0.5").unwrap();
-        
-        // Increase bid size when short, decrease when long
-        let bid_adjustment = Decimal::ONE - inventory_ratio * skew_factor;
-        // Decrease ask size when short, increase when long
-        let ask_adjustment = Decimal::ONE + inventory_ratio * skew_factor;
-        
-        // Calculate raw sizes
-        let raw_bid_size = base_size * vol_adjustment * bid_adjustment;
-        let raw_ask_size = base_size * vol_adjustment * ask_adjustment;
-        
-        // Round to lot size
-        self.order_size_bid = self.config.round_to_lot(raw_bid_size);
-        self.order_size_ask = self.config.round_to_lot(raw_ask_size);
-        
-        // Apply position limits
-        let remaining_buy_capacity = position.max_inventory - position.inventory;
-        let remaining_sell_capacity = position.inventory - position.min_inventory;
-        
-        self.order_size_bid = self.order_size_bid
-            .min(remaining_buy_capacity)
-            .min(risk_manager.max_order_size)
-            .max(Decimal::ZERO);
-            
-        self.order_size_ask = self.order_size_ask
-            .min(remaining_sell_capacity)
-            .min(risk_manager.max_order_size)
-            .max(Decimal::ZERO);
-        
-        // Zero out if at limits
-        if position.inventory >= position.max_inventory * MAX_INVENTORY_RATIO {
-            self.order_size_bid = Decimal::ZERO;
+    /// === REPLACE: update_volatility (Huber clamp, multi-proxy blend, micro-alpha EWMA) ===
+    async fn update_volatility(&mut self, price: f64) -> Result<(), Box<dyn std::error::Error>> {
+        let mut ve = self.volatility_estimator.write().await;
+        let ph = self.price_history.read().await;
+        if ph.len() < 2 { return Ok(()); }
+
+        let prev_price = ph[ph.len() - 2].price.max(TICK_SIZE);
+        let mut r = (price / prev_price).ln();
+        if !r.is_finite() { r = 0.0; }
+
+        // Huber clamp using EWMA scale proxy
+        let scale = ve.ewma_r2.sqrt().max(1e-9);
+        let k = 8.0; // ~8-sigma equivalent
+        let z = (r / scale).abs();
+        if z > k { r = r.signum() * k * scale; }
+
+        ve.last_return = r;
+        ve.returns.push_back(r);
+        ve.squared_returns.push_back(r * r);
+        if ve.returns.len() > VOLATILITY_WINDOW {
+            ve.returns.pop_front();
+            ve.squared_returns.pop_front();
         }
-        if position.inventory <= position.min_inventory * MAX_INVENTORY_RATIO {
-            self.order_size_ask = Decimal::ZERO;
+
+        // Update fast proxy
+        ve.ewma_r2 = EWMA_ALPHA * (r * r) + (1.0 - EWMA_ALPHA) * ve.ewma_r2;
+
+        if ve.returns.len() >= 10 {
+            let n = ve.returns.len() as f64;
+            let mean = ve.returns.iter().sum::<f64>() / n;
+            let var  = (ve.returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).max(0.0);
+            let realized = var.sqrt() * (86400.0f64).sqrt();
+
+            // Bipower variation (robust to jumps/spoofs)
+            let mut bp_sum = 0.0;
+            for i in 1..ve.returns.len() {
+                bp_sum += ve.returns[i - 1].abs() * ve.returns[i].abs();
+            }
+            let bp = (bp_sum.max(0.0) / (ve.returns.len().saturating_sub(1).max(1) as f64)).sqrt() * (86400.0f64).sqrt();
+
+            // EWMA vol
+            let ewma = ve.ewma_r2.sqrt() * (86400.0f64).sqrt();
+
+            // GARCH(1,1) update (stationary)
+            let sigma_prev = ve.garch_vol.max(1e-9);
+            let var_prev = (sigma_prev / (86400.0f64).sqrt()).powi(2);
+            let var_now = ve.omega + ve.alpha * (r * r) + ve.beta * var_prev;
+            ve.garch_vol = var_now.max(0.0).sqrt() * (86400.0f64).sqrt();
+
+            // Blend — emphasize robust pieces in noisy regimes
+            self.sigma = (0.30 * realized + 0.30 * ve.garch_vol + 0.25 * ewma + 0.15 * bp)
+                .max(VOLATILITY_FLOOR)
+                .min(VOLATILITY_CEILING);
         }
-        
-        // Ensure minimum order size or zero
-        if self.order_size_bid > Decimal::ZERO && self.order_size_bid < self.config.min_order_size {
-            self.order_size_bid = Decimal::ZERO;
+
+        // Short-window micro-momentum → alpha_signal
+        if ve.returns.len() >= MOMENTUM_WINDOW_SHORT {
+            let m = MOMENTUM_WINDOW_SHORT;
+            let mut s = 0.0;
+            for i in (ve.returns.len() - m)..ve.returns.len() { s += ve.returns[i]; }
+            let raw = s / (m as f64);
+            self.alpha_signal = (1.0 - ALPHA_EWMA) * self.alpha_signal + ALPHA_EWMA * raw;
         }
-        if self.order_size_ask > Decimal::ZERO && self.order_size_ask < self.config.min_order_size {
-            self.order_size_ask = Decimal::ZERO;
-        }
-        
         Ok(())
     }
-    
-    /// Execute a trade and update position tracking
-    pub async fn execute_trade(
-        &mut self,
-        side: OrderSide,
-        quantity: Decimal,
-        price: Decimal,
-    ) -> Result<(), EngineError> {
-        // Validate inputs
-        if quantity <= Decimal::ZERO {
-            return Err(EngineError::InvalidParameter(
-                "Quantity must be positive".to_string()
-            ));
+
+    /// === REPLACE: calculate_reservation_price (adds L2-imbalance micro-skew; oracle-safe) ===
+    async fn calculate_reservation_price(&mut self, _timestamp: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let (gamma_eff, _kappa_eff) = self.effective_params();
+
+        let inv_net = self.net_inventory() - self.target_inventory;
+
+        // Core Avellaneda skew + microstructure noise
+        let skew_cap = 0.005 * self.mid_price; // 50 bps
+        let skew_core = gamma_eff * self.sigma * self.sigma * inv_net;
+        let micro = (MICROSTRUCTURE_NOISE * self.sigma).copysign(inv_net);
+
+        // L2-imbalance micro-skew (no price levels available; use quantity imbalance)
+        let mut imb_skew = 0.0;
+        if let Some((_k, bs)) = self.venue_books.iter().next() {
+            // Convert imbalance [-1,1] → bps shift of mid
+            let imb = ASMMEngine::l2_imbalance(bs);
+            // cap 6 bps shift from pure imbalance
+            let imb_bps = (6.0 * imb).clamp(-6.0, 6.0);
+            imb_skew = (imb_bps / 10_000.0) * self.mid_price;
         }
-        if price <= Decimal::ZERO {
-            return Err(EngineError::InvalidParameter(
-                "Price must be positive".to_string()
-            ));
+
+        // Micro alpha & hostile-flow damp
+        let alpha_bps = (self.alpha_signal * 10_000.0).clamp(-ALPHA_SKEW_BPS_MAX, ALPHA_SKEW_BPS_MAX);
+        let hostile   = self.flow_classifier.clamp(0.0, 1.0);
+        let alpha_shift = (alpha_bps / 10_000.0) * self.mid_price * (0.25 * (1.0 - 0.5 * hostile));
+
+        let skew = (skew_core + micro + imb_skew).clamp(-skew_cap, skew_cap);
+        self.reservation_price = (self.mid_price - skew + alpha_shift).max(TICK_SIZE);
+        Ok(())
+    }
+
+    /// === REPLACE: calculate_optimal_quotes (adds depth/slope penalty, adaptive min-step) ===
+    async fn calculate_optimal_quotes(&mut self, timestamp: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let (gamma_eff, kappa_eff) = self.effective_params();
+
+        // Core half-spread
+        let term_risk = 0.5 * gamma_eff * self.sigma * self.sigma;
+        let term_flow = (1.0 / gamma_eff) * (1.0 + (gamma_eff / kappa_eff)).ln().max(0.0);
+        let mut half_spread_abs = (term_risk + term_flow).max(TICK_SIZE);
+
+        // Depth/slope penalty (thin books ⇒ widen)
+        let mut depth_pen_abs = 0.0;
+        if let Some((_k, bs)) = self.venue_books.iter().next() {
+            let base_size = (self.max_inventory * 0.05).max(MIN_ORDER_SIZE);
+            let depth_unit = (bs.best_bid_qty.min(bs.best_ask_qty)) / (base_size + 1e-9); // ~[0..∞)
+            let thin = (1.0 - depth_unit.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            depth_pen_abs = thin * 0.0006 * self.mid_price; // up to 6 bps
         }
-        
-        // Round to lot size
-        let adjusted_quantity = self.config.round_to_lot(quantity);
-        if adjusted_quantity < self.config.min_order_size {
-            return Err(EngineError::OrderSizeTooSmall {
-                size: adjusted_quantity,
-                min: self.config.min_order_size,
-            });
+        half_spread_abs += 0.5 * depth_pen_abs;
+
+        let inv_net_abs = (self.net_inventory() - self.target_inventory).abs();
+        let inv_penalty = (gamma_eff * self.sigma * self.sigma * inv_net_abs).max(0.0);
+
+        // Base spread with regime/slot/toxicity/intent/aging
+        let mut spread_abs = (2.0 * half_spread_abs + inv_penalty)
+            .max(MIN_SPREAD_BPS / 10_000.0 * self.mid_price)
+            .min(MAX_SPREAD_BPS / 10_000.0 * self.mid_price);
+
+        spread_abs += (SLOT_RISK_WIDEN_BPS / 10_000.0) * self.mid_price * self.slot_risk.clamp(0.0, 1.0);
+
+        let conf_ratio = (self.confidence_interval / ORACLE_CONFIDENCE_THRESHOLD).clamp(0.0, 1.0);
+        spread_abs += conf_ratio * CONF_WIDEN_MULT * (MIN_SPREAD_BPS / 10_000.0) * self.mid_price;
+
+        spread_abs += (TOXICITY_WIDEN_BPS / 10_000.0) * self.mid_price * self.toxicity_score.clamp(0.0, 1.0);
+
+        if self.last_quote_ts > 0 {
+            let age = (timestamp - self.last_quote_ts).max(0) as f64;
+            let aging_bps = (AGING_WIDEN_BPS_PER_SEC * age).min(AGING_WIDEN_BPS_CAP);
+            spread_abs += (aging_bps / 10_000.0) * self.mid_price;
         }
-        
-        // Calculate fees
-        let fee_rate = match side {
-            OrderSide::Buy => self.config.maker_fee_rate,
-            OrderSide::Sell => self.config.maker_fee_rate,
-        };
-        let fee = adjusted_quantity * price * fee_rate.abs() / Decimal::from(10000);
-        
-        // Update position
-        {
-            let mut position = self.position.write().await;
-            
-            match side {
-                OrderSide::Buy => {
-                    // Check position limits
-                    if position.inventory + adjusted_quantity > position.max_inventory {
-                        return Err(EngineError::PositionLimitBreached {
-                            position: position.inventory + adjusted_quantity,
-                            limit: position.max_inventory,
-                        });
-                    }
-                    position.update_position_buy(adjusted_quantity, price, fee);
-                }
-                OrderSide::Sell => {
-                    // Check position limits
-                    if position.inventory - adjusted_quantity < position.min_inventory {
-                        return Err(EngineError::PositionLimitBreached {
-                            position: position.inventory - adjusted_quantity,
-                            limit: position.min_inventory,
-                        });
-                    }
-                    position.update_position_sell(adjusted_quantity, price, fee);
-                }
+
+        // Intent hostility widen
+        let intent_widen_bps = self.intent_hostility_widen_bps();
+        spread_abs += (intent_widen_bps / 10_000.0) * self.mid_price;
+
+        // Inventory skew
+        let inventory_skew = INVENTORY_SKEW_FACTOR * gamma_eff * self.sigma * self.sigma
+            * (self.net_inventory() - self.target_inventory);
+
+        // Profit guard: after fees
+        let spread_with_fees = ((TAKER_FEE_BPS - MAKER_FEE_BPS) / 10_000.0).max(0.0) * self.mid_price;
+        let min_profitable_spread = ((MIN_PROFIT_BPS / 10_000.0) * self.mid_price + spread_with_fees) * SPREAD_BUFFER;
+
+        let half = 0.5 * spread_abs;
+        let mut bid = self.reservation_price - half - inventory_skew;
+        let mut ask = self.reservation_price + half - inventory_skew;
+
+        if ask - bid < min_profitable_spread {
+            let pad = 0.5 * (min_profitable_spread - (ask - bid));
+            bid -= pad; ask += pad;
+        }
+
+        // Tick rounding & oracle band
+        let round_tick = |x: f64| ((x / TICK_SIZE).round() * TICK_SIZE).max(TICK_SIZE);
+        let mut new_bid = round_tick(bid);
+        let mut new_ask = round_tick(ask);
+
+        let lower = (self.oracle_price * (1.0 - ORACLE_BAND_MULT * self.confidence_interval)).max(TICK_SIZE);
+        let upper = (self.oracle_price * (1.0 + ORACLE_BAND_MULT * self.confidence_interval)).max(TICK_SIZE);
+        if new_bid < lower { new_bid = lower; }
+        if new_ask > upper { new_ask = upper; }
+
+        new_bid = ((new_bid / TICK_SIZE).floor() * TICK_SIZE).max(TICK_SIZE);
+        new_ask = ((new_ask / TICK_SIZE).ceil()  * TICK_SIZE).max(TICK_SIZE);
+
+        // Adaptive anti-flicker: tougher gate under high slot risk/toxicity
+        let base_min_ticks = QUOTE_MIN_CHANGE_TICKS as f64;
+        let gate_mult = (1.0 + 1.5 * self.slot_risk.clamp(0.0,1.0) + 0.8 * self.toxicity_score.clamp(0.0,1.0)).clamp(1.0, 3.5);
+        let min_step = base_min_ticks * gate_mult * TICK_SIZE;
+
+        if self.last_published_bid > 0.0 && (new_bid - self.last_published_bid).abs() < min_step { new_bid = self.last_published_bid; }
+        if self.last_published_ask > 0.0 && (new_ask - self.last_published_ask).abs() < min_step { new_ask = self.last_published_ask; }
+
+        // Cancel-token governor
+        let bid_changed = self.last_published_bid <= 0.0 || (new_bid - self.last_published_bid).abs() >= (TICK_SIZE - 1e-12);
+        let ask_changed = self.last_published_ask <= 0.0 || (new_ask - self.last_published_ask).abs() >= (TICK_SIZE - 1e-12);
+        self.refill_cancel_tokens(timestamp);
+
+        let mut allowed = true;
+        if bid_changed || ask_changed {
+            allowed = self.consume_cancel_tokens(CANCELS_PER_QUOTE_CHANGE);
+            if !allowed {
+                if self.last_published_bid > 0.0 { new_bid = self.last_published_bid; }
+                if self.last_published_ask > 0.0 { new_ask = self.last_published_ask; }
             }
-            
-            // Update unrealized P&L
-            position.update_unrealized_pnl(self.mid_price);
         }
-        
-        // Update metrics
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.orders_filled += 1;
-            metrics.total_volume += adjusted_quantity;
-            match side {
-                OrderSide::Buy => metrics.bid_fills += 1,
-                OrderSide::Sell => metrics.ask_fills += 1,
-            }
+
+        if new_bid >= new_ask {
+            new_bid = (new_bid - TICK_SIZE).max(TICK_SIZE);
+            new_ask = new_ask + TICK_SIZE;
         }
-        
-        // Check risk limits
-        {
-            let position = self.position.read().await;
-            let mut risk_manager = self.risk_manager.write().await;
-            risk_manager.check_risk_limits(&position, self.mid_price, self.time_source.now_micros())?;
+
+        self.bid_price = new_bid;
+        self.ask_price = new_ask;
+
+        if allowed || self.last_published_bid == 0.0 || self.last_published_ask == 0.0 {
+            self.last_published_bid = new_bid;
+            self.last_published_ask = new_ask;
+            self.last_quote_ts = timestamp;
         }
-        
-        // Recalculate quotes
-        self.calculate_reservation_price()?;
-        self.calculate_optimal_quotes()?;
+
         self.calculate_order_sizes().await?;
-        
-        info!("Trade executed - Side: {:?}, Qty: {}, Price: {}, Fee: {}",
-              side, adjusted_quantity, price, fee);
-        
         Ok(())
     }
-    
-    /// Generate a quote with current market conditions
-    pub async fn get_quote(&mut self) -> Result<Quote, EngineError> {
-        // Check if engine is active
-        if !self.active {
-            return Err(EngineError::TradingHalted {
-                reason: "Engine is not active".to_string(),
-            });
+
+    /// === REPLACE: calculate_order_sizes (adds depth/liquidity & intent hostility damp) ===
+    async fn calculate_order_sizes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let rm = self.risk_manager.read().await;
+
+        let base_size = (self.max_inventory * 0.05).max(MIN_ORDER_SIZE);
+        let vol_scale = (1.0 / (1.0 + 10.0 * self.sigma)).clamp(0.15, 1.0);
+
+        // Edge after fees
+        let spread = (self.ask_price - self.bid_price).max(TICK_SIZE);
+        let fees_abs = ((TAKER_FEE_BPS - MAKER_FEE_BPS) / 10_000.0).max(0.0) * self.mid_price;
+        let edge_abs = (spread - fees_abs).max(0.0) * 0.5;
+
+        // Variance proxy
+        let var_abs = (self.sigma * self.mid_price).powi(2).max(1e-12);
+        let kelly = (edge_abs / var_abs).clamp(0.0, 0.25);
+
+        // Inventory tilt
+        let inv_ratio = (self.inventory / self.max_inventory).clamp(-1.0, 1.0);
+        let bid_adj = 1.0 + INVENTORY_SKEW_FACTOR * inv_ratio;
+        let ask_adj = 1.0 - INVENTORY_SKEW_FACTOR * inv_ratio;
+
+        // Drawdown damp
+        let dd_ratio = if rm.daily_loss_limit > 0.0 && rm.current_daily_pnl < 0.0 {
+            (-rm.current_daily_pnl / rm.daily_loss_limit).clamp(0.0, 1.5)
+        } else { 0.0 };
+        let dd_scale = (1.0 - 0.6 * dd_ratio).clamp(0.25, 1.0);
+
+        // Slot & toxicity size cuts + intent hostility (more negative mass ⇒ smaller)
+        let slot_cut = 1.0 - (SLOT_RISK_SIZE_CUT * self.slot_risk.clamp(0.0, 1.0));
+        let tox_cut  = 1.0 - (0.50 * self.toxicity_score.clamp(0.0, 1.0));
+        let intent_cut = 1.0 - (self.intent_hostility_widen_bps() / INTENT_WIDEN_BPS_MAX).clamp(0.0, 1.0) * 0.30;
+        let mut safety_scale = (slot_cut * tox_cut * dd_scale * intent_cut).clamp(0.10, 1.0);
+
+        // L2 imbalance boost (favor near-term pressure)
+        let mut imb = 0.0;
+        if let Some((_k, bs)) = self.venue_books.iter().next() {
+            imb = ASMMEngine::l2_imbalance(bs);
         }
-        
-        // Check risk manager status
-        {
-            let risk_manager = self.risk_manager.read().await;
-            if risk_manager.trading_halted {
-                return Err(EngineError::TradingHalted {
-                    reason: risk_manager.halt_reason.clone(),
-                });
-            }
+        let imb_bid_boost = (1.0 - 0.25 * imb).clamp(0.70, 1.30);
+        let imb_ask_boost = (1.0 + 0.25 * imb).clamp(0.70, 1.30);
+
+        // Depth/liquidity damp (thin book ⇒ smaller size)
+        if let Some((_k, bs)) = self.venue_books.iter().next() {
+            let base_ref = base_size + 1e-9;
+            let depth_unit = (bs.best_bid_qty.min(bs.best_ask_qty)) / base_ref; // 0..∞
+            let liq_damp = (0.60 + 0.40 * depth_unit.clamp(0.0, 1.0)).clamp(0.60, 1.0);
+            safety_scale *= liq_damp;
         }
-        
-        // Calculate fresh quotes
-        self.calculate_reservation_price()?;
-        self.calculate_optimal_quotes()?;
-        self.calculate_order_sizes().await?;
-        
-        // Update metrics
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.quotes_generated += 1;
-            
-            // Update average spread tracking
-            let spread_bps = (self.ask_price - self.bid_price) / self.mid_price * Decimal::from(10000);
-            if metrics.quotes_generated == 1 {
-                metrics.avg_spread_bps = spread_bps;
-            } else {
-                let weight = Decimal::from_str("0.99").unwrap();
-                metrics.avg_spread_bps = metrics.avg_spread_bps * weight + spread_bps * (Decimal::ONE - weight);
-            }
-        }
-        
-        let now = self.time_source.now_micros();
-        self.last_quote_time = now;
-        
-        let quote = Quote {
-            bid_price: self.bid_price,
-            bid_size: self.order_size_bid,
-            ask_price: self.ask_price,
-            ask_size: self.order_size_ask,
-            mid_price: self.mid_price,
-            spread_bps: (self.ask_price - self.bid_price) / self.mid_price * Decimal::from(10000),
-            timestamp: now,
-            valid_until: now + (QUOTE_VALIDITY_MS as i64 * 1000),
+
+        let target_bid = (base_size * vol_scale * (0.5 + kelly) * bid_adj * safety_scale * imb_bid_boost).max(MIN_ORDER_SIZE);
+        let target_ask = (base_size * vol_scale * (0.5 + kelly) * ask_adj * safety_scale * imb_ask_boost).max(MIN_ORDER_SIZE);
+
+        // Slew limiter based on cancel budget & risk
+        let budget_frac = (self.cancel_tokens / CANCEL_BURST_MAX).clamp(0.0, 1.0);
+        let step_frac = (0.30 + 0.50 * budget_frac + 0.20 * self.slot_risk.clamp(0.0,1.0)).clamp(0.25, 1.0);
+
+        let smooth = |prev: f64, tgt: f64| -> f64 {
+            if prev <= 0.0 { return tgt; }
+            let delta = tgt - prev;
+            let cap = (prev * step_frac).max(MIN_ORDER_SIZE * 0.5);
+            prev + delta.clamp(-cap, cap)
         };
-        
-        // Validate quote before returning
-        if !quote.is_valid(now) {
-            return Err(EngineError::InvalidQuote {
-                reason: "Generated quote failed validation".to_string(),
-            });
+
+        let size_bid_raw = smooth(self.order_size_bid, target_bid);
+        let size_ask_raw = smooth(self.order_size_ask, target_ask);
+
+        self.order_size_bid = size_bid_raw
+            .min(rm.max_order_size)
+            .min(self.max_inventory - self.inventory)
+            .max(0.0);
+
+        self.order_size_ask = size_ask_raw
+            .min(rm.max_order_size)
+            .min(self.inventory - self.min_inventory)
+            .max(0.0);
+
+        if self.inventory >= self.max_inventory * MAX_INVENTORY_RATIO { self.order_size_bid = 0.0; }
+        if self.inventory <= self.min_inventory * MAX_INVENTORY_RATIO { self.order_size_ask = 0.0; }
+
+        if self.toxicity_score >= TOXICITY_HALT_THRESHOLD {
+            self.order_size_bid = 0.0;
+            self.order_size_ask = 0.0;
         }
-        
-        Ok(quote)
-    }
-    
-    /// Emergency position close
-    pub async fn emergency_close_position(&mut self, market_price: Decimal) -> Result<(), EngineError> {
-        let mut position = self.position.write().await;
-        
-        if position.inventory == Decimal::ZERO {
-            info!("No position to close");
-            return Ok(());
-        }
-        
-        let side = if position.inventory > Decimal::ZERO {
-            OrderSide::Sell
-        } else {
-            OrderSide::Buy
-        };
-        
-        let quantity = position.inventory.abs();
-        
-        // Calculate emergency fee (likely taker fee)
-        let fee = quantity * market_price * TAKER_FEE_BPS.abs() / Decimal::from(10000);
-        
-        // Update position
-        match side {
-            OrderSide::Buy => position.update_position_buy(quantity, market_price, fee),
-            OrderSide::Sell => position.update_position_sell(quantity, market_price, fee),
-        }
-        
-        warn!("Emergency close executed - Side: {:?}, Qty: {}, Price: {}",
-              side, quantity, market_price);
-        
-        // Halt trading after emergency close
-        self.active = false;
-        let mut risk_manager = self.risk_manager.write().await;
-        risk_manager.trading_halted = true;
-        risk_manager.halt_reason = "Emergency position close executed".to_string();
-        
         Ok(())
     }
-    
-    /// Update engine parameters
-    pub async fn update_parameters(
-        &mut self,
-        gamma: Option<Decimal>,
-        kappa: Option<Decimal>,
-        eta: Option<Decimal>,
-    ) -> Result<(), EngineError> {
-        if let Some(g) = gamma {
-            if g <= Decimal::ZERO || g > Decimal::ONE {
-                return Err(EngineError::InvalidParameter(
-                    "Gamma must be between 0 and 1".to_string()
-                ));
-            }
-            self.gamma = g;
-        }
-        
-        if let Some(k) = kappa {
-            if k <= Decimal::ZERO || k > Decimal::from(10) {
-                return Err(EngineError::InvalidParameter(
-                    "Kappa must be between 0 and 10".to_string()
-                ));
-            }
-            self.kappa = k;
-        }
-        
-        if let Some(e) = eta {
-            if e <= Decimal::ZERO || e > Decimal::ONE {
-                return Err(EngineError::InvalidParameter(
-                    "Eta must be between 0 and 1".to_string()
-                ));
-            }
-            self.eta = e;
-        }
-        
-        // Recalculate quotes with new parameters
-        self.calculate_reservation_price()?;
-        self.calculate_optimal_quotes()?;
-        
-        Ok(())
-    }
-    
-    /// Reset session metrics
-    pub async fn reset_session(&mut self) {
-        let position = self.position.read().await;
-        let mut risk_manager = self.risk_manager.write().await;
-        
-        risk_manager.reset_daily_metrics(position.total_pnl());
-        
-        let now = self.time_source.now_micros();
-        self.session_start = now;
-        self.session_end = now + (24 * 3600 * 1_000_000);  // 24 hours
-        
-        info!("Session reset at {}", now);
-    }
-    
-    /// Get current engine status
-    pub async fn get_status(&self) -> EngineStatus {
-        let position = self.position.read().await;
-        let risk_manager = self.risk_manager.read().await;
-        let metrics = self.metrics.read().await;
-        
-        EngineStatus {
-            active: self.active,
-            trading_halted: risk_manager.trading_halted,
-            halt_reason: risk_manager.halt_reason.clone(),
-            position: position.inventory,
-            total_pnl: position.total_pnl(),
-            realized_pnl: position.realized_pnl,
-            unrealized_pnl: position.unrealized_pnl,
-            fees_paid: position.fees_paid,
-            current_volatility: self.sigma,
-            quotes_generated: metrics.quotes_generated,
-            orders_filled: metrics.orders_filled,
-            total_volume: metrics.total_volume,
-        }
-    }
-}
 
-// ===== Supporting Types =====
+    async fn check_risk_limits(&mut self, now_ts: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let mut rm = self.risk_manager.write().await;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub enum OrderSide {
-    Buy,
-    Sell,
-}
+        rm.position_limits_breached = self.inventory.abs() >= self.max_inventory * MAX_INVENTORY_RATIO;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EngineStatus {
-    pub active: bool,
-    pub trading_halted: bool,
-    pub halt_reason: String,
-    pub position: Decimal,
-    pub total_pnl: Decimal,
-    pub realized_pnl: Decimal,
-    pub unrealized_pnl: Decimal,
-    pub fees_paid: Decimal,
-    pub current_volatility: Decimal,
-    pub quotes_generated: u64,
-    pub orders_filled: u64,
-    pub total_volume: Decimal,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    struct MockTimeSource {
-        current_time: std::sync::Mutex<i64>,
-    }
-    
-    impl MockTimeSource {
-        fn new(time: i64) -> Self {
-            Self {
-                current_time: std::sync::Mutex::new(time),
-            }
-        }
-        
-        fn advance(&self, micros: i64) {
-            let mut time = self.current_time.lock().unwrap();
-            *time += micros;
-        }
-    }
-    
-    impl TimeSource for MockTimeSource {
-        fn now_micros(&self) -> i64 {
-            *self.current_time.lock().unwrap()
-        }
-    }
-    
-    #[tokio::test]
-    async fn test_canonical_spread_formula() {
-        let config = MarketConfig {
-            symbol: "TEST".to_string(),
-            base_decimals: 8,
-            quote_decimals: 2,
-            tick_size: Decimal::from_str("0.01").unwrap(),
-            lot_size: Decimal::from_str("0.01").unwrap(),
-            min_order_size: Decimal::from_str("0.1").unwrap(),
-            max_order_size: Decimal::from(1000),
-            maker_fee_rate: MAKER_FEE_BPS,
-            taker_fee_rate: TAKER_FEE_BPS,
-        };
-        
-        let time_source = Arc::new(MockTimeSource::new(1_000_000_000));
-        let mut engine = ASMMEngine::new(
-            config,
-            Decimal::from(100_000),
-            time_source.clone(),
-            24,
-        );
-        
-        // Set known values for testing
-        engine.mid_price = Decimal::from(100);
-        engine.gamma = Decimal::from_str("0.1").unwrap();
-        engine.kappa = Decimal::from_str("1.5").unwrap();
-        engine.sigma = Decimal::from_str("0.3").unwrap();  // 30% annualized vol
-        
-        // Calculate quotes
-        engine.calculate_reservation_price().unwrap();
-        engine.calculate_optimal_quotes().unwrap();
-        
-        // Verify spread is positive and reasonable
-        assert!(engine.optimal_spread > Decimal::ZERO);
-        assert!(engine.ask_price > engine.bid_price);
-        
-        // Verify spread components
-        let time_to_close_days = Decimal::from(24 * 3600) / Decimal::from(86400);  // ~1 day
-        let variance_term = engine.gamma * engine.sigma * engine.sigma * time_to_close_days;
-        assert!(variance_term > Decimal::ZERO);
-    }
-    
-    #[tokio::test]
-    async fn test_position_tracking() {
-        let mut tracker = PositionTracker::new(Decimal::from(100));
-        
-        // Buy 10 @ 100
-        tracker.update_position_buy(
-            Decimal::from(10),
-            Decimal::from(100),
-            Decimal::from_str("0.2").unwrap(),
-        );
-        
-        assert_eq!(tracker.inventory, Decimal::from(10));
-        assert_eq!(tracker.position_cost, Decimal::from(1000));
-        assert_eq!(tracker.avg_entry_price, Decimal::from(100));
-        
-        // Sell 5 @ 105
-        tracker.update_position_sell(
-            Decimal::from(5),
-            Decimal::from(105),
-            Decimal::from_str("0.1").unwrap(),
-        );
-        
-        assert_eq!(tracker.inventory, Decimal::from(5));
-        assert_eq!(tracker.realized_pnl, Decimal::from(25));  // 5 * (105 - 100)
-        
-        // Update unrealized P&L
-        tracker.update_unrealized_pnl(Decimal::from(110));
-        assert_eq!(tracker.unrealized_pnl, Decimal::from(50));  // 5 * (110 - 100)
-    }
-    
-    #[tokio::test]
-    async fn test_risk_limits() {
-        let mut risk_manager = RiskManager::new(Decimal::from(10_000));
-        let mut position = PositionTracker::new(Decimal::from(100));
-        
-        // Simulate loss
-        position.realized_pnl = Decimal::from(-150);
-        
-        // Should not breach daily loss limit yet
-        let result = risk_manager.check_risk_limits(
-            &position,
-            Decimal::from(100),
-            1_000_000,
-        );
-        assert!(result.is_ok());
-        
-        // Simulate larger loss
-        position.realized_pnl = Decimal::from(-250);
-        
-        // Should breach daily loss limit (2% of 10,000 = 200)
-        let result = risk_manager.check_risk_limits(
-            &position,
-            Decimal::from(100),
-            2_000_000,
-        );
-        assert!(result.is_err());
-        assert!(
-            risk_manager.trading_halted = true;
+        if rm.current_daily_pnl <= -rm.daily_loss_limit {
+            rm.trading_halted = true;
             self.active = false;
+            rm.last_risk_check = now_ts;
             return Err("Daily loss limit reached".into());
         }
         
-        let position_value = self.inventory.abs() * self.mid_price;
-        let max_allowed_position = risk_manager.max_position_size * self.mid_price;
-        
-        if position_value > max_allowed_position {
+        if rm.position_limits_breached {
             self.order_size_bid = 0.0;
             self.order_size_ask = 0.0;
-            return Err("Position size limit exceeded".into());
         }
-        
-        risk_manager.last_risk_check = Clock::get()?.unix_timestamp;
-        
+
+        // Absolute base-unit cap
+        if self.inventory.abs() > rm.max_position_size {
+            self.order_size_bid = 0.0;
+            self.order_size_ask = 0.0;
+            rm.trading_halted = true;
+            self.active = false;
+            rm.last_risk_check = now_ts;
+            return Err("Absolute position size exceeded".into());
+        }
+
+        rm.last_risk_check = now_ts;
         Ok(())
     }
 
@@ -1341,64 +931,421 @@ mod tests {
         price: f64,
         timestamp: i64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let adjusted_quantity = (quantity / LOT_SIZE).round() * LOT_SIZE;
-        
-        if adjusted_quantity < MIN_ORDER_SIZE {
-            return Err("Order size below minimum".into());
-        }
-        
+        if price <= 0.0 || !price.is_finite() { return Err("Invalid trade price".into()); }
+
+        let qty = ((quantity / LOT_SIZE).round() * LOT_SIZE).max(0.0);
+        if qty < MIN_ORDER_SIZE { return Err("Order size below minimum".into()); }
+
         match side {
             OrderSide::Buy => {
-                if self.inventory + adjusted_quantity > self.max_inventory {
-                    return Err("Trade would exceed max inventory".into());
+                if self.inventory + qty > self.max_inventory { return Err("Buy would exceed max inventory".into()); }
+                let fee_mult = 1.0 + MAKER_FEE_BPS / 10_000.0;
+
+                if self.inventory.abs() < f64::EPSILON {
+                    self.inventory_vwap = price;
+                } else {
+                    self.inventory_vwap = ((self.inventory_vwap * self.inventory) + (price * qty)) / (self.inventory + qty);
                 }
-                self.inventory += adjusted_quantity;
-                self.realized_pnl -= adjusted_quantity * price * (1.0 + MAKER_FEE_BPS / 10000.0);
-            },
+                self.inventory += qty;
+
+                // Realize maker fee immediately
+                self.realized_pnl -= qty * price * (fee_mult - 1.0);
+            }
             OrderSide::Sell => {
-                if self.inventory - adjusted_quantity < self.min_inventory {
-                    return Err("Trade would exceed min inventory".into());
-                }
-                self.inventory -= adjusted_quantity;
-                self.realized_pnl += adjusted_quantity * price * (1.0 - MAKER_FEE_BPS / 10000.0);
+                if self.inventory - qty < self.min_inventory { return Err("Sell would exceed min inventory".into()); }
+                let fee_mult = 1.0 - MAKER_FEE_BPS / 10_000.0;
+
+                let closing_qty = qty.min(self.inventory.abs());
+                let pnl_core = (price - self.inventory_vwap) * closing_qty;
+                self.realized_pnl += pnl_core;
+
+                self.realized_pnl -= qty * price * (1.0 - fee_mult);
+
+                self.inventory -= qty;
+                if self.inventory.abs() < f64::EPSILON { self.inventory_vwap = 0.0; }
             }
         }
-        
-        self.total_volume += adjusted_quantity;
+
+        self.total_volume += qty;
         self.trade_count += 1;
-        
+
+        // Enqueue for markout-based toxicity update
+        self.markouts.push_back(FillEvent { side, price, qty, ts: timestamp });
+
         self.update_unrealized_pnl();
-        
-        let mut risk_manager = self.risk_manager.write().await;
-        risk_manager.current_daily_pnl = self.realized_pnl + self.unrealized_pnl;
-        
+        {
+            let mut rm = self.risk_manager.write().await;
+            rm.current_daily_pnl = self.realized_pnl + self.unrealized_pnl;
+        }
+
+        self.update_toxicity(side); // immediate 1-step toxicity
         self.calculate_reservation_price(timestamp).await?;
         self.calculate_optimal_quotes(timestamp).await?;
-        
         Ok(())
     }
 
     fn update_unrealized_pnl(&mut self) {
-        self.unrealized_pnl = self.inventory * (self.mid_price - self.calculate_average_cost());
+        if self.inventory.abs() < f64::EPSILON {
+            self.unrealized_pnl = 0.0;
+            return;
+        }
+        self.unrealized_pnl = (self.mid_price - self.inventory_vwap) * self.inventory;
     }
 
     fn calculate_average_cost(&self) -> f64 {
-        if self.inventory.abs() < f64::EPSILON {
-            return self.mid_price;
+        if self.inventory.abs() < f64::EPSILON { return self.mid_price; }
+        self.inventory_vwap.max(TICK_SIZE)
+    }
+
+    fn update_toxicity(&mut self, side: OrderSide) {
+        let last_r = if let Ok(ve) = self.volatility_estimator.try_read() {
+            ve.last_return
+        } else { 0.0 };
+
+        let adverse = match side {
+            OrderSide::Buy  => last_r < 0.0,
+            OrderSide::Sell => last_r > 0.0,
+        };
+        let hit = if adverse { 1.0 } else { 0.0 };
+        self.toxicity_score = (1.0 - TOXICITY_EWMA_ALPHA) * self.toxicity_score + TOXICITY_EWMA_ALPHA * hit;
+    }
+
+    /// Set current slot risk [0..1]. Higher -> wider spreads, smaller sizes.
+    pub fn set_slot_risk(&mut self, risk: f64) {
+        self.slot_risk = risk.clamp(0.0, 1.0);
+    }
+
+    /// Optional: force reset of toxicity (e.g., after regime change)
+    pub fn reset_toxicity(&mut self) {
+        self.toxicity_score = 0.0;
+    }
+
+    /// Optional: seed last published quotes (after warm start)
+    pub fn seed_last_quotes(&mut self, bid: f64, ask: f64) {
+        self.last_published_bid = bid.max(TICK_SIZE);
+        self.last_published_ask = ask.max(TICK_SIZE);
+    }
+
+    pub fn get_venue_quotes(&self) -> Vec<VenueQuote> {
+        if self.venues.is_empty() || self.bid_price <= 0.0 || self.ask_price <= 0.0 {
+            return Vec::new();
         }
-        
-        let notional = self.realized_pnl + self.inventory * self.mid_price;
-        notional / self.inventory
+        let core_spread = (self.ask_price - self.bid_price).max(TICK_SIZE);
+        let core_mid = 0.5 * (self.bid_price + self.ask_price);
+
+        let hostile = self.flow_classifier.clamp(0.0, 1.0);
+
+        let mut out = Vec::with_capacity(self.venues.len());
+        for v in self.venues.iter() {
+            let liq = v.liquidity_score.clamp(0.0, 1.0);
+            let size_scale = (VENUE_SIZE_SCALE_MIN + liq * (VENUE_SIZE_SCALE_MAX - VENUE_SIZE_SCALE_MIN))
+                .clamp(VENUE_SIZE_SCALE_MIN, VENUE_SIZE_SCALE_MAX);
+
+            // Learned slippage/toxicity widen (bps)
+            let widen_bps = (v.slippage_bps + 20.0 * v.toxicity).max(0.0);
+            let widen_abs = (widen_bps / 10_000.0) * core_mid;
+
+            // Fee-aware edge
+            let fee_edge = ((TAKER_FEE_BPS - v.maker_fee_bps) / 10_000.0).max(0.0) * core_mid;
+
+            // Per-venue skew (bps): punish hostile venues, reward deep ones
+            let skew_bps = ((VENUE_SKEW_BPS_MAX) * (v.toxicity - 0.5 * hostile) - 5.0 * (1.0 - liq)).clamp(-VENUE_SKEW_BPS_MAX, VENUE_SKEW_BPS_MAX);
+            let skew_abs = (skew_bps / 10_000.0) * core_mid;
+
+            // Queue-position shading (ticks)
+            let (bid_ticks, ask_ticks) = self.shading_ticks_for_venue(v);
+
+            let half = 0.5 * (core_spread + widen_abs + fee_edge);
+            let mut bid = (core_mid - half - skew_abs).max(TICK_SIZE) + (bid_ticks as f64) * TICK_SIZE;
+            let mut ask = (core_mid + half - skew_abs).max(TICK_SIZE) + (ask_ticks as f64) * TICK_SIZE;
+
+            bid = ((bid / TICK_SIZE).floor() * TICK_SIZE).max(TICK_SIZE);
+            ask = ((ask / TICK_SIZE).ceil()  * TICK_SIZE).max(TICK_SIZE);
+            if bid >= ask { bid = (bid - TICK_SIZE).max(TICK_SIZE); ask += TICK_SIZE; }
+
+            out.push(VenueQuote {
+                venue: v.name.clone(),
+                bid_price: bid,
+                bid_size: (self.order_size_bid * size_scale).max(0.0),
+                ask_price: ask,
+                ask_size: (self.order_size_ask * size_scale).max(0.0),
+                timestamp: self.last_update,
+            });
+        }
+        out
+    }
+
+    pub fn upsert_venue(&mut self, vp: VenueParam) {
+        if let Some(ix) = self.venues.iter().position(|x| x.name == vp.name) {
+            self.venues[ix] = vp;
+        } else {
+            self.venues.push(vp);
+        }
+    }
+
+    /// Provide SOL/USD ref for tip conversion (e.g., from Pyth SOL/USD)
+    pub fn set_tip_ref_sol_usd(&mut self, sol_usd: f64) {
+        self.tip_ref_sol_usd = sol_usd.max(0.01);
+    }
+
+    /// === REPLACE: conservative_ev_per_unit (adds depth/imbalance & sigma→500ms realism) ===
+    fn conservative_ev_per_unit(&self) -> f64 {
+        // Base edge: half-spread after taker-maker differential
+        let spread = (self.ask_price - self.bid_price).max(TICK_SIZE);
+        let fees_abs = ((TAKER_FEE_BPS - MAKER_FEE_BPS) / 10_000.0).max(0.0) * self.mid_price;
+        let base = (spread - fees_abs).max(0.0) * 0.5;
+
+        // Regime penalties
+        let conf_ratio = (self.confidence_interval / ORACLE_CONFIDENCE_THRESHOLD).clamp(0.0, 1.0);
+        let tox      = self.toxicity_score.clamp(0.0, 1.0);
+        let hostile  = self.flow_classifier.clamp(0.0, 1.0);
+
+        // 500ms sigma proxy (Solana reality)
+        let sigma_500ms = (self.sigma / (86400.0f64).sqrt()) * (0.5f64).sqrt();
+        let sigma_pen_bps = (sigma_500ms * 10_000.0).min(30.0);
+
+        // Depth/imbalance adjustment: thin/one-sided book lowers effective edge
+        let mut depth_pen_bps = 0.0;
+        let mut imb_pen_bps   = 0.0;
+        if let Some((_k, bs)) = self.venue_books.iter().next() {
+            let base_size = (self.max_inventory * 0.05).max(MIN_ORDER_SIZE);
+            let depth_unit = (bs.best_bid_qty.min(bs.best_ask_qty)) / (base_size + 1e-9);
+            depth_pen_bps = (6.0 * (1.0 - depth_unit.clamp(0.0, 1.0))).clamp(0.0, 6.0);
+            let imb = ASMMEngine::l2_imbalance(bs).abs();
+            imb_pen_bps = (8.0 * imb).clamp(0.0, 8.0);
+        }
+
+        let penalty_abs = self.mid_price * (
+            (tox * 12.0 + hostile * 8.0 + conf_ratio * 4.0 + sigma_pen_bps + depth_pen_bps + imb_pen_bps) / 10_000.0
+        );
+
+        (base - penalty_abs).max(0.0)
+    }
+
+    /// === REPLACE: submission_urgency (adds depth & queue-pressure realism) ===
+    fn submission_urgency(&self, venue: &str, side: OrderSide, now_ts: i64) -> f64 {
+        let mut s = 0.0;
+
+        // Slot risk & quote aging dominate
+        let age = if self.last_quote_ts > 0 { (now_ts - self.last_quote_ts).max(0) as f64 } else { 0.0 };
+        s += 0.35 * self.slot_risk.clamp(0.0, 1.0);
+        s += 0.25 * (age / 1.5).min(1.0); // >1.5s stale ⇒ high urgency
+
+        // Toxic flow
+        s += 0.20 * self.toxicity_score.clamp(0.0, 1.0);
+
+        // Queue pressure + depth: back of queue or thin book ⇒ higher urgency
+        if let Some(bs) = self.venue_books.get(venue) {
+            let qf = match side {
+                OrderSide::Buy  => (1.0 - bs.qpos_bid_ahead_frac).clamp(0.0, 1.0),
+                OrderSide::Sell => (1.0 - bs.qpos_ask_ahead_frac).clamp(0.0, 1.0),
+            };
+            s += 0.15 * qf;
+
+            let base_size = (self.max_inventory * 0.05).max(MIN_ORDER_SIZE);
+            let depth_unit = (bs.best_bid_qty.min(bs.best_ask_qty)) / (base_size + 1e-9);
+            let thin = (1.0 - depth_unit.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            s += 0.15 * thin;
+        } else {
+            s += 0.10;
+        }
+        s.clamp(0.0, 1.0)
+    }
+
+    /// === REPLACE: plan_jito_bundle_for_venue (adds 1-tick improvement test vs tip cost) ===
+    pub fn plan_jito_bundle_for_venue(
+        &mut self,
+        venue: &str,
+        side: OrderSide,
+        qty: f64,
+        now_ts: i64,
+    ) -> JitoTipPlan {
+        let ev_per_unit = self.conservative_ev_per_unit();
+        let ev_quote = (ev_per_unit * qty).max(0.0);
+        let ev_usd = ev_quote;
+
+        let sol_usd = if self.symbol.starts_with("SOL/") { self.mid_price.max(0.01) } else { self.tip_ref_sol_usd.max(0.01) };
+        let urgency = self.submission_urgency(venue, side, now_ts);
+
+        // Venue hostility factor
+        let mut venue_factor = 1.0;
+        if let Some(vp) = self.venues.iter().find(|x| x.name == venue) {
+            venue_factor *= (1.0 + 0.20 * vp.toxicity.clamp(0.0,1.0));
+            venue_factor *= (1.0 + 0.15 * (1.0 - vp.liquidity_score.clamp(0.0,1.0)));
+        }
+
+        // Tip as fraction of EV in SOL, convex in urgency & slot risk
+        let base_tip_sol = (JITO_TIP_FRACTION_OF_EV * ev_usd / sol_usd).max(0.0);
+        let tip_sol = base_tip_sol
+            * urgency.powf(JITO_TIP_POWER)
+            * (1.0 + 0.5 * self.slot_risk.clamp(0.0,1.0))
+            * venue_factor;
+
+        let mut tip_lamports = (tip_sol * (LAMPORTS_PER_SOL as f64)).round() as u64;
+        if tip_lamports < JITO_TIP_MIN_LAMPORTS { tip_lamports = JITO_TIP_MIN_LAMPORTS; }
+        if tip_lamports > JITO_TIP_MAX_LAMPORTS { tip_lamports = JITO_TIP_MAX_LAMPORTS; }
+
+        // One-tick improvement test: if stepping improves EV enough, prefer bundle
+        let tick_value_quote = TICK_SIZE * qty;
+        // EV gain from one tick better fill, conservative: penalize half the fees differential
+        let one_tick_gain_usd = (tick_value_quote - 0.5 * ((TAKER_FEE_BPS - MAKER_FEE_BPS).max(0.0) / 10_000.0) * self.mid_price * qty).max(0.0);
+
+        let expected_tip_usd = (tip_lamports as f64 / LAMPORTS_PER_SOL as f64) * sol_usd;
+        let use_bundle = (urgency > 0.35 || self.slot_risk > 0.4)
+            && ev_usd + one_tick_gain_usd > expected_tip_usd;
+
+        JitoTipPlan { use_bundle, tip_lamports }
+    }
+
+    fn refill_cancel_tokens(&mut self, now_ts: i64) {
+        if self.last_cancel_refill_ts == 0 {
+            self.last_cancel_refill_ts = now_ts;
+            return;
+        }
+        let dt = (now_ts - self.last_cancel_refill_ts).max(0) as f64;
+        if dt <= 0.0 { return; }
+
+        // More budget in high slot risk / toxicity; less when flow is friendly.
+        let hostile = self.flow_classifier.clamp(0.0, 1.0);
+        let rate_scale = (1.0 + 0.5 * self.slot_risk.clamp(0.0,1.0) + 0.25 * self.toxicity_score.clamp(0.0,1.0) - 0.25 * (1.0 - hostile)).clamp(0.5, 2.0);
+        let refill_rate = CANCEL_RATE_MAX_PER_SEC * rate_scale;
+
+        // Slightly larger bucket when slot risk is elevated.
+        let cap = (CANCEL_BURST_MAX * (1.0 + 0.25 * self.slot_risk.clamp(0.0,1.0))).clamp(CANCEL_BURST_MAX, CANCEL_BURST_MAX * 1.25);
+
+        self.cancel_tokens = (self.cancel_tokens + refill_rate * dt).min(cap);
+        self.last_cancel_refill_ts = now_ts;
+    }
+
+    fn consume_cancel_tokens(&mut self, tokens: f64) -> bool {
+        if self.cancel_tokens + 1e-9 >= tokens {
+            self.cancel_tokens -= tokens;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn quote_change_cost_ticks(old_bid: f64, old_ask: f64, new_bid: f64, new_ask: f64) -> i64 {
+        let db = ((new_bid - old_bid).abs() / TICK_SIZE).round() as i64;
+        let da = ((new_ask - old_ask).abs() / TICK_SIZE).round() as i64;
+        db + da
+    }
+
+    /// === REPLACE: update_orderbook_snapshot (spoof-resilient smoothing & jump damp) ===
+    pub fn update_orderbook_snapshot(
+        &mut self,
+        venue: &str,
+        best_bid_qty: f64,
+        best_ask_qty: f64,
+        our_bid_qty: f64,
+        our_ask_qty: f64,
+        queue_ahead_bid_frac: f64,
+        queue_ahead_ask_frac: f64,
+        ts: i64,
+    ) {
+        let e = self.venue_books.entry(venue.to_string()).or_insert(BookState {
+            best_bid_qty: 0.0,
+            best_ask_qty: 0.0,
+            our_bid_qty: 0.0,
+            our_ask_qty: 0.0,
+            qpos_bid_ahead_frac: 0.5,
+            qpos_ask_ahead_frac: 0.5,
+            last_update: ts,
+        });
+
+        // Base α from elapsed time (τ≈400ms)
+        let dt = (ts - e.last_update).max(0) as f64;
+        let tau = 0.4;
+        let mut a = (1.0 - (-dt / tau).exp()).clamp(0.05, 0.6);
+
+        // Spoof/jump damp: if incoming size is a >x jump vs EWMA, reduce α for that side this tick
+        let jump_thresh = 5.0;
+        let bb = best_bid_qty.max(0.0);
+        let ba = best_ask_qty.max(0.0);
+
+        let damp_b = if e.best_bid_qty > 0.0 {
+            let r = (bb / e.best_bid_qty.max(1e-9)).max(e.best_bid_qty.max(1e-9) / bb.max(1e-9));
+            if r > jump_thresh { 0.25 } else { 1.0 }
+        } else { 1.0 };
+        let damp_a = if e.best_ask_qty > 0.0 {
+            let r = (ba / e.best_ask_qty.max(1e-9)).max(e.best_ask_qty.max(1e-9) / ba.max(1e-9));
+            if r > jump_thresh { 0.25 } else { 1.0 }
+        } else { 1.0 };
+
+        // Apply smoothing with per-side damp
+        e.best_bid_qty = (1.0 - a * damp_b) * e.best_bid_qty + (a * damp_b) * bb;
+        e.best_ask_qty = (1.0 - a * damp_a) * e.best_ask_qty + (a * damp_a) * ba;
+        e.our_bid_qty  = (1.0 - a) * e.our_bid_qty  + a * our_bid_qty.max(0.0);
+        e.our_ask_qty  = (1.0 - a) * e.our_ask_qty  + a * our_ask_qty.max(0.0);
+
+        // Clamp & smooth queue fractions
+        let qbf = queue_ahead_bid_frac.clamp(0.0, 1.0);
+        let qaf = queue_ahead_ask_frac.clamp(0.0, 1.0);
+        e.qpos_bid_ahead_frac = (1.0 - a) * e.qpos_bid_ahead_frac + a * qbf;
+        e.qpos_ask_ahead_frac = (1.0 - a) * e.qpos_ask_ahead_frac + a * qaf;
+
+        e.last_update = ts;
+    }
+
+    fn l2_imbalance(bs: &BookState) -> f64 {
+        let b = bs.best_bid_qty.max(0.0);
+        let a = bs.best_ask_qty.max(0.0);
+        let s = (b + a).max(1e-9);
+        (b - a) / s // [-1,1]
+    }
+
+    /// === REPLACE: shading_ticks_for_venue (queue + L2 imbalance + micro alpha + staleness damp) ===
+    fn shading_ticks_for_venue(&self, venue: &VenueParam) -> (i64, i64) {
+        if let Some(bs) = self.venue_books.get(&venue.name) {
+            let mut bid_ticks = 0i64;
+            let mut ask_ticks = 0i64;
+
+            // Queue position pressure
+            if bs.qpos_bid_ahead_frac < QUEUE_POS_FRONT_THRESH { bid_ticks += 1; }
+            else if bs.qpos_bid_ahead_frac > QUEUE_POS_BACK_THRESH { bid_ticks -= 1; }
+            if bs.qpos_ask_ahead_frac < QUEUE_POS_FRONT_THRESH { ask_ticks -= 1; }
+            else if bs.qpos_ask_ahead_frac > QUEUE_POS_BACK_THRESH { ask_ticks += 1; }
+
+            // L2 imbalance tilt
+            let imb = ASMMEngine::l2_imbalance(bs); // [-1,1]
+            let imb_ticks = (imb.abs() * (QUEUE_IMB_SKEW_TICKS_MAX as f64)).floor() as i64;
+            if imb > 0.0 {
+                bid_ticks -= imb_ticks;
+                ask_ticks += imb_ticks;
+            } else if imb < 0.0 {
+                bid_ticks += imb_ticks;
+                ask_ticks -= imb_ticks;
+            }
+
+            // Micro-alpha tilt
+            let alpha_tick = if self.alpha_signal > 0.0 { 1 } else if self.alpha_signal < 0.0 { -1 } else { 0 };
+            bid_ticks += alpha_tick;
+            ask_ticks -= alpha_tick;
+
+            // Staleness damp
+            let age = (self.last_update.saturating_sub(bs.last_update)) as f64;
+            if age > 0.0 {
+                let damp = (1.0 - (age / 2.0).min(1.0)).clamp(0.0, 1.0);
+                bid_ticks = ((bid_ticks as f64) * damp).round() as i64;
+                ask_ticks = ((ask_ticks as f64) * damp).round() as i64;
+            }
+
+            bid_ticks = bid_ticks.clamp(-QUEUE_POS_SKEW_TICKS_MAX, QUEUE_POS_SKEW_TICKS_MAX);
+            ask_ticks = ask_ticks.clamp(-QUEUE_POS_SKEW_TICKS_MAX, QUEUE_POS_SKEW_TICKS_MAX);
+            (bid_ticks, ask_ticks)
+        } else {
+            (0, 0)
+        }
     }
 
     pub async fn get_quote(&self) -> Result<Quote, Box<dyn std::error::Error>> {
-        if !self.active {
-            return Err("Engine inactive".into());
-        }
-        
-        let risk_manager = self.risk_manager.read().await;
-        if risk_manager.trading_halted {
-            return Err("Trading halted due to risk limits".into());
+        if !self.active { return Err("Engine inactive".into()); }
+        let rm = self.risk_manager.read().await;
+        if rm.trading_halted { return Err("Trading halted due to risk limits".into()); }
+
+        if self.bid_price <= 0.0 || self.ask_price <= 0.0 || self.bid_price >= self.ask_price {
+            return Err("Invalid quote state".into());
         }
         
         Ok(Quote {
@@ -1407,7 +1354,7 @@ mod tests {
             ask_price: self.ask_price,
             ask_size: self.order_size_ask,
             timestamp: self.last_update,
-            spread: self.ask_price - self.bid_price,
+            spread: (self.ask_price - self.bid_price).max(TICK_SIZE),
             mid_price: self.mid_price,
         })
     }
@@ -1419,28 +1366,24 @@ mod tests {
         eta: Option<f64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(g) = gamma {
-            if g <= 0.0 || g > 1.0 {
-                return Err("Invalid gamma parameter".into());
-            }
-            self.gamma = g;
+            if (0.0..=1.0).contains(&g) {
+                self.gamma = g.max(1e-6);
+                self.gamma_base = self.gamma;
+            } else { return Err("Invalid gamma".into()); }
         }
-        
         if let Some(k) = kappa {
-            if k <= 0.0 || k > 10.0 {
-                return Err("Invalid kappa parameter".into());
-            }
-            self.kappa = k;
+            if (0.0..=10.0).contains(&k) {
+                self.kappa = k.max(1e-6);
+                self.kappa_base = self.kappa;
+            } else { return Err("Invalid kappa".into()); }
         }
-        
         if let Some(e) = eta {
-            if e <= 0.0 || e > 1.0 {
-                return Err("Invalid eta parameter".into());
-            }
-            self.eta = e;
+            if (0.0..=1.0).contains(&e) { self.eta = e.max(1e-6); }
+            else { return Err("Invalid eta".into()); }
         }
-        
-        self.calculate_optimal_quotes(Clock::get()?.unix_timestamp).await?;
-        
+
+        let ts = if self.last_update > 0 { self.last_update } else { 0 };
+        self.calculate_optimal_quotes(ts).await?;
         Ok(())
     }
 
@@ -1495,30 +1438,16 @@ mod tests {
     }
 
     pub fn calculate_sharpe_ratio(&self) -> f64 {
-        let price_history = futures::executor::block_on(self.price_history.read());
-        
-        if price_history.len() < 2 {
-            return 0.0;
-        }
-        
-        let returns: Vec<f64> = price_history.windows(2)
-            .map(|w| (w[1].price / w[0].price).ln())
-            .collect();
-        
-        if returns.is_empty() {
-            return 0.0;
-        }
-        
-        let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
-            .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>() / returns.len() as f64;
-        
-        if variance > 0.0 {
-            mean_return / variance.sqrt() * (365.0_f64).sqrt()
-        } else {
-            0.0
-        }
+        let ve = futures::executor::block_on(self.volatility_estimator.read());
+        if ve.returns.len() < 2 { return 0.0; }
+
+        let n = ve.returns.len() as f64;
+        let mean = ve.returns.iter().sum::<f64>() / n;
+        let var = ve.returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n.max(1.0);
+        if var <= 0.0 { return 0.0; }
+        // daily sharpe proxy (assuming returns are ~ per second)
+        let daily_scale = (86400.0f64).sqrt();
+        mean / var.sqrt() * daily_scale
     }
 
     pub fn get_risk_metrics(&self) -> RiskMetrics {
@@ -1568,23 +1497,24 @@ pub struct RiskMetrics {
 
 impl VolatilityEstimator {
     pub fn update_garch_params(&mut self, returns: &[f64]) {
-        if returns.len() < 20 {
-            return;
-        }
-        
-        let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
-            .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>() / returns.len() as f64;
-        
-        self.omega = variance * 0.01;
+        if returns.len() < 20 { return; }
+
+        // Target unconditional variance
+        let n = returns.len() as f64;
+        let mean = returns.iter().sum::<f64>() / n;
+        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n.max(1.0);
+
+        // Conservative re-fit: keep alpha small, beta high, persistence < 0.995
         self.alpha = 0.05;
-        self.beta = 0.94;
-        
-        let persistence = self.alpha + self.beta;
-        if persistence >= 1.0 {
-            self.beta = 0.99 - self.alpha;
+        self.beta  = 0.94;
+        let pers = self.alpha + self.beta;
+        if pers >= 0.995 {
+            self.beta = (0.995 - self.alpha).max(0.90);
         }
+
+        // Back out omega for stationary variance: var = omega / (1 - alpha - beta)
+        let denom = (1.0 - self.alpha - self.beta).max(1e-6);
+        self.omega = (var * denom * 0.5).max(1e-12);
     }
 }
 
