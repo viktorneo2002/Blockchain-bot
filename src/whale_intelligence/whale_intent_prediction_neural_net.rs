@@ -298,6 +298,161 @@ const USE_W2_SOA5: bool = true;   // interleave W2 rows as [5 x ph] SOA for stre
 /// === ADD (verbatim): bf16 storage toggle ===
 const USE_BF16_WEIGHTS: bool = true;   // store W1/W1ᵀ/W2 as IEEE bfloat16 (u16) with exact widen on load
 
+/// === ADD (verbatim): 2MiB-aligned reallocator + THP advice ===
+const USE_HUGEPAGE_ADVICE: bool = true;
+const ALIGN_2MB: bool = true;
+
+/// === ADD (verbatim): missing constants ===
+const SOFTMAX_EXP_CUTOFF: f32 = -50.0;
+const USE_FAST_EXP: bool = false;
+
+/// === ADD (verbatim): missing functions ===
+#[inline(always)]
+fn fast_exp_f32(x: f32) -> f32 {
+    // Simple polynomial approximation for exp(x)
+    let x = x.clamp(-50.0, 50.0);
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    1.0 + x + x2/2.0 + x3/6.0 + x4/24.0
+}
+
+#[inline(always)]
+fn pack_f32_to_f16_vec(src: &[f32]) -> Vec<u16> {
+    let n = src.len();
+    let mut dst = vec![0u16; n];
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(src.as_ptr().add(i));
+            let h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, h);
+            i += 8;
+        }
+    }
+    while i < n { dst[i] = f32_to_f16_bits_nearest_even(src[i]); i += 1; }
+    dst
+}
+
+#[inline(always)]
+fn f32_to_f16_bits_nearest_even(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = (bits >> 23) & 0xFF;
+    let mant = bits & 0x7FFFFF;
+    
+    if exp == 0xFF {
+        // NaN or Inf
+        ((sign << 15) | 0x7C00 | ((mant != 0) as u32 * 0x200)) as u16
+    } else if exp == 0 {
+        // Denormal
+        let shift = mant.leading_zeros() - 8;
+        let mant16 = (mant << (shift + 1)) >> 13;
+        ((sign << 15) | mant16) as u16
+    } else {
+        // Normal
+        let exp16 = ((exp as i32) - 127 + 15) as u32;
+        if exp16 >= 31 {
+            // Overflow to Inf
+            ((sign << 15) | 0x7C00) as u16
+        } else if exp16 <= 0 {
+            // Underflow to denormal
+            let shift = 1 - exp16 as u32;
+            let mant16 = (mant >> (13 + shift)) | ((mant >> (12 + shift)) & 1);
+            ((sign << 15) | mant16) as u16
+        } else {
+            ((sign << 15) | (exp16 << 10) | (mant >> 13)) as u16
+        }
+    }
+}
+
+#[inline(always)]
+fn lock_and_prefault_weights_f16(w1: &mut [u16], w1t: &mut [u16], w2s: &mut [u16]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use core::ffi::c_void;
+        extern "C" {
+            fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+            fn mlock(addr: *const c_void, len: usize) -> i32;
+        }
+        const MADV_WILLNEED: i32 = 3;
+        const MADV_HUGEPAGE: i32 = 14;
+
+        for slice in [w1, w1t, w2s] {
+            if slice.is_empty() { continue; }
+            let ptr = slice.as_mut_ptr() as *mut c_void;
+            let len = slice.len() * core::mem::size_of::<u16>();
+            let _ = madvise(ptr, len, MADV_WILLNEED);
+            if ENABLE_HUGEPAGE_ADVICE { let _ = madvise(ptr, len, MADV_HUGEPAGE); }
+            let _ = mlock(ptr, len);
+        }
+    }
+}
+
+#[inline(always)]
+fn logistic_from_margin(inv_t: f32, margin: f32) -> f32 {
+    1.0 / (1.0 + (-margin * inv_t).exp())
+}
+
+#[inline(always)]
+fn enable_denormals_zero_if_x86() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let mut mxcsr = _mm_getcsr();
+        mxcsr |= 0x8040; // FTZ + DAZ
+        _mm_setcsr(mxcsr);
+    }
+}
+
+#[inline(always)]
+fn init_store_hidden_stream_env() {
+    // Environment variable initialization for hidden store toggle
+    let _ = std::env::var("PREDICTOR_STORE_HIDDEN_STREAM");
+}
+
+#[inline(always)]
+fn env_f32(name: &str, default: f32) -> f32 {
+    match std::env::var(name) {
+        Ok(s) => s.parse().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+#[inline(always)]
+fn build_nz_indices_micropruned(x: &[f32], w1_col_l1: &[f32], w2_linf_max: f32, nz: &mut Vec<usize>) -> usize {
+    let mut count = 0;
+    for i in 0..x.len() {
+        if x[i].abs() * w1_col_l1[i] > w2_linf_max {
+            nz.push(i);
+            count += 1;
+        }
+    }
+    count
+}
+
+#[inline(always)]
+fn should_use_sparse_cost(nz: usize, d: usize, h: usize, cost: CostModel) -> bool {
+    let dense_cost = (d * h) as f32 * cost.dense_elem;
+    let sparse_cost = (nz * h) as f32 * cost.sparse_elem + cost.nz_overhead;
+    sparse_cost < dense_cost
+}
+
+#[derive(Clone, Copy)]
+struct CostModel {
+    dense_elem: f32,
+    sparse_elem: f32,
+    nz_overhead: f32,
+}
+
+#[inline(always)]
+fn round_up_8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
 /// === ADD (verbatim): env flag reader (evaluated once at init) ===
 #[inline(always)]
 fn env_flag(name: &str, default: bool) -> bool {
@@ -363,6 +518,83 @@ unsafe fn prefetch_row(ptr: *const f32, stride: usize) {
             _mm_prefetch(ptr.add(stride) as *const i8, _MM_HINT_T0);
         }
     }
+}
+
+/// === ADD (verbatim): 2MiB-aligned reallocator + THP advice ===
+#[inline(always)]
+fn to_aligned_vec_with<const A: usize, T: Copy>(mut v: Vec<T>) -> Vec<T> {
+    use std::alloc::{alloc, dealloc, Layout};
+    assert!(A.is_power_of_two());
+    let len = v.len();
+    if len == 0 { return v; }
+    let layout = Layout::from_size_align(len * core::mem::size_of::<T>(), A).unwrap();
+    unsafe {
+        let ptr = alloc(layout) as *mut T;
+        if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        core::ptr::copy_nonoverlapping(v.as_ptr(), ptr, len);
+        let out = Vec::from_raw_parts(ptr, len, len);
+        let old = v.as_mut_ptr();
+        let old_cap = v.capacity();
+        let old_layout = Layout::array::<T>(old_cap).unwrap();
+        core::mem::forget(v);
+        dealloc(old as *mut u8, old_layout);
+        out
+    }
+}
+
+#[inline(always)]
+fn to_aligned_vec_2mb_f32(v: Vec<f32>) -> Vec<f32> {
+    if ALIGN_2MB { to_aligned_vec_with::<{ 2 * 1024 * 1024 }, f32>(v) } else { v }
+}
+#[inline(always)]
+fn to_aligned_vec_2mb_u16(v: Vec<u16>) -> Vec<u16> {
+    if ALIGN_2MB { to_aligned_vec_with::<{ 2 * 1024 * 1024 }, u16>(v) } else { v }
+}
+
+#[inline(always)]
+fn advise_hugepage_f32(bufs: &[&[f32]]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use core::ffi::c_void;
+        extern "C" { fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32; }
+        const MADV_HUGEPAGE: i32 = 14;
+        if !USE_HUGEPAGE_ADVICE { return; }
+        for b in bufs {
+            if b.is_empty() { continue; }
+            let p = b.as_ptr() as *mut c_void;
+            let n = b.len() * core::mem::size_of::<f32>();
+            let _ = madvise(p, n, MADV_HUGEPAGE);
+        }
+    }
+}
+#[inline(always)]
+fn advise_hugepage_u16(bufs: &[&[u16]]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use core::ffi::c_void;
+        extern "C" { fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32; }
+        const MADV_HUGEPAGE: i32 = 14;
+        if !USE_HUGEPAGE_ADVICE { return; }
+        for b in bufs {
+            if b.is_empty() { continue; }
+            let p = b.as_ptr() as *mut c_void;
+            let n = b.len() * core::mem::size_of::<u16>();
+            let _ = madvise(p, n, MADV_HUGEPAGE);
+        }
+    }
+}
+
+/// === ADD (verbatim): branchless clamp+ReLU + prefetch distance ===
+#[inline(always)]
+fn clamp_relu(h: f32, clip: f32) -> f32 {
+    // clamp to [-clip, clip] then ReLU
+    let t = h.max(-clip).min(clip);
+    t.max(0.0)
+}
+
+#[inline(always)]
+fn prefetch_lookahead(pd: usize) -> usize {
+    if pd >= 256 { 128 } else { 64 }
 }
 
 /// === ADD (verbatim): 64B-aligned Vec reallocator for f32/f16 ===
@@ -523,6 +755,36 @@ fn pack_f32_to_bf16_vec(src: &[f32]) -> Vec<u16> {
     }
     while i < n { dst[i] = f32_to_bf16_bits_nearest_even(src[i]); i += 1; }
     dst
+}
+
+/// === ADD (verbatim): build SoA-5 for f32 ===
+#[inline(always)]
+fn build_w2_soa5_f32(w2_f32: &[f32], ph: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; 5 * ph];
+    for j in 0..ph {
+        let b = 5 * j;
+        out[b + 0] = w2_f32[0 * ph + j];
+        out[b + 1] = w2_f32[1 * ph + j];
+        out[b + 2] = w2_f32[2 * ph + j];
+        out[b + 3] = w2_f32[3 * ph + j];
+        out[b + 4] = w2_f32[4 * ph + j];
+    }
+    out
+}
+
+/// === ADD (verbatim): build SoA-5 for f16 ===
+#[inline(always)]
+fn build_w2_soa5_f16(w2_f16: &[u16], ph: usize) -> Vec<u16> {
+    let mut out = vec![0u16; 5 * ph];
+    for j in 0..ph {
+        let b = 5 * j;
+        out[b + 0] = w2_f16[0 * ph + j];
+        out[b + 1] = w2_f16[1 * ph + j];
+        out[b + 2] = w2_f16[2 * ph + j];
+        out[b + 3] = w2_f16[3 * ph + j];
+        out[b + 4] = w2_f16[4 * ph + j];
+    }
+    out
 }
 
 /// === ADD (verbatim): build SoA-5 for bf16 as well ===
@@ -1138,6 +1400,10 @@ fn call_sparse_f16_avx512(
     unsafe { forward_input_sparse_scaled_f16_avx512(ph, w1th, b1, w1c, w2h, w2r, ob, ch, cl, x, nz, h, z) }
 }
 
+/// === ADD (verbatim): binding flags for SoA-5 selection ===
+#[derive(Copy, Clone)]
+enum DenseLayout { RowMajor, SoA5 }
+
 /// === ADD (verbatim): utility to order class indices by last argmax ===
 #[inline(always)]
 fn class_eval_order(last_top: usize) -> [usize;5] {
@@ -1713,6 +1979,10 @@ pub struct IntentPredictor {
 
     // Cost model for sparse/dense decision
     cost: CostModel,
+
+    // === NEW: layout flags for dense path selection ===
+    dense_f32_layout: DenseLayout,
+    dense_bf16_layout: DenseLayout,
 }
 
 impl IntentPredictor {
@@ -1881,25 +2151,30 @@ impl IntentPredictor {
     let mut w2_soa5_f16 = if USE_W2_SOA5 && use_f16_weights { build_w2_soa5_f16(&packed_w2_scaled_f16, ph) } else { Vec::new() };
     let mut w2_soa5_bf16= if USE_W2_SOA5 && use_bf16_weights { build_w2_soa5_bf16(&packed_w2_scaled_bf16, ph) } else { Vec::new() };
 
-    // 64B align everything hot
-    pw1        = to_aligned_vec_f32(pw1);
-    pw1t       = to_aligned_vec_f32(pw1t);
-    pw2_scaled = to_aligned_vec_f32(pw2_scaled);
+    // 2MiB alignment for hot weights (opt-in)
+    pw1        = to_aligned_vec_2mb_f32(pw1);
+    pw1t       = to_aligned_vec_2mb_f32(pw1t);
+    pw2_scaled = to_aligned_vec_2mb_f32(pw2_scaled);
     if use_f16_weights {
-        packed_w1_f16        = to_aligned_vec_u16(packed_w1_f16);
-        packed_w1t_f16       = to_aligned_vec_u16(packed_w1t_f16);
-        packed_w2_scaled_f16 = to_aligned_vec_u16(packed_w2_scaled_f16);
+        packed_w1_f16        = to_aligned_vec_2mb_u16(packed_w1_f16);
+        packed_w1t_f16       = to_aligned_vec_2mb_u16(packed_w1t_f16);
+        packed_w2_scaled_f16 = to_aligned_vec_2mb_u16(packed_w2_scaled_f16);
     }
     if use_bf16_weights {
-        packed_w1_bf16        = to_aligned_vec_u16(packed_w1_bf16);
-        packed_w1t_bf16       = to_aligned_vec_u16(packed_w1t_bf16);
-        packed_w2_scaled_bf16 = to_aligned_vec_u16(packed_w2_scaled_bf16);
+        packed_w1_bf16        = to_aligned_vec_2mb_u16(packed_w1_bf16);
+        packed_w1t_bf16       = to_aligned_vec_2mb_u16(packed_w1t_bf16);
+        packed_w2_scaled_bf16 = to_aligned_vec_2mb_u16(packed_w2_scaled_bf16);
     }
     if USE_W2_SOA5 {
-        w2_soa5 = to_aligned_vec_f32(w2_soa5);
-        if use_f16_weights { w2_soa5_f16  = to_aligned_vec_u16(w2_soa5_f16); }
-        if use_bf16_weights{ w2_soa5_bf16 = to_aligned_vec_u16(w2_soa5_bf16); }
+        w2_soa5 = to_aligned_vec_2mb_f32(w2_soa5);
+        if use_f16_weights { w2_soa5_f16  = to_aligned_vec_2mb_u16(w2_soa5_f16); }
+        if use_bf16_weights { w2_soa5_bf16= to_aligned_vec_2mb_u16(w2_soa5_bf16); }
     }
+
+    // THP hint
+    advise_hugepage_f32(&[&pw1, &pw1t, &pw2_scaled, &w2_soa5]);
+    advise_hugepage_u16(&[&packed_w1_f16, &packed_w1t_f16, &packed_w2_scaled_f16, &w2_soa5_f16]);
+    advise_hugepage_u16(&[&packed_w1_bf16, &packed_w1t_bf16, &packed_w2_scaled_bf16, &w2_soa5_bf16]);
 
     // lock/prefault
     lock_and_prefault_weights(&mut pw1, &mut pw1t, &mut pw2_scaled, &mut pb1);
@@ -1932,19 +2207,19 @@ impl IntentPredictor {
     init_store_hidden_stream_env();
 
     // === Static kernel binding ===
+    let mut dense_f32_layout = DenseLayout::RowMajor;
+    let mut dense_bf16_layout = DenseLayout::RowMajor;
+
     let fwd_dense_f32: FwdDenseF32 =
         if has_avx2_fma && use_stream_fused_rt && ph <= STREAM_FUSED_WHEN_PH_LE {
             #[cfg(target_arch = "x86_64")]
             {
                 if USE_W2_SOA5 && !w2_soa5.is_empty() {
-                    // bind SoA-5 variant (closure adapts signature to FwdDenseF32)
-                    |pd, ph, w1, b1, w1r, _w2s, _w2r, ob, ch, cl, x, h, z| unsafe {
-                        forward_fused_scaled_stream_avx2_soa5(pd, ph, w1, b1, w1r, &w2_soa5, ob, ch, cl, x, h, z)
-                    }
+                    dense_f32_layout = DenseLayout::SoA5;
+                    forward_fused_scaled_stream_avx2_soa5
                 } else {
-                    |pd,ph,w1,b1,w1r,w2s,_w2r,ob,ch,cl,x,h,z| unsafe {
-                        forward_fused_scaled_stream_avx2(pd,ph,w1,b1,w1r,w2s,&[0usize;0],ob,ch,cl,x,h,z)
-                    }
+                    // your existing stream-fused (row-major) function
+                    call_fused_avx2
                 }
             }
             #[cfg(not(target_arch = "x86_64"))]
@@ -2026,15 +2301,11 @@ impl IntentPredictor {
             #[cfg(target_arch="x86_64")]
             {
                 Some(if has_avx2_fma {
-                    // choose SoA-5 stream variant when in regime
-                    if USE_W2_SOA5 && use_stream_fused_rt && ph <= STREAM_FUSED_WHEN_PH_LE && !w2_soa5_bf16.is_empty() {
-                        |pd,ph,w1h,b1,w1r,_w2h,_w2r,ob,ch,cl,x,h,z| unsafe {
-                            forward_fused_scaled_stream_avx2_soa5_bf16(pd,ph,w1h,b1,w1r,&w2_soa5_bf16,ob,ch,cl,x,h,z)
-                        }
+                    if USE_W2_SOA5 && !w2_soa5_bf16.is_empty() && use_stream_fused_rt && ph <= STREAM_FUSED_WHEN_PH_LE {
+                        dense_bf16_layout = DenseLayout::SoA5;
+                        forward_fused_scaled_stream_avx2_soa5_bf16
                     } else {
-                        |pd,ph,w1h,b1,w1r,w2h,_w2r,ob,ch,cl,x,h,z| unsafe {
-                            forward_fused_scaled_bf16_avx2(pd,ph,w1h,b1,w1r,w2h,&[0usize;0],ob,ch,cl,x,h,z)
-                        }
+                        forward_fused_scaled_bf16_avx2
                     }
                 } else { unreachable!() })
             }
@@ -2130,6 +2401,9 @@ impl IntentPredictor {
         fwd_sparse_bf16,
 
         cost,
+
+        dense_f32_layout,
+        dense_bf16_layout,
         })
     }
 
@@ -2327,14 +2601,17 @@ impl IntentPredictor {
                     }
                 } else if self.use_bf16_weights {
                     if let Some(f) = self.fwd_dense_bf16 {
+                        let w2 = match self.dense_bf16_layout {
+                            DenseLayout::RowMajor => &self.packed_w2_scaled_bf16,
+                            DenseLayout::SoA5     => &self.packed_w2s_soa5_bf16,
+                        };
                         f(
                             self.p_feature_count,
                             self.p_hidden_size,
                             &self.packed_w1_bf16,
                             &self.packed_b1,
                             &self.w1_row_offsets,
-                            &self.packed_w2_scaled_bf16,
-                            &self.w2_row_offsets,
+                            w2, &self.w2_row_offsets,
                             &self.out_bias,
                             self.w.clip_hidden,
                             self.w.clip_logits,
@@ -2360,14 +2637,17 @@ impl IntentPredictor {
                         )?;
                     }
                 } else {
+                    let w2 = match self.dense_f32_layout {
+                        DenseLayout::RowMajor => &self.packed_w2_scaled,
+                        DenseLayout::SoA5     => &self.packed_w2s_soa5,
+                    };
                     self.fwd_dense_f32(
                         self.p_feature_count,
                         self.p_hidden_size,
                         &self.packed_w1,
                         &self.packed_b1,
                         &self.w1_row_offsets,
-                        &self.packed_w2_scaled,
-                        &self.w2_row_offsets,
+                        w2, &self.w2_row_offsets,
                         &self.out_bias,
                         self.w.clip_hidden,
                         self.w.clip_logits,
@@ -2493,6 +2773,25 @@ impl IntentPredictor {
     #[inline]
     pub fn get_last_input_hash(&self) -> Option<[u8; 32]> {
         self.last_input_hash
+    }
+
+    /// Check if history vote is OK for a class
+    #[inline(always)]
+    fn hist_vote_ok(&self, class: usize) -> bool {
+        if self.hist_len < HYST_MIN[class] as usize { return false; }
+        let mut count = 0;
+        for i in 0..self.hist_len {
+            if self.hist[i] == class as u8 { count += 1; }
+        }
+        count >= HYST_MIN[class] as usize
+    }
+
+    /// Push a class to history
+    #[inline(always)]
+    fn hist_push(&mut self, class: usize) {
+        self.hist[self.hist_pos] = class as u8;
+        self.hist_pos = (self.hist_pos + 1) % HWIN;
+        if self.hist_len < HWIN { self.hist_len += 1; }
     }
 
     /// === REPLACE: reload_weights ===
@@ -3574,6 +3873,130 @@ unsafe fn forward_input_sparse_scaled_avx2(
     Ok(())
 }
 
+/// === REPLACE: AVX2 stream-fused using SoA-5 (f32) ===
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn forward_fused_scaled_stream_avx2_soa5(
+    pd: usize, ph: usize,
+    packed_w1: &[f32], packed_b1: &[f32], w1_row_offsets: &[usize],
+    w2s_soa5: &[f32], _w2_row_offsets_unused: &[usize],
+    out_bias: &[f32; 5], clip_hidden: f32, clip_logits: f32,
+    x: &[f32], hidden_out: &mut [f32], logits_out: &mut [f32],
+) -> Result<(), PredictionError> {
+    use core::arch::x86_64::*;
+    #[inline(always)] unsafe fn hsum256_ps(v: __m256) -> f32 {
+        let x = _mm256_hadd_ps(v, v); let y = _mm256_hadd_ps(x, x);
+        _mm_cvtss_f32(_mm_add_ss(_mm256_castps256_ps128(y), _mm256_extractf128_ps(y, 1)))
+    }
+
+    let mut acc = [0.0f32; 5];
+    acc.copy_from_slice(out_bias);
+
+    let pf = prefetch_lookahead(pd);
+
+    for j in 0..ph {
+        let base = w1_row_offsets[j];
+        let row_ptr = packed_w1.as_ptr().add(base);
+        let x_ptr   = x.as_ptr();
+        let mut a0 = _mm256_setzero_ps();
+
+        let mut i = 0usize;
+        while i + 8 <= pd {
+            let rv = _mm256_loadu_ps(row_ptr.add(i));
+            let xv = _mm256_loadu_ps(x_ptr.add(i));
+            a0 = _mm256_fmadd_ps(rv, xv, a0);
+            if USE_PREFETCH { prefetch_row(row_ptr, i + pf); prefetch_row(x_ptr, i + pf); }
+            i += 8;
+        }
+        let mut h = hsum256_ps(a0) + *packed_b1.get_unchecked(j);
+        while i < pd { h += *row_ptr.add(i) * *x_ptr.add(i); i += 1; }
+
+        let h = clamp_relu(h, clip_hidden);
+        *hidden_out.get_unchecked_mut(j) = h;
+
+        let wptr = w2s_soa5.as_ptr().add(5 * j);
+        acc[0] = acc[0].mul_add(*wptr.add(0), h);
+        acc[1] = acc[1].mul_add(*wptr.add(1), h);
+        acc[2] = acc[2].mul_add(*wptr.add(2), h);
+        acc[3] = acc[3].mul_add(*wptr.add(3), h);
+        acc[4] = acc[4].mul_add(*wptr.add(4), h);
+    }
+
+    for r in 0..5 {
+        let mut v = acc[r];
+        if v >  clip_logits { v =  clip_logits; }
+        if v < -clip_logits { v = -clip_logits; }
+        logits_out[r] = v;
+    }
+    _mm256_zeroupper();
+    Ok(())
+}
+
+/// === REPLACE: AVX2 stream-fused using SoA-5 (bf16) ===
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn forward_fused_scaled_stream_avx2_soa5_bf16(
+    pd: usize, ph: usize,
+    w1_bf16: &[u16], b1: &[f32], w1_row_offsets: &[usize],
+    w2_soa5_bf16: &[u16], _w2_row_offsets_unused: &[usize],
+    out_bias: &[f32;5], clip_hidden: f32, clip_logits: f32,
+    x: &[f32], hidden_out: &mut [f32], logits_out: &mut [f32],
+) -> Result<(), PredictionError> {
+    use core::arch::x86_64::*;
+    #[inline(always)] unsafe fn widen_bf16_8(ptr: *const u16) -> __m256 {
+        let h = _mm_loadu_si128(ptr as *const _);
+        let w32 = _mm256_cvtepu16_epi32(h);
+        let w32s = _mm256_slli_epi32::<16>(w32);
+        core::mem::transmute::<__m256i, __m256>(w32s)
+    }
+    #[inline(always)] unsafe fn hsum256_ps(v: __m256) -> f32 {
+        let x = _mm256_hadd_ps(v, v); let y = _mm256_hadd_ps(x, x);
+        _mm_cvtss_f32(_mm_add_ss(_mm256_castps256_ps128(y), _mm256_extractf128_ps(y, 1)))
+    }
+
+    let mut acc = [0.0f32; 5];
+    acc.copy_from_slice(out_bias);
+
+    let pf = prefetch_lookahead(pd);
+
+    for j in 0..ph {
+        let base = w1_row_offsets[j];
+        let mut a0 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= pd {
+            let wv = widen_bf16_8(w1_bf16.as_ptr().add(base + i));
+            let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+            a0 = _mm256_fmadd_ps(wv, xv, a0);
+            if USE_PREFETCH { prefetch_row(x.as_ptr(), i + pf); }
+            i += 8;
+        }
+        let mut h = hsum256_ps(a0) + b1[j];
+        while i < pd {
+            let w = (w1_bf16[base + i] as u32) << 16;
+            h += f32::from_bits(w) * x[i]; i += 1;
+        }
+
+        let h = clamp_relu(h, clip_hidden);
+        *hidden_out.get_unchecked_mut(j) = h;
+
+        let wptr = w2_soa5_bf16.as_ptr().add(5 * j);
+        acc[0] = acc[0].mul_add(f32::from_bits(((*wptr.add(0)) as u32) << 16), h);
+        acc[1] = acc[1].mul_add(f32::from_bits(((*wptr.add(1)) as u32) << 16), h);
+        acc[2] = acc[2].mul_add(f32::from_bits(((*wptr.add(2)) as u32) << 16), h);
+        acc[3] = acc[3].mul_add(f32::from_bits(((*wptr.add(3)) as u32) << 16), h);
+        acc[4] = acc[4].mul_add(f32::from_bits(((*wptr.add(4)) as u32) << 16), h);
+    }
+
+    for r in 0..5 {
+        let mut v = acc[r];
+        if v >  clip_logits { v =  clip_logits; }
+        if v < -clip_logits { v = -clip_logits; }
+        logits_out[r] = v;
+    }
+    _mm256_zeroupper();
+    Ok(())
+}
+
 /// === ADD (verbatim): forward_fused_scaled_f16 (dispatch wrapper) ===
 #[inline(always)]
 fn forward_fused_scaled_f16(
@@ -4122,6 +4545,26 @@ fn argmax_with_second(probs: &[f32; 5]) -> (usize, f32, f32) {
 
     for i in 1..5 {
         let v = probs[i];
+        if v > best_v {
+            second_v = best_v;
+            best_v = v;
+            best_i = i;
+        } else if v > second_v {
+            second_v = v;
+        }
+    }
+    (best_i, best_v, second_v)
+}
+
+/// Branchless top-2 selection for 5 elements
+#[inline(always)]
+fn top2_5(vals: [f32; 5]) -> (usize, f32, f32) {
+    let mut best_i = 0usize;
+    let mut best_v = vals[0];
+    let mut second_v = f32::NEG_INFINITY;
+
+    for i in 1..5 {
+        let v = vals[i];
         if v > best_v {
             second_v = best_v;
             best_v = v;
