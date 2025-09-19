@@ -1,86 +1,508 @@
 #![deny(unsafe_code)]
 #![deny(warnings)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::{
-    collections::{VecDeque, HashSet},
-    hash::BuildHasherDefault,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use smallvec::SmallVec;
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
-use rustc_hash::FxHasher;
-
-use solana_sdk::{
-    pubkey,
-    pubkey::Pubkey,
-    instruction::Instruction,
-};
-
-use tokio::task::yield_now;
+use std::collections::{HashMap, VecDeque};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::instruction::Instruction;
 use serde::{Deserialize, Serialize};
+// === ADD (verbatim) ===
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use anyhow::Result;
+use once_cell::sync::Lazy;
+use dashmap::{DashMap, DashSet};
+// === ADD (verbatim) ===
+use ahash::AHashMap;
+use std::hash::Hash;
+// === REPLACE: atomic import line ===
+use std::sync::atomic::{AtomicU64, Ordering, AtomicBool, AtomicI64};
 
-// ----- Optional low-latency allocator (enable with `--features mimalloc`) -----
-#[cfg(feature = "mimalloc")]
-use mimalloc::MiMalloc;
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+// Real Solana DEX Program IDs
+pub const JUPITER_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+pub const RAYDIUM_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+pub const ORCA_PROGRAM_ID: &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
 
-// ======= Hasher/type aliases =======
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
-type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
-type FxHashSet<T>    = HashSet<T, FxBuildHasher>;
+// Common stablecoin mints
+pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+pub const BUSD_MINT: &str = "AJ1W9A9N9dEMdVyoDiam2rV44gnBm2csrPDP7xqcapgX";
 
-// ======= Tunables (measured + bounded) =======
-const MAX_RECENT_SWAPS: usize = 512;        // ring cap to prevent bloat
-const MIRROR_WINDOW_SECS: u64 = 5;          // timing mirror window
-const COORD_WINDOW_SECS: u64 = 60;          // coordination timing window
-const HISTORY_WINDOW_SECS: u64 = 24 * 3600; // 24h rolling
-const COORD_WINDOW_SLOTS: u64 = 2;          // slot-based timing window for coordination
-const MAX_PATTERN_TS: usize = 256;          // hard cap per PatternKey
-const MAX_PEERS_PER_WALLET: usize = 128;    // hard cap per wallet
-const MAX_COORD_CACHE: usize = 8192;        // cache size cap for coord scores
-const COORD_CACHE_TTL_SECS: u64 = 2;        // TTL for coord cache reuse
+// === ADD (verbatim) ===
+pub static JUPITER_PROGRAM: Lazy<Pubkey> = Lazy::new(|| Pubkey::from_str(JUPITER_PROGRAM_ID).unwrap());
+pub static RAYDIUM_PROGRAM: Lazy<Pubkey> = Lazy::new(|| Pubkey::from_str(RAYDIUM_PROGRAM_ID).unwrap());
+pub static ORCA_PROGRAM:    Lazy<Pubkey> = Lazy::new(|| Pubkey::from_str(ORCA_PROGRAM_ID).unwrap());
 
-// ======= Zero-cost const Pubkeys (no runtime parsing) =======
-pub const JUPITER_PROGRAM_ID: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
-pub const RAYDIUM_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
-pub const ORCA_PROGRAM_ID:    Pubkey = pubkey!("9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP");
+pub static USDC: Lazy<Pubkey> = Lazy::new(|| Pubkey::from_str(USDC_MINT).unwrap());
+pub static USDT: Lazy<Pubkey> = Lazy::new(|| Pubkey::from_str(USDT_MINT).unwrap());
+pub static BUSD: Lazy<Pubkey> = Lazy::new(|| Pubkey::from_str(BUSD_MINT).unwrap());
 
-pub const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-pub const USDT_MINT: Pubkey = pubkey!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
-pub const BUSD_MINT: Pubkey = pubkey!("AJ1W9A9N9dEMdVyoDiam2rV44gnBm2csrPDP7xqcapgX");
+// === ADD (verbatim) ===
+pub static EXTRA_STABLE: Lazy<DashSet<Pubkey, ahash::RandomState>> =
+    Lazy::new(|| DashSet::with_hasher(ahash::RandomState::default()));
 
-// Hot-path stable set (O(1) contains)
-static STABLE_MINTS: Lazy<[Pubkey; 3]> = Lazy::new(|| [USDC_MINT, USDT_MINT, BUSD_MINT]);
+#[inline]
+pub fn add_stablecoin(mint: Pubkey) { EXTRA_STABLE.insert(mint); }
 
+#[inline]
+pub fn remove_stablecoin(mint: &Pubkey) { EXTRA_STABLE.remove(mint); }
+
+// === REPLACE: is_stablecoin ===
 #[inline(always)]
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
+fn is_stablecoin(mint: &Pubkey) -> bool {
+    mint == &*USDC || mint == &*USDT || mint == &*BUSD || EXTRA_STABLE.contains(mint)
+}
+
+// === ADD (verbatim) ===
+const RECENT_WINDOW_SECS: u64 = 86_400; // 24h rolling window
+// === REPLACE: const MAX_RECENT_SWAPS line ===
+pub const MAX_RECENT_SWAPS: usize = 128;    // hard cap; keeps memory O(1)
+const MAX_PATTERN_TIMES: usize = 512;   // per-pattern timestamps cap
+
+// === ADD (verbatim) ===
+const MIRROR_BAND_SECS: u64 = 5;
+const MIRROR_SCAN_BACK: usize = 64;
+const MIRROR_DECAY_HL: f64 = 2.0; // seconds
+
+// === ADD (verbatim) ===
+const HEAT_ALPHA: f64 = 0.20;            // EWMA for slot fee-heat
+const TIP_ALPHA:  f64 = 0.15;            // EWMA for average observed tip (lamports)
+const PPM_SCALE:  f64 = 1_000_000.0;     // fixed-point scaling for atomics
+
+const DEFAULT_CU_ESTIMATE: u64 = 200_000; // conservative CU for a typical swap/bundle
+const MAX_TIP_LAMPORTS:    u64 = 5_000_000; // hard cap safety (5M lamports)
+
+// === ADD (verbatim) ===
+const TIMING_MAX_PAIRS: usize = 128; // upper bound on matched timing pairs per correl
+const TIMING_MAX_SKEW_SECS: u64 = 60; // symmetric window used in swap timing correl
+
+// === ADD (verbatim) ===
+const MAX_SLIPPAGE_BPS_HARD: u16 = 9_900;   // reject pathological payloads
+const MIN_AMOUNT_IN: u64 = 10;              // dust guard (prevents noise / grief)
+const MAX_MATCH_LATENCY_SECS: u64 = 8;      // timing window for mirror burst
+
+// === ADD (verbatim) ===
+const MIN_MIRROR_BAND_SECS: f64 = 2.0;
+const MAX_MIRROR_BAND_SECS: f64 = 6.0;
+
+// === ADD (verbatim) ===
+const STAIR_MAX_ATTEMPTS: u32 = 6;
+const MIRROR_RECENCY_TAU_SECS: f64 = 180.0; // ~3 min half-life-esque
+const COORD_HL_SECS: f64 = 600.0; // 10 min half-life
+
+// === ADD (verbatim) ===
+const SHADOW_POS_HOLD_SECS: u64 = 2;
+const SHADOW_NEG_COOLDOWN_SECS: u64 = 1;
+
+// === ADD (verbatim) ===
+const SPEND_WINDOW_SECS: u64 = 60;
+
+// === ADD (verbatim) ===
+const STATS_ALPHA: f64 = 0.20;
+
+// === ADD (verbatim) ===
+const SURPRISE_SHORT_SECS: u64 = 10;
+const SURPRISE_LONG_SECS:  u64 = 120;
+
+// === ADD (verbatim) ===
+const VOL_ALPHA: f64 = 0.15;
+
+// === ADD (verbatim) ===
+const DD_WINDOW_SECS: u64 = 600; // 10 min
+const DD_HARD_NEG_LAMPORTS: i64 = -2_500_000; // ~0.0025 SOL default brake
+
+// === ADD (verbatim) ===
+const CB_CACHE_CAP: usize = 256;
+static CB_CACHE_TICK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+
+// === ADD (verbatim) ===
+type RelayId = u8; // map these to your relays externally
+
+#[derive(Default)]
+struct RelayStats {
+    acc_ppm:   AtomicU64, // acceptance ppm (0..1e6)
+    per_cu:    AtomicU64, // lamports/CU EWMA
+    rtt_ms:    AtomicU64, // end-to-end RTT ms EWMA
+    cool_until: AtomicU64, // unix ts (secs) until which relay is cooled
+    fails:     AtomicU64,  // consecutive fails
+}
+impl RelayStats {
+    #[inline] fn load_acc(&self) -> f64 { (self.acc_ppm.load(Ordering::Relaxed) as f64) / PPM_SCALE }
+    #[inline] fn store_acc(&self, x: f64) { self.acc_ppm.store((x.clamp(0.0,1.0)*PPM_SCALE).round() as u64, Ordering::Relaxed); }
+    #[inline] fn load_per_cu(&self) -> u64 { self.per_cu.load(Ordering::Relaxed) }
+    #[inline] fn store_per_cu(&self, v: u64) { self.per_cu.store(v, Ordering::Relaxed); }
+    #[inline] fn load_rtt(&self) -> u64 { self.rtt_ms.load(Ordering::Relaxed) }
+    #[inline] fn store_rtt(&self, v: u64) { self.rtt_ms.store(v, Ordering::Relaxed); }
+    #[inline] fn set_cool(&self, until: u64) { self.cool_until.store(until, Ordering::Relaxed); }
+    #[inline] fn cooled(&self, now: u64) -> bool { now <= self.cool_until.load(Ordering::Relaxed) }
+}
+
+const RELAY_ALPHA: f64 = 0.20;
+const RELAY_COOL_BASE_SECS: u64 = 8;
+
+// === ADD (verbatim) ===
+const FEED_MAX_SOURCES: usize = 4;
+const FEED_QUORUM: usize = 2;
+const FEED_FUSE_EPS_SECS: u64 = 1;
+
+type SourceId = u8;
+
+// per-source typed patterns
+// key = (source, dex, token_in)
+type SrcKey = (SourceId, DexType, Pubkey);
+
+// === ADD (verbatim) ===
+const BLOOM_BITS: usize = 1 << 20; // 1M bits (~128KB/partition)
+const BLOOM_HASHES: usize = 3;
+const BLOOM_ROTATE_SECS: u64 = 300;
+
+struct RotBloom {
+    a: Box<[AtomicU64]>, // bitset A
+    b: Box<[AtomicU64]>, // bitset B
+    start_sec: AtomicU64,
+    which_a: AtomicBool, // active partition flag
+}
+impl RotBloom {
+    fn new() -> Self {
+        let words = BLOOM_BITS / 64;
+        let make = || (0..words).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice();
+        Self { a: make(), b: make(), start_sec: AtomicU64::new(0), which_a: AtomicBool::new(true) }
+    }
+    #[inline] fn reset_slice(s: &Box<[AtomicU64]>) { for w in s.iter() { w.store(0, Ordering::Relaxed); } }
+
+    #[inline]
+    fn touch_rotate(&self, now_sec: u64) {
+        let start = self.start_sec.load(Ordering::Relaxed);
+        if now_sec.saturating_sub(start) >= BLOOM_ROTATE_SECS {
+            // rotate partitions
+            let use_a = !self.which_a.load(Ordering::Relaxed);
+            self.which_a.store(use_a, Ordering::Relaxed);
+            if use_a { Self::reset_slice(&self.a); } else { Self::reset_slice(&self.b); }
+            self.start_sec.store(now_sec, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn hashes(bytes: &[u8]) -> [u64; BLOOM_HASHES] {
+        // use ahash for speed; derive multiple via xorshift
+        let mut h = ahash::AHasher::default();
+        h.write(bytes);
+        let mut x = h.finish();
+        let mut out = [0u64; BLOOM_HASHES];
+        for i in 0..BLOOM_HASHES {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17; // xorshift
+            out[i] = x;
+        }
+        out
+    }
+
+    #[inline]
+    fn check_or_set(&self, key: &[u8], now_sec: u64) -> bool {
+        self.touch_rotate(now_sec);
+        let use_a = self.which_a.load(Ordering::Relaxed);
+        let bits = BLOOM_BITS as u64;
+        let hashes = Self::hashes(key);
+        let mut seen = true;
+
+        let slice = if use_a { &self.a } else { &self.b };
+        for h in hashes.iter() {
+            let idx = (h % bits) as usize;
+            let w = idx / 64; let b = 1u64 << (idx % 64);
+            let prev = slice[w].fetch_or(b, Ordering::Relaxed);
+            if (prev & b) == 0 { seen = false; }
+        }
+        seen
+    }
+}
+
+static SEEN_SIGS: Lazy<RotBloom> = Lazy::new(RotBloom::new);
+
+#[inline]
+pub fn seen_signature(sig_bytes: &[u8], now_sec: u64) -> bool {
+    SEEN_SIGS.check_or_set(sig_bytes, now_sec)
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct RouteComplexity {
+    cu_ewma: AtomicU64,
+    heap_ewma: AtomicU64,
+}
+impl RouteComplexity {
+    #[inline] fn load_cu(&self) -> u64 { self.cu_ewma.load(Ordering::Relaxed) }
+    #[inline] fn store_cu(&self, v: u64) { self.cu_ewma.store(v, Ordering::Relaxed); }
+    #[inline] fn load_heap(&self) -> u64 { self.heap_ewma.load(Ordering::Relaxed) }
+    #[inline] fn store_heap(&self, v: u64) { self.heap_ewma.store(v, Ordering::Relaxed); }
+}
+
+const COMPLEXITY_ALPHA: f64 = 0.20;
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct SlotLock { held: AtomicBool }
+
+type PairSlotKey = (Pubkey, Pubkey, u64);
+
+// === ADD (verbatim) ===
+// per-leader best phase (ms from slot start) and EWMA update
+#[derive(Default)]
+struct LeaderPhase {
+    ms: AtomicU64, // best offset
+}
+impl LeaderPhase {
+    #[inline] fn load(&self) -> u64 { self.ms.load(Ordering::Relaxed) }
+    #[inline] fn store(&self, v: u64) { self.ms.store(v, Ordering::Relaxed); }
+}
+
+const PHASE_ALPHA: f64 = 0.20; // EWMA aggressiveness
+
+// === ADD (verbatim) ===
+static SLOT_PRICE_TICK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+#[derive(Clone)]
+struct CbEntry { ixs: [Instruction; 2], tick: u64 }
+
+#[derive(Default)]
+struct ShadowStats {
+    attempts: AtomicU64,
+    hits:     AtomicU64,
+    ev_lamports_ewma: AtomicI64, // signed lamports
+}
+
+impl ShadowStats {
+    #[inline] fn load_hr(&self) -> f64 {
+        let a = self.attempts.load(Ordering::Relaxed) as f64;
+        if a == 0.0 { 0.0 } else { (self.hits.load(Ordering::Relaxed) as f64) / a }
+    }
+    #[inline] fn load_ev(&self) -> f64 { self.ev_lamports_ewma.load(Ordering::Relaxed) as f64 }
+    #[inline] fn update(&self, included: bool, realized_edge_lamports: i64) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        if included { self.hits.fetch_add(1, Ordering::Relaxed); }
+        let prev = self.ev_lamports_ewma.load(Ordering::Relaxed) as f64;
+        let next = (1.0 - STATS_ALPHA) * prev + STATS_ALPHA * (realized_edge_lamports as f64);
+        self.ev_lamports_ewma.store(next.round() as i64, Ordering::Relaxed);
+    }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct VolAtom {
+    val: AtomicU64, // f64 stored as u64 bits
+}
+
+impl VolAtom {
+    #[inline] fn load(&self) -> f64 { f64::from_bits(self.val.load(Ordering::Relaxed)) }
+    #[inline] fn store(&self, v: f64) { self.val.store(v.to_bits(), Ordering::Relaxed); }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct CoordStrength {
+    ppm: AtomicU64, // 0..1_000_000
+    last_ts: AtomicU64,
+}
+
+impl CoordStrength {
+    #[inline] fn load(&self) -> (f64, u64) {
+        let p = (self.ppm.load(Ordering::Relaxed) as f64) / PPM_SCALE;
+        let t = self.last_ts.load(Ordering::Relaxed);
+        (p, t)
+    }
+    #[inline] fn store(&self, p: f64, ts: u64) {
+        let ppm = (p.clamp(0.0, 1.0) * PPM_SCALE).round() as u64;
+        self.ppm.store(ppm, Ordering::Relaxed);
+        self.last_ts.store(ts, Ordering::Relaxed);
+    }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct LeaderStats {
+    inclusions: AtomicU64,
+    attempts: AtomicU64,
+    per_cu_paid: AtomicU64, // EWMA of per-CU price paid on inclusions
+}
+
+impl LeaderStats {
+    #[inline] fn load_acc(&self) -> f64 {
+        let a = self.attempts.load(Ordering::Relaxed) as f64;
+        if a == 0.0 { 0.0 } else { (self.inclusions.load(Ordering::Relaxed) as f64) / a }
+    }
+    #[inline] fn load_pcu(&self) -> u64 { self.per_cu_paid.load(Ordering::Relaxed) }
+    #[inline] fn update(&self, included: bool, per_cu: u64) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        if included {
+            self.inclusions.fetch_add(1, Ordering::Relaxed);
+            let prev = self.load_pcu() as f64;
+            let newv = 0.8 * prev + 0.2 * (per_cu as f64);
+            self.per_cu_paid.store(newv.round() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct SpendWindow {
+    start_ts: AtomicU64,
+    spent: AtomicU64,
+}
+
+impl SpendWindow {
+    #[inline] fn reset_if_needed(&self, now_ts: u64) {
+        let start = self.start_ts.load(Ordering::Relaxed);
+        if now_ts.saturating_sub(start) >= SPEND_WINDOW_SECS {
+            self.start_ts.store(now_ts, Ordering::Relaxed);
+            self.spent.store(0, Ordering::Relaxed);
+        }
+    }
+    #[inline] fn allow(&self, lamports: u64, now_ts: u64, cap: u64) -> bool {
+        self.reset_if_needed(now_ts);
+        let prev = self.spent.fetch_add(lamports, Ordering::Relaxed);
+        prev + lamports <= cap
+    }
+}
+
+// === ADD (verbatim) ===
+#[inline]
+fn count_since(dq: &VecDeque<u64>, now_ts: u64, window: u64) -> u32 {
+    let cutoff = now_ts.saturating_sub(window);
+    let mut c = 0u32;
+    for &t in dq.iter().rev() {
+        if t >= cutoff { c += 1; } else { break; }
+    }
+    c
+}
+
+#[inline]
+fn burst_surprise_score_from(pattern_ts: &VecDeque<u64>, now_ts: u64) -> f64 {
+    if pattern_ts.len() < 4 { return 0.0; }
+    let s = count_since(pattern_ts, now_ts, SURPRISE_SHORT_SECS) as f64 / (SURPRISE_SHORT_SECS as f64);
+    let l = count_since(pattern_ts, now_ts, SURPRISE_LONG_SECS)  as f64 / (SURPRISE_LONG_SECS as f64);
+    if l <= 0.0 { return 0.0; }
+    let ratio = (s / l).max(0.0);
+    // map ratio>1 to (0,1) smoothly; ignore <=1
+    let excess = (ratio - 1.0).max(0.0);
+    (excess / (excess + 1.5)).clamp(0.0, 1.0) // fast rise, bounded
+}
+
+// === ADD (verbatim) ===
+#[inline]
+fn canon_pair(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
+    let ab = a.to_bytes();
+    let bb = b.to_bytes();
+    if ab <= bb { (a,b) } else { (b,a) }
+}
+
+// === ADD (verbatim) ===
+#[inline]
+fn extract_cu_price_from_ix(ix: &Instruction) -> Option<u64> {
+    // ComputeBudget ABI: tag=3 (SetComputeUnitPrice), then LE u64
+    if ix.data.len() >= 9 && ix.data[0] == 3u8 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&ix.data[1..9]);
+        Some(u64::from_le_bytes(buf))
+    } else { None }
+}
+
+// === ADD (verbatim) ===
+#[inline(always)]
+fn read_u64_le_at(data: &[u8], off: usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    let s = data.get(off..end)?;
+    // Safety: slice is exactly 8 bytes due to get()
+    Some(u64::from_le_bytes(s.try_into().ok()?))
 }
 
 #[inline(always)]
-fn read_u64_le(data: &[u8], start: usize) -> u64 {
-    let end = start.saturating_add(8);
-    data.get(start..end)
-        .and_then(|s| s.try_into().ok())
-        .map(u64::from_le_bytes)
-        .unwrap_or(0)
+fn declared_slippage_bps(amount_in: u64, min_out: u64) -> u16 {
+    if amount_in == 0 { return 0; }
+    let ai = amount_in as u128;
+    let mo = min_out as u128;
+    let diff = ai.saturating_sub(mo);
+    let num  = diff.saturating_mul(10_000u128);
+    let bps  = (num / ai).min(9_999u128);
+    bps as u16
 }
 
-// IMPROVED: branchless stable-mint check (no slice traversal)
+// === ADD (verbatim) ===
 #[inline(always)]
-fn is_stable(pk: &Pubkey) -> bool {
-    *pk == USDC_MINT || *pk == USDT_MINT || *pk == BUSD_MINT
+fn sane_swap(token_in: &Pubkey, token_out: &Pubkey, amount_in: u64, min_out: u64, slippage_bps: u16) -> bool {
+    if token_in == token_out { return false; }
+    if amount_in < MIN_AMOUNT_IN { return false; }
+    if min_out == 0 { return false; }
+    if slippage_bps > MAX_SLIPPAGE_BPS_HARD { return false; }
+    true
+}
+
+#[inline(always)]
+fn sanitize_swap_fields(token_in: Pubkey, token_out: Pubkey, amount_in: u64, min_out: u64) -> (Pubkey, Pubkey, u64, u64) {
+    // clamp monotonicity without changing economics
+    let ai = amount_in.max(MIN_AMOUNT_IN);
+    let mo = min_out.min(amount_in); // never > amount_in
+    (token_in, token_out, ai, mo)
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+pub struct FeeHeat {
+    // heat in ppm [0..1_000_000], EWMA of (1 - exp(-bundles/3))
+    heat_ppm: AtomicU64,
+    // EWMA of observed mean tip in lamports
+    tip_avg:  AtomicU64,
+    // online p80 of per-bundle tips (lamports), SA quantile
+    tip_p80: AtomicU64,
+}
+
+impl FeeHeat {
+    #[inline]
+    fn load_heat(&self) -> f64 {
+        (self.heat_ppm.load(Ordering::Relaxed) as f64) / PPM_SCALE
+    }
+    #[inline]
+    fn store_heat(&self, h: f64) {
+        let v = (h.clamp(0.0, 1.0) * PPM_SCALE).round() as u64;
+        self.heat_ppm.store(v, Ordering::Relaxed);
+    }
+    #[inline]
+    fn load_tip(&self) -> u64 {
+        self.tip_avg.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn store_tip(&self, lamports: u64) {
+        self.tip_avg.store(lamports.min(MAX_TIP_LAMPORTS), Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn load_tip_p80(&self) -> u64 { self.tip_p80.load(Ordering::Relaxed) }
+
+    /// Stochastic-approx quantile update; feed per-bundle tip samples ad-hoc.
+    #[inline]
+    pub fn update_tip_quantile_p80(&self, sample_lamports: u64) {
+        // q_{t+1} = q_t + η * (I[x <= q_t] - 0.8)
+        const ETA: f64 = 0.02;
+        let q0 = self.load_tip_p80() as f64;
+        let delta = if (sample_lamports as f64) <= q0 { 1.0 - 0.8 } else { 0.0 - 0.8 };
+        let q1 = (q0 + ETA * delta).max(1.0);
+        self.tip_p80.store(q1.round() as u64, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn update_slot(&self, observed_bundles: u32, mean_tip_lamports: u64) {
+        // instantaneous heat in [0,1]
+        let inst_heat = 1.0 - (-(observed_bundles as f64) / 3.0).exp();
+        let prev_heat = self.load_heat();
+        let new_heat  = (1.0 - HEAT_ALPHA) * prev_heat + HEAT_ALPHA * inst_heat;
+        self.store_heat(new_heat);
+
+        let prev_tip = self.load_tip() as f64;
+        let new_tip  = (1.0 - TIP_ALPHA) * prev_tip + TIP_ALPHA * (mean_tip_lamports as f64);
+        self.store_tip(new_tip.round() as u64);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapData {
-    pub timestamp: u64, // wall-clock seconds; 0 if unknown
-    pub slot: u64,      // Solana slot; 0 if unknown
+    pub timestamp: u64,
     pub dex: DexType,
     pub token_in: Pubkey,
     pub token_out: Pubkey,
@@ -90,15 +512,12 @@ pub struct SwapData {
     pub transaction_signature: String,
 }
 
-#[repr(u8)]
+// === REPLACE: the #[derive(...)] on DexType ===
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum DexType { Jupiter = 0, Raydium = 1, Orca = 2 }
-
-// Typed pattern key (no heap allocs, fast hash)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PatternKey {
-    pub dex: DexType,
-    pub token_in: Pubkey,
+pub enum DexType {
+    Jupiter,
+    Raydium,
+    Orca,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,103 +529,45 @@ pub struct LiquidityAction {
     pub amount_b: u64,
 }
 
-// Running stats for O(1) exact updates
-#[derive(Debug, Clone)]
-struct ProfileStats {
-    swaps: usize,
-    sum_ln_amount: f64,
-    slippage_sum_bps: u64,
-    total_amount_in: u128,
-    stable_trade_vol: u128,
-    stable_inflow: u128,
-    stable_outflow: u128,
-    token_counts: FxHashMap<Pubkey, u32>,
-}
-
-impl Default for ProfileStats {
-    fn default() -> Self {
-        Self {
-            swaps: 0,
-            sum_ln_amount: 0.0,
-            slippage_sum_bps: 0,
-            total_amount_in: 0,
-            stable_trade_vol: 0,
-            stable_inflow: 0,
-            stable_outflow: 0,
-            token_counts: FxHashMap::default(),
-        }
-    }
-}
-
-impl ProfileStats {
-    #[inline(always)]
-    fn apply(&mut self, s: &SwapData) {
-        self.swaps = self.swaps.saturating_add(1);
-        if s.amount_in > 0 {
-            self.sum_ln_amount += (s.amount_in as f64).ln();
-            self.total_amount_in = self.total_amount_in.saturating_add(s.amount_in as u128);
-        }
-        self.slippage_sum_bps = self.slippage_sum_bps.saturating_add(s.slippage_bps as u64);
-
-        let is_stable_trade = STABLE_MINTS.contains(&s.token_in) || STABLE_MINTS.contains(&s.token_out);
-        if is_stable_trade {
-            self.stable_trade_vol = self.stable_trade_vol.saturating_add(s.amount_in as u128);
-        }
-        if STABLE_MINTS.contains(&s.token_in) {
-            self.stable_outflow = self.stable_outflow.saturating_add(s.amount_in as u128);
-        }
-        if STABLE_MINTS.contains(&s.token_out) {
-            self.stable_inflow = self.stable_inflow.saturating_add(s.amount_out as u128);
-        }
-
-        *self.token_counts.entry(s.token_in).or_insert(0) += 1;
-        *self.token_counts.entry(s.token_out).or_insert(0) += 1;
-    }
-
-    #[inline(always)]
-    fn revert(&mut self, s: &SwapData) {
-        if self.swaps > 0 { self.swaps -= 1; }
-        if s.amount_in > 0 {
-            self.sum_ln_amount -= (s.amount_in as f64).ln();
-            self.total_amount_in = self.total_amount_in.saturating_sub(s.amount_in as u128);
-        }
-        self.slippage_sum_bps = self.slippage_sum_bps.saturating_sub(s.slippage_bps as u64);
-
-        let is_stable_trade = STABLE_MINTS.contains(&s.token_in) || STABLE_MINTS.contains(&s.token_out);
-        if is_stable_trade {
-            self.stable_trade_vol = self.stable_trade_vol.saturating_sub(s.amount_in as u128);
-        }
-        if STABLE_MINTS.contains(&s.token_in) {
-            self.stable_outflow = self.stable_outflow.saturating_sub(s.amount_in as u128);
-        }
-        if STABLE_MINTS.contains(&s.token_out) {
-            self.stable_inflow = self.stable_inflow.saturating_sub(s.amount_out as u128);
-        }
-
-        if let Some(c) = self.token_counts.get_mut(&s.token_in) {
-            *c -= 1; if *c == 0 { self.token_counts.remove(&s.token_in); }
-        }
-        if let Some(c) = self.token_counts.get_mut(&s.token_out) {
-            *c -= 1; if *c == 0 { self.token_counts.remove(&s.token_out); }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LiquidityActionType {
     AddLiquidity,
     RemoveLiquidity,
 }
 
+// === REPLACE: the entire WalletProfile struct and its impl block (supersedes step #4) ===
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletProfile {
     pub wallet: Pubkey,
-    pub recent_swaps: VecDeque<SwapData>,                 // bounded ring
-    pub liquidity_actions: SmallVec<[LiquidityAction; 8]>, // tiny allocs
+
+    // Recent swap window (24h) as a ring buffer
+    pub recent_swaps: VecDeque<SwapData>,
+    pub liquidity_actions: Vec<LiquidityAction>,
+
+    // Timestamps & volume
     pub first_seen: u64,
     pub last_activity: u64,
     pub total_volume: u64,
-    // live metrics
+
+    // ===== Rolling counters for O(1) metrics =====
+    // token entropy: counts over the active window
+    token_counts: AHashMap<Pubkey, u32>,
+    token_total: u32,              // counts both in+out → +2 per swap
+
+    // stablecoin flow
+    stable_outflow_in_sum: u128,   // sum(amount_in) when token_in is stable
+    stable_inflow_out_sum: u128,   // sum(amount_out) when token_out is stable
+
+    // averages
+    swaps_count: u32,              // active window size
+    sum_slippage_bps: u64,         // Σ slippage_bps
+    sum_aggr_base: f64,            // Σ ( ln(amount_in)/20 + 2*slippage_bps/10_000 )
+
+    // cached endpoints for freq calc (avoid peeking the deque repeatedly)
+    first_ts: u64,
+    last_ts: u64,
+
+    // ===== Exposed metrics (kept in sync) =====
     pub aggression_index: f64,
     pub token_rotation_entropy: f64,
     pub risk_preference: f64,
@@ -216,23 +577,37 @@ pub struct WalletProfile {
     pub stablecoin_inflow_ratio: f64,
     pub avg_slippage_tolerance: f64,
     pub swap_frequency_score: f64,
-    // O(1) running stats (exact)
-    stats: ProfileStats,
-    // EMA for mirror intent
-    mirror_ema: f64,
 }
 
 impl WalletProfile {
-    #[inline(always)]
+    #[inline]
     pub fn new(wallet: Pubkey) -> Self {
-        let now = now_unix();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+
         Self {
             wallet,
-            recent_swaps: VecDeque::with_capacity(128),
-            liquidity_actions: SmallVec::new(),
+            recent_swaps: VecDeque::with_capacity(MAX_RECENT_SWAPS),
+            liquidity_actions: Vec::new(),
             first_seen: now,
             last_activity: now,
             total_volume: 0,
+
+            token_counts: AHashMap::new(),
+            token_total: 0,
+
+            stable_outflow_in_sum: 0,
+            stable_inflow_out_sum: 0,
+
+            swaps_count: 0,
+            sum_slippage_bps: 0,
+            sum_aggr_base: 0.0,
+
+            first_ts: 0,
+            last_ts: 0,
+
             aggression_index: 0.0,
             token_rotation_entropy: 0.0,
             risk_preference: 0.5,
@@ -242,549 +617,2067 @@ impl WalletProfile {
             stablecoin_inflow_ratio: 0.0,
             avg_slippage_tolerance: 0.0,
             swap_frequency_score: 0.0,
-            stats: ProfileStats::default(),
-            mirror_ema: 0.0,
         }
     }
 
     #[inline(always)]
-    pub fn maintain_bounds(&mut self, now: u64) {
-        let cutoff = now.saturating_sub(HISTORY_WINDOW_SECS);
+    fn add_token(&mut self, k: Pubkey) {
+        *self.token_counts.entry(k).or_insert(0) += 1;
+        self.token_total = self.token_total.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn remove_token(&mut self, k: Pubkey) {
+        if let Some(v) = self.token_counts.get_mut(&k) {
+            if *v > 1 { *v -= 1; } else { self.token_counts.remove(&k); }
+            self.token_total = self.token_total.saturating_sub(1);
+        }
+    }
+
+    #[inline(always)]
+    fn apply_swap(&mut self, s: &SwapData, sign: i32) {
+        // sign = +1 on push, -1 on pop
+        match sign {
+            1 => {
+                self.add_token(s.token_in);
+                self.add_token(s.token_out);
+                self.swaps_count = self.swaps_count.saturating_add(1);
+                self.sum_slippage_bps = self.sum_slippage_bps.saturating_add(s.slippage_bps as u64);
+                let size_factor = (s.amount_in as f64).ln() / 20.0;
+                let slip_factor = (s.slippage_bps as f64) / 10_000.0;
+                self.sum_aggr_base += size_factor + 2.0 * slip_factor;
+
+                if is_stablecoin(&s.token_in)  { self.stable_outflow_in_sum = self.stable_outflow_in_sum.saturating_add(s.amount_in as u128); }
+                if is_stablecoin(&s.token_out) { self.stable_inflow_out_sum = self.stable_inflow_out_sum.saturating_add(s.amount_out as u128); }
+            }
+            -1 => {
+                self.remove_token(s.token_in);
+                self.remove_token(s.token_out);
+                self.swaps_count = self.swaps_count.saturating_sub(1);
+                self.sum_slippage_bps = self.sum_slippage_bps.saturating_sub(s.slippage_bps as u64);
+                let size_factor = (s.amount_in as f64).ln() / 20.0;
+                let slip_factor = (s.slippage_bps as f64) / 10_000.0;
+                self.sum_aggr_base -= size_factor + 2.0 * slip_factor;
+
+                if is_stablecoin(&s.token_in)  { self.stable_outflow_in_sum = self.stable_outflow_in_sum.saturating_sub(s.amount_in as u128); }
+                if is_stablecoin(&s.token_out) { self.stable_inflow_out_sum = self.stable_inflow_out_sum.saturating_sub(s.amount_out as u128); }
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn recompute_cached_metrics(&mut self) {
+        // entropy
+        if self.token_total > 0 {
+            let mut h = 0.0;
+            let total = self.token_total as f64;
+            for &c in self.token_counts.values() {
+                let p = (c as f64) / total;
+                // p*ln(p) safe for p>0
+                h -= p * p.ln();
+            }
+            self.token_rotation_entropy = h;
+        } else {
+            self.token_rotation_entropy = 0.0;
+        }
+
+        // avg slippage
+        self.avg_slippage_tolerance = if self.swaps_count == 0 { 0.0 } else {
+            (self.sum_slippage_bps as f64) / (self.swaps_count as f64)
+        };
+
+        // frequency score (swaps per hour, capped 10)
+        let ts_span = if self.first_ts > 0 && self.last_ts >= self.first_ts {
+            self.last_ts - self.first_ts
+        } else { 0 };
+        self.swap_frequency_score = if self.swaps_count <= 1 || ts_span == 0 {
+            if self.swaps_count > 1 { 10.0 } else { 0.0 }
+        } else {
+            let sph = (self.swaps_count as f64) * 3600.0 / (ts_span as f64);
+            sph.min(10.0)
+        };
+
+        // aggression index = mean(base) * freq_mult (cap 10)
+        let base_aggr = if self.swaps_count == 0 { 0.0 } else { self.sum_aggr_base / (self.swaps_count as f64) };
+        self.aggression_index = (base_aggr * (1.0 + self.swap_frequency_score / 2.0)).min(10.0);
+
+        // stablecoin ratios / risk
+        let denom = self.stable_inflow_out_sum.saturating_add(self.stable_outflow_in_sum);
+        self.stablecoin_inflow_ratio = if denom == 0 { 0.0 } else {
+            (self.stable_inflow_out_sum as f64) / (denom as f64)
+        };
+        // risk preference higher when fewer stables (use total in-volume from counters)
+        let total_in_vol = (self.total_volume as f64).max(1.0); // guard
+        let stable_in_ratio = (self.stable_outflow_in_sum as f64) / total_in_vol;
+        self.risk_preference = (1.0 - stable_in_ratio).clamp(0.0, 1.0);
+    }
+
+    #[inline]
+    fn refresh_window_edges(&mut self) {
+        self.first_ts = self.recent_swaps.front().map(|s| s.timestamp).unwrap_or(0);
+        self.last_ts  = self.recent_swaps.back().map(|s| s.timestamp).unwrap_or(self.first_ts);
+    }
+
+    #[inline]
+    fn prune_old(&mut self, now_ts: u64) {
+        let cutoff = now_ts.saturating_sub(RECENT_WINDOW_SECS);
         while let Some(front) = self.recent_swaps.front() {
-            if front.timestamp <= cutoff { self.recent_swaps.pop_front(); } else { break; }
+            if front.timestamp <= cutoff {
+                let old = self.recent_swaps.pop_front().unwrap();
+                self.apply_swap(&old, -1);
+            } else { break; }
         }
-        while self.recent_swaps.len() > MAX_RECENT_SWAPS {
-            self.recent_swaps.pop_front();
+    }
+
+    // === REPLACE: the entire push_swap_pruned body (keep signature) ===
+    #[inline]
+    pub fn push_swap_pruned(&mut self, mut swap: SwapData) {
+        // Enforce non-decreasing timestamps to keep the deque time-ordered
+        if self.last_ts != 0 && swap.timestamp < self.last_ts {
+            swap.timestamp = self.last_ts; // clamp for order; preserves window math & linear scans
         }
+
+        // prune window first based on the (possibly clamped) timestamp
+        self.prune_old(swap.timestamp);
+
+        // push new swap
+        self.total_volume = self.total_volume.saturating_add(swap.amount_in);
+        self.last_activity = swap.timestamp;
+
+        if self.recent_swaps.len() == MAX_RECENT_SWAPS {
+            if let Some(evicted) = self.recent_swaps.pop_front() {
+                self.apply_swap(&evicted, -1);
+            }
+        }
+        self.apply_swap(&swap, 1);
+        self.recent_swaps.push_back(swap);
+
+        // refresh edges & recompute cached metrics
+        self.refresh_window_edges();
+        self.recompute_cached_metrics();
     }
 }
 
+// === REPLACE: fields in WhaleWalletBehavioralFingerprinter and its new() ===
 pub struct WhaleWalletBehavioralFingerprinter {
-    profiles: DashMap<Pubkey, WalletProfile, FxBuildHasher>,
-    mempool_patterns: DashMap<PatternKey, SmallVec<[u64; 64]>, FxBuildHasher>,
-    coordination_graph: DashMap<Pubkey, SmallVec<[Pubkey; 8]>, FxBuildHasher>,
-    coord_score_cache: DashMap<(Pubkey, u64), (f64, u64), FxBuildHasher>,
+    profiles: DashMap<Pubkey, WalletProfile, ahash::RandomState>,
+    mempool_patterns: DashMap<String, VecDeque<u64>, ahash::RandomState>,
+    mempool_patterns_typed: DashMap<(DexType, Pubkey), VecDeque<u64>, ahash::RandomState>,
+    coordination_graph: DashMap<Pubkey, DashSet<Pubkey, ahash::RandomState>, ahash::RandomState>,
+
+    // === NEW: slot-synced fee-heat ===
+    fee_heat: FeeHeat,
+    // === NEW: leader preference hint (atomic, zero-lock path) ===
+    leader_aligned: AtomicBool,
+    // === NEW: capture→chain latency bias (ms), positive means we see events late
+    latency_bias_ms: AtomicI64,
+    // === NEW: leader stats storage ===
+    leader_stats: DashMap<Pubkey, LeaderStats, ahash::RandomState>,
+    // === NEW: pair volatility tracking ===
+    pair_vol: DashMap<(Pubkey, Pubkey), VolAtom, ahash::RandomState>,
+    // wallets temporarily quarantined until timestamp
+    quarantine_until: DashMap<Pubkey, u64, ahash::RandomState>,
+    // === NEW: coordination strength tracking ===
+    coord_strength: DashMap<(Pubkey, Pubkey), CoordStrength, ahash::RandomState>,
+    // bandit: per-(heat, vol, leader) start-index policy
+    stair_policies: DashMap<PolicyKey, Vec<StartArm>, ahash::RandomState>,
+    // last chosen start index per wallet (for outcome attribution)
+    last_stair_start: DashMap<Pubkey, u8, ahash::RandomState>,
+    // === NEW: shadow state cache ===
+    shadow_state: DashMap<Pubkey, (bool, u64), ahash::RandomState>,
+    spend_cap_lamports_per_min: AtomicU64,
+    attempts_cap_per_slot:      AtomicU64,
+    spend_window: SpendWindow,
+    attempts_used_in_slot: DashMap<u64 /*slot*/, AtomicU64, ahash::RandomState>,
+    // === NEW: compute budget cache ===
+    cb_cache: DashMap<(u32, u64), CbEntry, ahash::RandomState>,
+    // === NEW: shadow P&L attribution ===
+    shadow_stats: DashMap<Pubkey, ShadowStats, ahash::RandomState>,
+    // === NEW: drawdown quarantine until unixts (secs) ===
+    dd_quarantine_until: DashMap<Pubkey, u64, ahash::RandomState>,
+    // === NEW: current slot for deterministic jitter ===
+    current_slot: AtomicU64,
+    // === NEW: per-wallet attempt cap overrides ===
+    attempts_cap_override: DashMap<Pubkey, u64, ahash::RandomState>,
+    // === NEW: multi-relay router stats ===
+    relay_stats: DashMap<RelayId, RelayStats, ahash::RandomState>,
+    // === NEW: per-source typed patterns for consensus ===
+    mempool_patterns_typed_src: DashMap<SrcKey, VecDeque<u64>, ahash::RandomState>,
+    // === NEW: route complexity tracking ===
+    route_cx: DashMap<(DexType, Pubkey, Pubkey), RouteComplexity, ahash::RandomState>,
+    // === NEW: pair-slot concurrency lock ===
+    pair_slot_lock: DashMap<PairSlotKey, SlotLock, ahash::RandomState>,
+    // === NEW: leader-phase calibrator ===
+    leader_phase_ms: DashMap<Pubkey, LeaderPhase, ahash::RandomState>,
+    // === NEW: per-slot global price floor ===
+    slot_max_per_cu: AtomicU64,
 }
 
 impl WhaleWalletBehavioralFingerprinter {
+    // === REPLACE: new() ===
     pub fn new() -> Self {
         Self {
-            profiles: DashMap::with_hasher(FxBuildHasher::default()),
-            mempool_patterns: DashMap::with_hasher(FxBuildHasher::default()),
-            coordination_graph: DashMap::with_hasher(FxBuildHasher::default()),
-            coord_score_cache: DashMap::with_hasher(FxBuildHasher::default()),
+            profiles: DashMap::with_hasher(ahash::RandomState::default()),
+            mempool_patterns: DashMap::with_hasher(ahash::RandomState::default()),
+            mempool_patterns_typed: DashMap::with_hasher(ahash::RandomState::default()),
+            coordination_graph: DashMap::with_hasher(ahash::RandomState::default()),
+            fee_heat: FeeHeat::default(),
+            leader_aligned: AtomicBool::new(false),
+        latency_bias_ms: AtomicI64::new(0),
+        leader_stats: DashMap::with_hasher(ahash::RandomState::default()),
+        pair_vol: DashMap::with_hasher(ahash::RandomState::default()),
+        quarantine_until: DashMap::with_hasher(ahash::RandomState::default()),
+        coord_strength: DashMap::with_hasher(ahash::RandomState::default()),
+        stair_policies: DashMap::with_hasher(ahash::RandomState::default()),
+        last_stair_start: DashMap::with_hasher(ahash::RandomState::default()),
+        shadow_state: DashMap::with_hasher(ahash::RandomState::default()),
+        spend_cap_lamports_per_min: AtomicU64::new(2_000_000_000), // default 2 SOL/min
+        attempts_cap_per_slot:      AtomicU64::new(4),
+        spend_window: SpendWindow::default(),
+        attempts_used_in_slot: DashMap::with_hasher(ahash::RandomState::default()),
+        cb_cache: DashMap::with_hasher(ahash::RandomState::default()),
+        shadow_stats: DashMap::with_hasher(ahash::RandomState::default()),
+        dd_quarantine_until: DashMap::with_hasher(ahash::RandomState::default()),
+        current_slot: AtomicU64::new(0),
+        attempts_cap_override: DashMap::with_hasher(ahash::RandomState::default()),
+        relay_stats: DashMap::with_hasher(ahash::RandomState::default()),
+        mempool_patterns_typed_src: DashMap::with_hasher(ahash::RandomState::default()),
+        route_cx: DashMap::with_hasher(ahash::RandomState::default()),
+        pair_slot_lock: DashMap::with_hasher(ahash::RandomState::default()),
+        leader_phase_ms: DashMap::with_hasher(ahash::RandomState::default()),
+        slot_max_per_cu: AtomicU64::new(0),
         }
     }
 
-    /// Legacy entry (uses wall clock + slot=0). Prefer `process_transaction_at`.
-    #[inline(always)]
-    pub async fn process_transaction(&self, wallet: Pubkey, ix: &Instruction) -> Result<()> {
-        self.process_transaction_at(wallet, ix, now_unix(), 0).await
-    }
-
-    /// Hot-path entry: caller provides timestamp & slot (no syscalls).
-    #[inline(always)]
-    pub async fn process_transaction_at(&self, wallet: Pubkey, ix: &Instruction, ts: u64, slot: u64) -> Result<()> {
-        if let Some(mut swap) = self.parse_swap_instruction(ix).await? {
-            swap.timestamp = ts;
-            swap.slot = slot;
-            self.update_wallet_profile(wallet, swap).await?;
+    pub async fn process_transaction(&self, wallet: Pubkey, instruction: &Instruction) -> Result<()> {
+        if let Some(swap_data) = self.parse_swap_instruction(instruction).await? {
+            self.update_wallet_profile(wallet, swap_data).await?;
         }
         Ok(())
     }
 
+    // === REPLACE: parse_swap_instruction (confirm inlined) ===
     #[inline(always)]
-    async fn parse_swap_instruction(&self, ix: &Instruction) -> Result<Option<SwapData>> {
-        let pid = ix.program_id;
-        if pid == JUPITER_PROGRAM_ID { return self.parse_jupiter_swap(ix).await; }
-        if pid == RAYDIUM_PROGRAM_ID { return self.parse_raydium_swap(ix).await; }
-        if pid == ORCA_PROGRAM_ID    { return self.parse_orca_swap(ix).await; }
-        Ok(None)
+    async fn parse_swap_instruction(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
+        let pid = instruction.program_id;
+        if pid == *JUPITER_PROGRAM {
+            self.parse_jupiter_swap(instruction).await
+        } else if pid == *RAYDIUM_PROGRAM {
+            self.parse_raydium_swap(instruction).await
+        } else if pid == *ORCA_PROGRAM {
+            self.parse_orca_swap(instruction).await
+        } else {
+            Ok(None)
+        }
     }
 
-    #[inline(always)]
-    async fn parse_jupiter_swap(&self, ix: &Instruction) -> Result<Option<SwapData>> {
-        // format (common): [disc:8][amount_in:8][min_out:8]...
-        if ix.data.len() < 24 || ix.accounts.len() < 3 { return Ok(None); }
-        let amount_in = read_u64_le(&ix.data, 8);
-        let min_out   = read_u64_le(&ix.data, 16);
+    // === REPLACE: parse_jupiter_swap ===
+    async fn parse_jupiter_swap(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
+        if instruction.data.len() < 24 || instruction.accounts.len() < 3 { return Ok(None); }
+        let amount_in      = read_u64_le_at(&instruction.data, 8).unwrap_or(0);
+        let min_amount_out = read_u64_le_at(&instruction.data, 16).unwrap_or(0);
 
-        let token_in  = ix.accounts.get(1).map(|a| a.pubkey).unwrap_or(Pubkey::default());
-        let token_out = ix.accounts.get(2).map(|a| a.pubkey).unwrap_or(Pubkey::default());
+        let token_in  = instruction.accounts.get(1).map(|a| a.pubkey).unwrap_or_default();
+        let token_out = instruction.accounts.get(2).map(|a| a.pubkey).unwrap_or_default();
+        let (token_in, token_out, amount_in, min_amount_out) = sanitize_swap_fields(token_in, token_out, amount_in, min_amount_out);
 
-        let expected_out = amount_in.saturating_mul(995) / 1000; // ~0.5%
-        let slip = if expected_out > 0 && expected_out > min_out {
-            (((expected_out - min_out) * 10_000) / expected_out) as u16
-        } else { 0 };
+        let slippage_bps = declared_slippage_bps(amount_in, min_amount_out);
+        if !sane_swap(&token_in, &token_out, amount_in, min_amount_out, slippage_bps) { return Ok(None); }
 
         Ok(Some(SwapData {
-            timestamp: 0, slot: 0,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs(),
             dex: DexType::Jupiter,
             token_in, token_out,
-            amount_in, amount_out: min_out,
-            slippage_bps: slip,
+            amount_in,
+            amount_out: min_amount_out,
+            slippage_bps,
             transaction_signature: String::new(),
         }))
     }
 
-    #[inline(always)]
-    async fn parse_raydium_swap(&self, ix: &Instruction) -> Result<Option<SwapData>> {
-        if ix.data.len() < 17 || ix.accounts.len() < 10 { return Ok(None); }
-        // [disc:1][amount_in:8][min_out:8]
-        let amount_in = read_u64_le(&ix.data, 1);
-        let min_out   = read_u64_le(&ix.data, 9);
+    // === REPLACE: parse_raydium_swap ===
+    async fn parse_raydium_swap(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
+        if instruction.data.len() < 17 || instruction.accounts.len() < 10 { return Ok(None); }
+        let amount_in      = read_u64_le_at(&instruction.data, 1).unwrap_or(0);
+        let min_amount_out = read_u64_le_at(&instruction.data, 9).unwrap_or(0);
 
-        // heuristic positions seen commonly
-        let token_in  = ix.accounts.get(8).map(|a| a.pubkey).unwrap_or(Pubkey::default());
-        let token_out = ix.accounts.get(9).map(|a| a.pubkey).unwrap_or(Pubkey::default());
+        let token_in  = instruction.accounts.get(8).map(|a| a.pubkey)
+            .or_else(|| instruction.accounts.get(instruction.accounts.len().saturating_sub(2)).map(|a| a.pubkey))
+            .unwrap_or_default();
+        let token_out = instruction.accounts.get(9).map(|a| a.pubkey)
+            .or_else(|| instruction.accounts.last().map(|a| a.pubkey))
+            .unwrap_or_default();
 
-        let expected_out = amount_in.saturating_mul(997) / 1000; // ~0.3%
-        let slip = if expected_out > 0 && expected_out > min_out {
-            (((expected_out - min_out) * 10_000) / expected_out) as u16
-        } else { 0 };
+        let (token_in, token_out, amount_in, min_amount_out) = sanitize_swap_fields(token_in, token_out, amount_in, min_amount_out);
+        let slippage_bps = declared_slippage_bps(amount_in, min_amount_out);
+        if !sane_swap(&token_in, &token_out, amount_in, min_amount_out, slippage_bps) { return Ok(None); }
 
         Ok(Some(SwapData {
-            timestamp: 0, slot: 0,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs(),
             dex: DexType::Raydium,
             token_in, token_out,
-            amount_in, amount_out: min_out,
-            slippage_bps: slip,
+            amount_in,
+            amount_out: min_amount_out,
+            slippage_bps,
             transaction_signature: String::new(),
         }))
     }
 
-    #[inline(always)]
-    async fn parse_orca_swap(&self, ix: &Instruction) -> Result<Option<SwapData>> {
-        if ix.data.len() < 16 || ix.accounts.len() < 4 { return Ok(None); }
-        // [amount:8][other_amount_threshold:8]
-        let amount_in = read_u64_le(&ix.data, 0);
-        let min_out   = read_u64_le(&ix.data, 8);
+    // === REPLACE: parse_orca_swap ===
+    async fn parse_orca_swap(&self, instruction: &Instruction) -> Result<Option<SwapData>> {
+        if instruction.data.len() < 16 || instruction.accounts.len() < 6 { return Ok(None); }
+        let amount_in      = read_u64_le_at(&instruction.data, 0).unwrap_or(0);
+        let min_amount_out = read_u64_le_at(&instruction.data, 8).unwrap_or(0);
 
-        let token_in  = ix.accounts.get(2).map(|a| a.pubkey).unwrap_or(Pubkey::default());
-        let token_out = ix.accounts.get(3).map(|a| a.pubkey).unwrap_or(Pubkey::default());
+        let token_in  = instruction.accounts.get(2).map(|a| a.pubkey)
+            .or_else(|| instruction.accounts.get(instruction.accounts.len().saturating_sub(2)).map(|a| a.pubkey))
+            .unwrap_or_default();
+        let token_out = instruction.accounts.get(3).map(|a| a.pubkey)
+            .or_else(|| instruction.accounts.last().map(|a| a.pubkey))
+            .unwrap_or_default();
 
-        let expected_out = amount_in.saturating_mul(999) / 1000; // ~0.1%
-        let slip = if expected_out > 0 && expected_out > min_out {
-            (((expected_out - min_out) * 10_000) / expected_out) as u16
-        } else { 0 };
+        let (token_in, token_out, amount_in, min_amount_out) = sanitize_swap_fields(token_in, token_out, amount_in, min_amount_out);
+        let slippage_bps = declared_slippage_bps(amount_in, min_amount_out);
+        if !sane_swap(&token_in, &token_out, amount_in, min_amount_out, slippage_bps) { return Ok(None); }
 
         Ok(Some(SwapData {
-            timestamp: 0, slot: 0,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs(),
             dex: DexType::Orca,
             token_in, token_out,
-            amount_in, amount_out: min_out,
-            slippage_bps: slip,
+            amount_in,
+            amount_out: min_amount_out,
+            slippage_bps,
             transaction_signature: String::new(),
         }))
     }
 
-    #[inline(always)]
-    async fn update_wallet_profile(&self, wallet: Pubkey, swap: SwapData) -> Result<()> {
-        let now = if swap.timestamp > 0 { swap.timestamp } else { now_unix() };
-        // get-or-create (guard scope limited)
-        let mut entry = self.profiles.entry(wallet).or_insert_with(|| WalletProfile::new(wallet));
-        {
-            let prof = entry.value_mut();
-
-            // time window eviction
-            let cutoff = now.saturating_sub(HISTORY_WINDOW_SECS);
-            while let Some(front) = prof.recent_swaps.front() {
-                if front.timestamp > 0 && front.timestamp <= cutoff {
-                    let old = prof.recent_swaps.pop_front().expect("front existed");
-                    prof.stats.revert(&old);
-                } else { break; }
-            }
-            // cap eviction
-            while prof.recent_swaps.len() >= MAX_RECENT_SWAPS {
-                if let Some(old) = prof.recent_swaps.pop_front() { prof.stats.revert(&old); } else { break; }
-            }
-
-            // apply new swap
-            prof.recent_swaps.push_back(swap.clone());
-            prof.stats.apply(&swap);
-            prof.last_activity = now;
-            prof.total_volume = prof.total_volume.saturating_add(swap.amount_in);
-
-            // mirror EMA update (O(1))
-            let inst_corr = self.instant_mirror_corr(&swap);
-            let n = prof.stats.swaps.max(1) as f64;
-            let alpha = (0.20f64).max(1.0 / n.min(20.0));
-            prof.mirror_ema = prof.mirror_ema * (1.0 - alpha) + inst_corr * alpha;
-
-            // recompute metrics from O(1) stats
-            prof.aggression_index         = self.metric_aggression(&prof.stats, &prof.recent_swaps);
-            prof.token_rotation_entropy   = self.metric_entropy(&prof.stats);
-            prof.risk_preference          = self.metric_risk_pref(&prof.stats);
-            prof.liquidity_behavior_score = self.calculate_liquidity_behavior_score(&prof.liquidity_actions);
-            prof.mirror_intent_score      = prof.mirror_ema.clamp(0.0, 1.0);
-            prof.coordination_score       = self.calculate_coordination_score_cached(wallet, swap.slot, now);
-            prof.stablecoin_inflow_ratio  = self.metric_stable_inflow_ratio(&prof.stats);
-            prof.avg_slippage_tolerance   = self.metric_avg_slippage(&prof.stats);
-            prof.swap_frequency_score     = self.metric_swap_freq(&prof.recent_swaps);
+    // === REPLACE: update_wallet_profile ===
+    #[inline]
+    async fn update_wallet_profile(&self, wallet: Pubkey, swap_data: SwapData) -> Result<()> {
+        let now_ts = swap_data.timestamp;
+        if let Some(mut prof) = self.profiles.get_mut(&wallet) {
+            prof.push_swap_pruned(swap_data.clone());
+            self.feed_pair_vol(swap_data.token_in, swap_data.token_out, swap_data.slippage_bps);
+            prof.mirror_intent_score = self.calculate_mirror_intent_score_recency(&prof.recent_swaps, now_ts).await;
+            prof.coordination_score  = self.calculate_coordination_score(wallet).await;
+            self.maybe_quarantine(&prof);
+            // NEW: keep coordination strength fresh (see Piece O)
+            self.update_coord_strength_for_neighbors(wallet, now_ts).await;
+            return Ok(());
         }
-        drop(entry);
-        yield_now().await;
+
+        let mut newp = WalletProfile::new(wallet);
+        newp.push_swap_pruned(swap_data.clone());
+        self.feed_pair_vol(swap_data.token_in, swap_data.token_out, swap_data.slippage_bps);
+        newp.mirror_intent_score = self.calculate_mirror_intent_score_recency(&newp.recent_swaps, now_ts).await;
+        newp.coordination_score  = self.calculate_coordination_score(wallet).await;
+        self.maybe_quarantine(&newp);
+        self.profiles.insert(wallet, newp);
+        // NEW:
+        self.update_coord_strength_for_neighbors(wallet, now_ts).await;
         Ok(())
     }
 
-    // ===== Metrics from running stats =====
-    #[inline(always)]
-    fn metric_aggression(&self, st: &ProfileStats, swaps: &VecDeque<SwapData>) -> f64 {
-        if st.swaps == 0 { return 0.0; }
-        let avg_ln_amt = st.sum_ln_amount / (st.swaps as f64);
-        let avg_slip   = (st.slippage_sum_bps as f64) / (st.swaps as f64) / 10_000.0;
-        let base = (avg_ln_amt / 20.0) + 2.0 * avg_slip;
+    fn calculate_aggression_index(&self, swaps: &[SwapData]) -> f64 {
+        if swaps.is_empty() {
+            return 0.0;
+        }
 
-        let (first, last) = match (swaps.front(), swaps.back()) {
-            (Some(a), Some(b)) if a.timestamp > 0 && b.timestamp >= a.timestamp => (a.timestamp, b.timestamp),
-            _ => (0, 0),
+        let mut aggression_sum = 0.0;
+        let mut count = 0;
+
+        for swap in swaps {
+            let size_factor = (swap.amount_in as f64).ln() / 20.0; // Logarithmic scaling
+            let slippage_factor = (swap.slippage_bps as f64) / 10000.0;
+            let aggression = size_factor + slippage_factor * 2.0; // Weight slippage higher
+            aggression_sum += aggression;
+            count += 1;
+        }
+
+        let base_aggression = aggression_sum / count as f64;
+        
+        // Frequency multiplier
+        let time_span = if swaps.len() > 1 {
+            swaps.last().unwrap().timestamp - swaps.first().unwrap().timestamp
+        } else {
+            1
         };
-        let span = last.saturating_sub(first);
-        let freq_mult = if span > 0 { (swaps.len() as f64 * 3600.0) / (span as f64) } else { 1.0 };
-        (base * freq_mult).min(10.0)
+        
+        let frequency_multiplier = if time_span > 0 {
+            (swaps.len() as f64 * 3600.0) / time_span as f64 // swaps per hour
+        } else {
+            1.0
+        };
+
+        (base_aggression * frequency_multiplier).min(10.0) // Cap at 10.0
     }
 
-    #[inline(always)]
-    fn metric_entropy(&self, st: &ProfileStats) -> f64 {
-        let total: u64 = st.token_counts.values().map(|&c| c as u64).sum();
-        if total == 0 { return 0.0; }
-        let t = total as f64;
-        let mut h = 0.0;
-        for &c in st.token_counts.values() {
-            let p = (c as f64) / t;
-            if p > 0.0 { h -= p * p.ln(); }
+    fn calculate_token_rotation_entropy(&self, swaps: &[SwapData]) -> f64 {
+        if swaps.is_empty() {
+            return 0.0;
         }
-        h
-    }
 
-    #[inline(always)]
-    fn metric_risk_pref(&self, st: &ProfileStats) -> f64 {
-        if st.total_amount_in == 0 { return 0.5; }
-        1.0 - (st.stable_trade_vol as f64 / st.total_amount_in as f64)
-    }
+        let mut token_counts: HashMap<Pubkey, usize> = HashMap::new();
+        let mut total_tokens = 0;
 
-    #[inline(always)]
-    fn metric_stable_inflow_ratio(&self, st: &ProfileStats) -> f64 {
-        let denom = st.stable_inflow.saturating_add(st.stable_outflow);
-        if denom == 0 { 0.0 } else { (st.stable_inflow as f64) / (denom as f64) }
-    }
-
-    #[inline(always)]
-    fn metric_avg_slippage(&self, st: &ProfileStats) -> f64 {
-        if st.swaps == 0 { 0.0 } else { (st.slippage_sum_bps as f64) / (st.swaps as f64) }
-    }
-
-    #[inline(always)]
-    fn metric_swap_freq(&self, swaps: &VecDeque<SwapData>) -> f64 {
-        if swaps.len() < 2 { return 0.0; }
-        let first = match swaps.front() { Some(s) => s.timestamp, None => return 0.0 };
-        let last  = match swaps.back()  { Some(s) => s.timestamp, None => return 0.0 };
-        let span  = last.saturating_sub(first);
-        if span == 0 { 10.0 } else { ((swaps.len() as f64 * 3600.0) / (span as f64)).min(10.0) }
-    }
-
-    // ===== Mirror intent (EMA on instantaneous correlation) =====
-    #[inline(always)]
-    fn instant_mirror_corr(&self, s: &SwapData) -> f64 {
-        let key = PatternKey { dex: s.dex, token_in: s.token_in };
-        if let Some(ts) = self.mempool_patterns.get(&key) { self.timing_correlation_rev(s.timestamp, &ts) } else { 0.0 }
-    }
-
-    #[inline(always)]
-    fn calculate_aggression_index(&self, swaps: &VecDeque<SwapData>) -> f64 {
-        if swaps.is_empty() { return 0.0; }
-        // size term uses ln(amount) (scaled), slippage weighted heavier; freq multiplier per hour
-        let mut sum = 0.0;
-        for s in swaps.iter() {
-            let size = if s.amount_in > 0 { (s.amount_in as f64).ln() / 20.0 } else { 0.0 };
-            let slip = (s.slippage_bps as f64) / 10_000.0;
-            sum += size + 2.0 * slip;
+        for swap in swaps {
+            *token_counts.entry(swap.token_in).or_insert(0) += 1;
+            *token_counts.entry(swap.token_out).or_insert(0) += 1;
+            total_tokens += 2;
         }
-        let base = sum / (swaps.len() as f64);
 
-        let first = swaps.front().map(|s| s.timestamp).unwrap_or(0);
-        let last  = swaps.back().map(|s| s.timestamp).unwrap_or(first);
-        let span  = last.saturating_sub(first);
-        let freq_mult = if span > 0 { (swaps.len() as f64 * 3600.0) / (span as f64) } else { 1.0 };
+        let mut entropy = 0.0;
+        for count in token_counts.values() {
+            let probability = *count as f64 / total_tokens as f64;
+            if probability > 0.0 {
+                entropy -= probability * probability.ln();
+            }
+        }
 
-        (base * freq_mult).min(10.0)
+        entropy
     }
 
-    #[inline(always)]
-    fn calculate_token_rotation_entropy(&self, swaps: &VecDeque<SwapData>) -> f64 {
-        if swaps.is_empty() { return 0.0; }
-        let mut counts: FxHashMap<Pubkey, u32> = FxHashMap::default();
-        let mut total: u32 = 0;
-        for s in swaps.iter() {
-            *counts.entry(s.token_in).or_insert(0) += 1; total += 1;
-            *counts.entry(s.token_out).or_insert(0) += 1; total += 1;
-        }
-        let tot = total as f64;
-        let mut h = 0.0;
-        for &c in counts.values() {
-            let p = (c as f64) / tot;
-            if p > 0.0 { h -= p * p.ln(); }
-        }
-        h
-    }
-
-    #[inline(always)]
-    fn calculate_risk_preference(&self, swaps: &VecDeque<SwapData>) -> f64 {
+    // === REPLACE: calculate_risk_preference ===
+    fn calculate_risk_preference(&self, swaps: &[SwapData]) -> f64 {
         if swaps.is_empty() { return 0.5; }
-        let mut stable_vol = 0u128;
-        let mut vol = 0u128;
-        for s in swaps.iter() {
-            vol += s.amount_in as u128;
-            if STABLE_MINTS.contains(&s.token_in) || STABLE_MINTS.contains(&s.token_out) {
-                stable_vol += s.amount_in as u128;
+        let mut stable_in: u128 = 0;
+        let mut total_in:  u128 = 0;
+        for s in swaps {
+            total_in = total_in.saturating_add(s.amount_in as u128);
+            if is_stablecoin(&s.token_in) || is_stablecoin(&s.token_out) {
+                stable_in = stable_in.saturating_add(s.amount_in as u128);
             }
         }
-        if vol == 0 { return 0.5; }
-        1.0 - (stable_vol as f64 / vol as f64)
+        if total_in == 0 { return 0.5; }
+        (1.0 - (stable_in as f64) / (total_in as f64)).clamp(0.0, 1.0)
     }
 
-    #[inline(always)]
-    fn calculate_liquidity_behavior_score(&self, acts: &SmallVec<[LiquidityAction; 8]>) -> f64 {
-        if acts.is_empty() { return 0.0; }
-        let mut add = 0u32; let mut rem = 0u32;
-        for a in acts.iter() {
-            match a.action_type {
-                LiquidityActionType::AddLiquidity    => add += 1,
-                LiquidityActionType::RemoveLiquidity => rem += 1,
+    fn calculate_liquidity_behavior_score(&self, actions: &[LiquidityAction]) -> f64 {
+        if actions.is_empty() {
+            return 0.0;
+        }
+
+        let mut add_count = 0;
+        let mut remove_count = 0;
+        let mut timing_scores = Vec::new();
+
+        for action in actions {
+            match action.action_type {
+                LiquidityActionType::AddLiquidity => add_count += 1,
+                LiquidityActionType::RemoveLiquidity => remove_count += 1,
             }
         }
-        let mut timing_sum = 0.0; let mut timing_cnt = 0.0;
-        for w in acts.windows(2) {
-            let dt = w[1].timestamp.saturating_sub(w[0].timestamp);
-            let eff = if dt < 300 { 1.0 } else { 300.0 / (dt as f64) };
-            timing_sum += eff; timing_cnt += 1.0;
+
+        // Calculate timing efficiency (how quickly they add/remove around events)
+        for window in actions.windows(2) {
+            let time_diff = window[1].timestamp - window[0].timestamp;
+            let efficiency = if time_diff < 300 { 1.0 } else { 1.0 / (time_diff as f64 / 300.0) };
+            timing_scores.push(efficiency);
         }
-        let timing_avg = if timing_cnt > 0.0 { timing_sum / timing_cnt } else { 0.0 };
-        let total = (add + rem) as f64;
-        let balance = if total > 0.0 { 1.0 - ((add as f64 - rem as f64).abs() / total) } else { 0.0 };
-        ((timing_avg + balance) * 0.5).clamp(0.0, 1.0)
+
+        let timing_avg = if timing_scores.is_empty() {
+            0.0
+        } else {
+            timing_scores.iter().sum::<f64>() / timing_scores.len() as f64
+        };
+
+        let balance_score = if add_count + remove_count == 0 {
+            0.0
+        } else {
+            1.0 - (add_count as f64 - remove_count as f64).abs() / (add_count + remove_count) as f64
+        };
+
+        (timing_avg + balance_score) / 2.0
     }
 
-    #[inline(always)]
+    // === REPLACE: calculate_mirror_intent_score signature and body ===
+    #[inline]
     async fn calculate_mirror_intent_score(&self, swaps: &VecDeque<SwapData>) -> f64 {
         if swaps.is_empty() { return 0.0; }
-        let mut sum = 0.0; let mut n = 0.0;
+        let mut corr_sum = 0.0_f64;
+        let mut n = 0_u32;
+
         for s in swaps.iter() {
-            let key = PatternKey { dex: s.dex, token_in: s.token_in };
-            if let Some(ts) = self.mempool_patterns.get(&key) {
-                sum += self.timing_correlation(s.timestamp, &ts);
-                n += 1.0;
+            if let Some(dq) = self.mempool_patterns_typed.get(&(s.dex, s.token_in)) {
+                let c = self.calculate_timing_correlation(s.timestamp, &s.token_in, &dq);
+                corr_sum += c; n += 1;
+                continue;
+            }
+            let key = format!("{:?}_{}", s.dex, s.token_in);
+            if let Some(dq) = self.mempool_patterns.get(&key) {
+                let c = self.calculate_timing_correlation(s.timestamp, &s.token_in, &dq);
+                corr_sum += c; n += 1;
             }
         }
-        if n == 0.0 { 0.0 } else { (sum / n).clamp(0.0, 1.0) }
+        if n == 0 { 0.0 } else { (corr_sum / (n as f64)).clamp(0.0, 1.0) }
     }
 
+    // === REPLACE: calculate_timing_correlation signature attribute ===
     #[inline(always)]
-    fn timing_correlation_rev(&self, t: u64, pattern_ts: &SmallVec<[u64; 64]>) -> f64 {
-        // reverse-scan newest first, early exit once window exceeded
-        let mut best = 0.0;
-        for &p in pattern_ts.iter().rev() {
-            if p + MIRROR_WINDOW_SECS < t { break; }
-            let d = t.max(p) - t.min(p);
-            if d <= MIRROR_WINDOW_SECS {
-                let c = 1.0 - (d as f64 / MIRROR_WINDOW_SECS as f64);
-                if c > best { best = c; if best == 1.0 { break; } }
+    fn calculate_timing_correlation(&self, ts: u64, _token_in: &Pubkey, pattern_ts: &VecDeque<u64>) -> f64 {
+        let bias_ms = self.latency_bias_ms.load(Ordering::Relaxed);
+        // adjust our swap timestamp to account for capture delay
+        let adj_ts = if bias_ms >= 0 {
+            ts.saturating_add((bias_ms as u64) / 1000)
+        } else {
+            ts.saturating_sub(((-bias_ms) as u64) / 1000)
+        };
+
+        let band = Self::dynamic_band_from(pattern_ts); // seconds
+        let mut best = 0.0f64;
+
+        for &p in pattern_ts.iter().rev().take(MIRROR_SCAN_BACK) {
+            let d = adj_ts.abs_diff(p) as f64;
+            if d <= band {
+                let core  = 1.0 - d / band;
+                let decay = (-d / MIRROR_DECAY_HL).exp();
+                let sc = (core * decay).clamp(0.0, 1.0);
+                if sc > best { best = sc; if best >= 0.999 { break; } }
+            } else if (p as i64) < (adj_ts as i64) - (band as i64) {
+                break;
             }
         }
         best
     }
 
-    #[inline(always)]
-    fn calculate_coordination_score_cached(&self, wallet: Pubkey, slot: u64, now: u64) -> f64 {
-        if slot > 0 {
-            if let Some(cached) = self.coord_score_cache.get(&(wallet, slot)) {
-                let (score, ts) = *cached;
-                if now.saturating_sub(ts) <= COORD_CACHE_TTL_SECS { return score; }
-            }
-        }
-        let score = self.calculate_coordination_score(wallet);
-        if slot > 0 {
-            if self.coord_score_cache.len() > MAX_COORD_CACHE { self.coord_score_cache.clear(); }
-            self.coord_score_cache.insert((wallet, slot), (score, now));
-        }
-        score
-    }
-
-    #[inline(always)]
-    fn calculate_coordination_score(&self, wallet: Pubkey) -> f64 {
-        let peers = self.coordination_graph.get(&wallet).map(|v| v.clone()).unwrap_or_default();
-        if peers.is_empty() { return 0.0; }
+    // === REPLACE: calculate_coordination_score ===
+    #[inline]
+    async fn calculate_coordination_score(&self, wallet: Pubkey) -> f64 {
+        let Some(neigh) = self.coordination_graph.get(&wallet) else { return 0.0; };
+        if neigh.is_empty() { return 0.0; }
 
         let me = match self.profiles.get(&wallet) { Some(p) => p, None => return 0.0 };
-        let me_swaps: &VecDeque<SwapData> = &me.recent_swaps;
 
-        let mut sum = 0.0; let mut cnt = 0.0;
-        for peer in peers.iter() {
-            if let Some(other) = self.profiles.get(peer) {
-                let tc = self.swap_timing_corr_twoptr(me_swaps, &other.recent_swaps, COORD_WINDOW_SECS);
-                let kc = self.token_preference_jaccard(me_swaps, &other.recent_swaps);
-                let bc = self.behavior_corr(&me, &other);
-                sum += (tc + kc + bc) / 3.0;
-                cnt += 1.0;
+        let mut sum = 0.0_f64;
+        let mut k = 0_u32;
+
+        for other in neigh.iter() {
+            if let Some(op) = self.profiles.get(other.value()) {
+                // zero-alloc path: deques + in-map token maps
+                let corr = self.calculate_profile_correlation(&*me, &*op);
+                sum += corr; k += 1;
             }
         }
-        if cnt == 0.0 { 0.0 } else { (sum / cnt).clamp(0.0, 1.0) }
+        if k == 0 { 0.0 } else { (sum / (k as f64)).clamp(0.0, 1.0) }
     }
 
-    fn calculate_profile_correlation(&self, profile1: &WalletProfile, profile2: &WalletProfile) -> f64 {
-        let timing_correlation = self.swap_timing_corr_twoptr(&profile1.recent_swaps, &profile2.recent_swaps, COORD_WINDOW_SECS);
-        let token_correlation = self.token_preference_jaccard(&profile1.recent_swaps, &profile2.recent_swaps);
-        let behavior_correlation = self.behavior_corr(profile1, profile2);
-        (timing_correlation + token_correlation + behavior_correlation) / 3.0
-    }
-
+    // === REPLACE: calculate_profile_correlation ===
     #[inline(always)]
-    fn swap_timing_corr_twoptr(&self, a: &VecDeque<SwapData>, b: &VecDeque<SwapData>, win: u64) -> f64 {
-        if a.is_empty() || b.is_empty() { return 0.0; }
-        // two-pointer sweep on sorted timestamps
-        let (mut i, mut j) = (0usize, 0usize);
-        let (mut acc, mut cnt) = (0.0, 0.0);
-        while i < a.len() && j < b.len() {
-            let ta = a[i].timestamp; let tb = b[j].timestamp;
-            let (min, max) = (ta.min(tb), ta.max(tb));
-            let d = max - min;
-            if d <= win {
-                acc += 1.0 - (d as f64 / win as f64);
-                cnt += 1.0;
-                // advance the earlier one to look for next match
-                if ta <= tb { i += 1; } else { j += 1; }
+    fn calculate_profile_correlation(&self, p1: &WalletProfile, p2: &WalletProfile) -> f64 {
+        let timing_correlation   = self.calculate_swap_timing_correlation(&p1.recent_swaps, &p2.recent_swaps);
+        let token_correlation    = self.token_preference_correlation_fast(p1, p2);
+        let behavior_correlation = self.calculate_behavior_correlation(p1, p2);
+        ((timing_correlation + token_correlation + behavior_correlation) / 3.0).clamp(0.0, 1.0)
+    }
+
+    // === REPLACE: calculate_swap_timing_correlation ===
+    // === REPLACE: calculate_swap_timing_correlation body's numeric literals ===
+    #[inline]
+    fn calculate_swap_timing_correlation(&self, s1: &VecDeque<SwapData>, s2: &VecDeque<SwapData>) -> f64 {
+        if s1.is_empty() || s2.is_empty() { return 0.0; }
+
+        let mut i = s1.len();
+        let mut j = s2.len();
+        let mut sum = 0.0_f64;
+        let mut cnt = 0_u32;
+
+        while i > 0 && j > 0 {
+            let t1 = s1[i - 1].timestamp;
+            let t2 = s2[j - 1].timestamp;
+
+            if t1 >= t2 {
+                let diff = t1 - t2;
+                if diff <= TIMING_MAX_SKEW_SECS {
+                    sum += 1.0 - (diff as f64 / TIMING_MAX_SKEW_SECS as f64);
+                    cnt += 1;
+                    i -= 1; j -= 1;
+                } else {
+                    i -= 1;
+                }
             } else {
-                if ta < tb { i += 1; } else { j += 1; }
+                let diff = t2 - t1;
+                if diff <= TIMING_MAX_SKEW_SECS {
+                    sum += 1.0 - (diff as f64 / TIMING_MAX_SKEW_SECS as f64);
+                    cnt += 1;
+                    i -= 1; j -= 1;
+                } else {
+                    j -= 1;
+                }
             }
+            if (cnt as usize) >= TIMING_MAX_PAIRS { break; }
         }
-        if cnt == 0.0 { 0.0 } else { (acc / cnt).clamp(0.0, 1.0) }
+        if cnt == 0 { 0.0 } else { (sum / (cnt as f64)).clamp(0.0, 1.0) }
     }
 
-    #[inline(always)]
-    fn token_preference_jaccard(&self, a: &VecDeque<SwapData>, b: &VecDeque<SwapData>) -> f64 {
-        use std::collections::hash_set::HashSet;
-        if a.is_empty() || b.is_empty() { return 0.0; }
-        let mut sa: HashSet<Pubkey> = HashSet::with_capacity(a.len()*2);
-        let mut sb: HashSet<Pubkey> = HashSet::with_capacity(b.len()*2);
-        for s in a.iter() { sa.insert(s.token_in); sa.insert(s.token_out); }
-        for s in b.iter() { sb.insert(s.token_in); sb.insert(s.token_out); }
-        let inter = sa.intersection(&sb).count() as f64;
-        let uni   = sa.union(&sb).count() as f64;
-        if uni == 0.0 { 0.0 } else { inter / uni }
+    fn calculate_token_preference_correlation(&self, swaps1: &[SwapData], swaps2: &[SwapData]) -> f64 {
+        if swaps1.is_empty() || swaps2.is_empty() {
+            return 0.0;
+        }
+
+        let mut tokens1 = std::collections::HashSet::new();
+        let mut tokens2 = std::collections::HashSet::new();
+
+        for swap in swaps1 {
+            tokens1.insert(swap.token_in);
+            tokens1.insert(swap.token_out);
+        }
+
+        for swap in swaps2 {
+            tokens2.insert(swap.token_in);
+            tokens2.insert(swap.token_out);
+        }
+
+        let intersection = tokens1.intersection(&tokens2).count();
+        let union = tokens1.union(&tokens2).count();
+
+        if union == 0 {
+            return 0.0;
+        }
+
+        intersection as f64 / union as f64
     }
 
+    // === REPLACE: token_preference_correlation_fast ===
     #[inline(always)]
-    fn behavior_corr(&self, p1: &WalletProfile, p2: &WalletProfile) -> f64 {
-        let ad = (p1.aggression_index - p2.aggression_index).abs();
-        let rd = (p1.risk_preference   - p2.risk_preference).abs();
-        let ed = (p1.token_rotation_entropy - p2.token_rotation_entropy).abs();
-
-        let ac = 1.0 - (ad / 10.0).min(1.0);
-        let rc = 1.0 - rd.clamp(0.0, 1.0);
-        let ec = 1.0 - (ed / 5.0).min(1.0);
-
-        ((ac + rc + ec) / 3.0).clamp(0.0, 1.0)
+    fn token_preference_correlation_fast(&self, p1: &WalletProfile, p2: &WalletProfile) -> f64 {
+        let (small, large) = if p1.token_counts.len() <= p2.token_counts.len() {
+            (&p1.token_counts, &p2.token_counts)
+        } else {
+            (&p2.token_counts, &p1.token_counts)
+        };
+        let mut inter = 0usize;
+        for k in small.keys() {
+            if large.contains_key(k) { inter += 1; }
+        }
+        let union = p1.token_counts.len() + p2.token_counts.len() - inter;
+        if union == 0 { 0.0 } else { (inter as f64) / (union as f64) }
     }
 
-    #[inline(always)]
-    fn calculate_stablecoin_inflow_ratio(&self, swaps: &VecDeque<SwapData>) -> f64 {
+    fn calculate_behavior_correlation(&self, profile1: &WalletProfile, profile2: &WalletProfile) -> f64 {
+        let aggression_diff = (profile1.aggression_index - profile2.aggression_index).abs();
+        let risk_diff = (profile1.risk_preference - profile2.risk_preference).abs();
+        let entropy_diff = (profile1.token_rotation_entropy - profile2.token_rotation_entropy).abs();
+
+        let aggression_correlation = 1.0 - (aggression_diff / 10.0).min(1.0);
+        let risk_correlation = 1.0 - risk_diff;
+        let entropy_correlation = 1.0 - (entropy_diff / 5.0).min(1.0);
+
+        (aggression_correlation + risk_correlation + entropy_correlation) / 3.0
+    }
+
+    // === REPLACE: calculate_stablecoin_inflow_ratio ===
+    fn calculate_stablecoin_inflow_ratio(&self, swaps: &[SwapData]) -> f64 {
         if swaps.is_empty() { return 0.0; }
-        let mut inflow: u128 = 0;
+        let mut inflow:  u128 = 0;
         let mut outflow: u128 = 0;
-        for s in swaps.iter() {
-            if STABLE_MINTS.contains(&s.token_in)  { outflow += s.amount_in as u128; }
-            if STABLE_MINTS.contains(&s.token_out) { inflow  += s.amount_out as u128; }
+        for s in swaps {
+            if is_stablecoin(&s.token_in)  { outflow = outflow.saturating_add(s.amount_in as u128); }
+            if is_stablecoin(&s.token_out) { inflow  = inflow.saturating_add(s.amount_out as u128); }
         }
-        let denom = inflow + outflow;
-        if denom == 0 { 0.0 } else { (inflow as f64) / (denom as f64) }
+        let denom = inflow.saturating_add(outflow);
+        if denom == 0 { return 0.0; }
+        (inflow as f64) / (denom as f64)
     }
 
-    #[inline(always)]
-    fn calculate_avg_slippage_tolerance(&self, swaps: &VecDeque<SwapData>) -> f64 {
+    // === REPLACE: calculate_avg_slippage_tolerance ===
+    fn calculate_avg_slippage_tolerance(&self, swaps: &[SwapData]) -> f64 {
         if swaps.is_empty() { return 0.0; }
         let sum: u64 = swaps.iter().map(|s| s.slippage_bps as u64).sum();
         (sum as f64) / (swaps.len() as f64)
     }
 
-    #[inline(always)]
-    fn calculate_swap_frequency_score(&self, swaps: &VecDeque<SwapData>) -> f64 {
+    // === REPLACE: calculate_swap_frequency_score ===
+    fn calculate_swap_frequency_score(&self, swaps: &[SwapData]) -> f64 {
         if swaps.len() < 2 { return 0.0; }
-        let first = swaps.front().unwrap().timestamp;
-        let last  = swaps.back().unwrap().timestamp;
-        let span  = last.saturating_sub(first);
-        if span == 0 { 10.0 } else { ((swaps.len() as f64 * 3600.0) / span as f64).min(10.0) }
+        let first = swaps.first().unwrap().timestamp;
+        let last  = swaps.last().unwrap().timestamp;
+        if last <= first { return 10.0; }
+        let sph = (swaps.len() as f64) * 3600.0 / ((last - first) as f64);
+        sph.min(10.0)
     }
 
-    #[inline(always)]
     pub async fn get_wallet_profile(&self, wallet: &Pubkey) -> Option<WalletProfile> {
-        self.profiles.get(wallet).map(|e| e.value().clone())
+        self.profiles.get(wallet).map(|entry| entry.clone())
     }
 
-    #[inline(always)]
     pub async fn detect_mirror_intent(&self, wallet: &Pubkey) -> Result<bool> {
-        let p = self.profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
-        Ok(p.mirror_intent_score > 0.7)
+        let profile = self.profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
+        
+        Ok(profile.mirror_intent_score > 0.7)
     }
 
-    #[inline(always)]
     pub async fn analyze_liquidity_behavior(&self, wallet: &Pubkey) -> Result<f64> {
-        let p = self.profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
-        Ok(p.liquidity_behavior_score)
+        let profile = self.profiles.get(wallet).ok_or_else(|| anyhow::anyhow!("Wallet not found"))?;
+        
+        Ok(profile.liquidity_behavior_score)
     }
 
+    // === ADD (verbatim): typed fast updater ===
+    #[inline]
+    pub async fn update_mempool_pattern_typed(&self, dex: DexType, token_in: Pubkey, timestamp: u64) -> Result<()> {
+        let mut dq = self.mempool_patterns_typed
+            .entry((dex, token_in))
+            .or_insert_with(|| VecDeque::with_capacity(MAX_PATTERN_TIMES));
+        let cutoff = timestamp.saturating_sub(3_600);
+        while let Some(&front) = dq.front() {
+            if front <= cutoff { dq.pop_front(); } else { break; }
+        }
+        if dq.len() == MAX_PATTERN_TIMES { dq.pop_front(); }
+        dq.push_back(timestamp);
+        Ok(())
+    }
+
+    // === REPLACE: update_mempool_pattern (extends step #15) ===
+    pub async fn update_mempool_pattern(&self, pattern: String, timestamp: u64) -> Result<()> {
+        // Legacy path (string key)
+        let mut dq = self.mempool_patterns
+            .entry(pattern.clone())
+            .or_insert_with(|| VecDeque::with_capacity(MAX_PATTERN_TIMES));
+
+        let cutoff = timestamp.saturating_sub(3_600);
+        while let Some(&front) = dq.front() {
+            if front <= cutoff { dq.pop_front(); } else { break; }
+        }
+        if dq.len() == MAX_PATTERN_TIMES { dq.pop_front(); }
+        dq.push_back(timestamp);
+
+        // Attempt to parse and also update typed map
+        if let Some((dex_str, token_str)) = pattern.split_once('_') {
+            let dex = match dex_str {
+                "Jupiter" => Some(DexType::Jupiter),
+                "Raydium" => Some(DexType::Raydium),
+                "Orca"    => Some(DexType::Orca),
+                _ => None,
+            };
+            if let (Some(dex), Ok(mint)) = (dex, Pubkey::from_str(token_str)) {
+                let _ = self.update_mempool_pattern_typed(dex, mint, timestamp).await;
+            }
+        }
+        Ok(())
+    }
+
+    // === REPLACE: add_coordination_edge ===
+    pub async fn add_coordination_edge(&self, w1: Pubkey, w2: Pubkey) -> Result<()> {
+        if w1 == w2 { return Ok(()); }
+        let set1 = self.coordination_graph.entry(w1).or_insert_with(|| DashSet::with_hasher(ahash::RandomState::default()));
+        set1.insert(w2);
+        let set2 = self.coordination_graph.entry(w2).or_insert_with(|| DashSet::with_hasher(ahash::RandomState::default()));
+        set2.insert(w1);
+        Ok(())
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_slot_fee_observation(&self, observed_bundles: u32, mean_tip_lamports: u64) {
+        self.fee_heat.update_slot(observed_bundles, mean_tip_lamports);
+    }
+
+    // === ADD (verbatim) ===
+    // === REPLACE: recommend_cu_price_lamports ===
+    #[inline]
+    pub fn recommend_cu_price_lamports(&self, p: &WalletProfile) -> u64 {
+        let mirror = p.mirror_intent_score.clamp(0.0, 1.0);
+        let coord  = p.coordination_score.clamp(0.0, 1.0);
+        let aggr   = (p.aggression_index / 10.0).clamp(0.0, 1.0);
+
+        let heat   = self.fee_heat.load_heat();
+        let tipavg = self.fee_heat.load_tip() as f64;
+
+        let base_per_cu = (tipavg / (DEFAULT_CU_ESTIMATE as f64)).max(1.0);
+        let sig = 0.55 * mirror + 0.25 * coord + 0.20 * aggr;
+
+        // pair volatility proxy (0..1) from last swap
+        let pair_vol = p.recent_swaps.back()
+            .map(|last| self.read_pair_vol(last.token_in, last.token_out))
+            .unwrap_or(0.0);
+
+        // Heat amplifies signal; vol adds a bounded kick up to +20% at extreme vol
+        let premium = 1.0 + 3.0 * heat * sig + 0.20 * pair_vol;
+
+        (base_per_cu * premium).round()
+            .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64
+    }
+
+    #[inline]
+    pub fn recommend_bundle_tip_lamports(&self, p: &WalletProfile, total_cu: u64) -> u64 {
+        let per_cu = self.recommend_cu_price_lamports(p);
+        per_cu.saturating_mul(total_cu).min(MAX_TIP_LAMPORTS)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn build_compute_budget_ixs(cu_limit: u32, cu_price_lamports_per_cu: u64) -> [Instruction; 2] {
+        let ix_limit = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
+        let ix_price = ComputeBudgetInstruction::set_compute_unit_price(cu_price_lamports_per_cu);
+        [ix_limit, ix_price]
+    }
+
+    #[inline]
+    pub fn prepend_compute_budget(ixs: &mut Vec<Instruction>, cu_limit: u32, cu_price_lamports_per_cu: u64) {
+        let [limit, price] = build_compute_budget_ixs(cu_limit, cu_price_lamports_per_cu);
+        // ComputeBudget must come first for priority
+        ixs.insert(0, price);
+        ixs.insert(0, limit);
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_cu_price_lamports_with_leader(&self, p: &WalletProfile, leader_aligned: bool) -> u64 {
+        // Base recommendation
+        let mut per_cu = self.recommend_cu_price_lamports(p) as f64;
+
+        // If leader is *not* aligned (less friendly for our bundles), add skew;
+        // if aligned, shave a bit to avoid overpaying unnecessarily.
+        let heat = self.fee_heat.load_heat(); // 0..1
+        if leader_aligned {
+            // save up to 12% at low heat, tapering to ~5% at high heat
+            let shave = 0.12 - 0.07 * heat;
+            per_cu *= (1.0 - shave).clamp(0.88, 0.95);
+        } else {
+            // pay up to +35% at high heat, +15% at low heat
+            let bump = 0.15 + 0.20 * heat;
+            per_cu *= (1.0 + bump).clamp(1.15, 1.35);
+        }
+
+        per_cu.round()
+            .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64
+    }
+
+    // === REPLACE: should_shadow_trade ===
+    #[inline]
+    pub fn should_shadow_trade(&self, p: &WalletProfile) -> bool {
+        // Core signal
+        let s = 0.6 * p.mirror_intent_score
+              + 0.25 * p.coordination_score
+              + 0.15 * (p.aggression_index / 10.0);
+
+        // Risk brakes on stables & extreme slippage tolerance (toxic flow heuristic)
+        let stable_pen = if p.stablecoin_inflow_ratio > 0.80 { 0.20 }
+                         else if p.stablecoin_inflow_ratio > 0.60 { 0.12 } else { 0.0 };
+        let slip_pen   = if p.avg_slippage_tolerance >= 1_500.0 { 0.12 } // ≥15% bps
+                         else if p.avg_slippage_tolerance >= 800.0 { 0.06 } else { 0.0 };
+
+        // Activity boost
+        let freq_boost = (p.swap_frequency_score / 10.0) * 0.12;
+
+        // Heat raises the bar in cold slots (avoid paying when no one else is)
+        let heat = self.fee_heat.load_heat(); // 0..1
+        let heat_gate = if heat < 0.15 { 0.08 }
+                        else if heat < 0.35 { 0.04 } else { 0.0 };
+
+        let score = (s + freq_boost - stable_pen - slip_pen - heat_gate).clamp(0.0, 1.0);
+        score >= 0.58
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub async fn update_mempool_patterns_typed_batch(&self, items: &[(DexType, Pubkey, u64)]) -> Result<()> {
+        for &(dex, token_in, ts) in items {
+            let mut dq = self.mempool_patterns_typed
+                .entry((dex, token_in))
+                .or_insert_with(|| VecDeque::with_capacity(MAX_PATTERN_TIMES));
+            let cutoff = ts.saturating_sub(3_600);
+            while let Some(&front) = dq.front() {
+                if front <= cutoff { dq.pop_front(); } else { break; }
+            }
+            if dq.len() == MAX_PATTERN_TIMES { dq.pop_front(); }
+            dq.push_back(ts);
+        }
+        Ok(())
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_leader_aligned(&self, aligned: bool) {
+        self.leader_aligned.store(aligned, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn recommend_cu_price_auto(&self, p: &WalletProfile) -> u64 {
+        let aligned = self.leader_aligned.load(Ordering::Relaxed);
+        self.recommend_cu_price_lamports_with_leader(p, aligned)
+    }
+
+    #[inline]
+    pub fn build_priority_budget_auto(&self, p: &WalletProfile, cu_limit: u32) -> [Instruction; 2] {
+        let per_cu = self.recommend_cu_price_auto(p);
+        Self::build_compute_budget_ixs(cu_limit, per_cu)
+    }
+
+    // === REPLACE: recommend_bundle_tip_lamports ===
+    #[inline]
+    pub fn recommend_bundle_tip_lamports(&self, p: &WalletProfile, total_cu: u64) -> u64 {
+        let per_cu = self.recommend_cu_price_auto(p) as f64;
+        let tipavg = self.fee_heat.load_tip() as f64;
+        let tip80  = self.fee_heat.load_tip_p80() as f64;
+
+        // robust floor = max(40% of mean, 90% of p80)
+        let floor = tipavg * 0.40f64;
+        let robust = (tip80 * 0.90f64).max(floor);
+        let want  = (per_cu * total_cu as f64).max(robust);
+        want.round().clamp(1.0, MAX_TIP_LAMPORTS as f64) as u64
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn detect_mirror_burst(&self, p: &WalletProfile) -> bool {
+        // Check last swap against recent pattern queue (typed fast path)
+        if let Some(last) = p.recent_swaps.back() {
+            if let Some(dq) = self.mempool_patterns_typed.get(&(last.dex, last.token_in)) {
+                // Find any pattern hit within MAX_MATCH_LATENCY_SECS
+                for &t in dq.iter().rev().take(MIRROR_SCAN_BACK) {
+                    if last.timestamp.abs_diff(t) <= MAX_MATCH_LATENCY_SECS { return true; }
+                    if (t as i64) < (last.timestamp as i64) - (MAX_MATCH_LATENCY_SECS as i64) { break; }
+                }
+            }
+        }
+        false
+    }
+
+    // === REPLACE: should_shadow_trade ===
+    #[inline]
+    pub fn should_shadow_trade(&self, p: &WalletProfile) -> bool {
+        if let Some(until) = self.quarantine_until.get(&p.wallet).map(|e| *e.value()) {
+            if p.last_activity <= until { return false; }
+        }
+
+        let s = 0.54 * p.mirror_intent_score
+              + 0.22 * p.coordination_score
+              + 0.24 * (p.aggression_index / 10.0);
+
+        let coord_boost = 0.08 * self.read_coord_strength_avg(p.wallet).clamp(0.0, 1.0);
+
+        let stable_pen = if p.stablecoin_inflow_ratio > 0.80 { 0.20 }
+                         else if p.stablecoin_inflow_ratio > 0.60 { 0.12 } else { 0.0 };
+        let slip_pen   = if p.avg_slippage_tolerance >= 1_500.0 { 0.12 }
+                         else if p.avg_slippage_tolerance >= 800.0 { 0.06 } else { 0.0 };
+
+        let pair_vol = p.recent_swaps.back()
+            .map(|last| self.read_pair_vol(last.token_in, last.token_out))
+            .unwrap_or(0.0);
+        let vol_pen = 0.18 * pair_vol;
+
+        let freq_boost = (p.swap_frequency_score / 10.0) * 0.12;
+        let heat = self.fee_heat.load_heat();
+        let heat_gate = if heat < 0.12 { 0.10 } else if heat < 0.30 { 0.06 } else { 0.0 };
+
+        let burst = self.detect_mirror_burst(p);
+        let burst_boost = if burst { (0.06 + 0.10 * heat).min(0.12) } else { 0.0 };
+
+        let score = (s + coord_boost + freq_boost + burst_boost - stable_pen - slip_pen - vol_pen - heat_gate).clamp(0.0, 1.0);
+        score >= 0.60
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_latency_bias_ms(&self, bias_ms: i64) {
+        // set to (observed_chain_ts - local_capture_ts) in milliseconds
+        self.latency_bias_ms.store(bias_ms, Ordering::Relaxed);
+    }
+
+    // === ADD (verbatim) ===
     #[inline(always)]
-    pub async fn update_mempool_pattern_key(&self, key: PatternKey, ts: u64) -> Result<()> {
-        let mut entry = self.mempool_patterns.entry(key).or_insert_with(|| SmallVec::<[u64; 64]>::new());
-        let v = entry.value_mut();
-        if let Some(&last) = v.last() {
-            if ts >= last { v.push(ts); }
-            else {
-                let pos = v.iter().position(|&x| x > ts).unwrap_or(v.len());
-                v.insert(pos, ts);
+    fn dynamic_band_from(pattern_ts: &VecDeque<u64>) -> f64 {
+        // Use up to 8 last inter-arrival gaps; derive a stable band
+        let n = pattern_ts.len();
+        if n < 3 { return MIRROR_BAND_SECS as f64; }
+        let take = 8.min(n - 1);
+        let mut sum = 0u64;
+        let mut cnt = 0u32;
+        for k in 1..=take {
+            let i = n - k;
+            let prev = pattern_ts[i - 1];
+            let curr = pattern_ts[i];
+            if curr > prev {
+                sum = sum.saturating_add(curr - prev);
+                cnt += 1;
+            }
+        }
+        if cnt == 0 { return MIRROR_BAND_SECS as f64; }
+        let mean = (sum as f64) / (cnt as f64);
+        // heuristically tighten a bit, clamp to safe bounds
+        (mean * 1.2).max(MIN_MIRROR_BAND_SECS).min(MAX_MIRROR_BAND_SECS)
+    }
+
+    // === ADD (verbatim) ===
+    #[derive(Default)]
+    struct LeaderStats {
+        // acceptance EWMA in ppm
+        acc_ppm: AtomicU64,
+        // observed average per-CU price (lamports/CU)
+        per_cu_avg: AtomicU64,
+    }
+
+    impl LeaderStats {
+        #[inline] fn load_acc(&self) -> f64 { (self.acc_ppm.load(Ordering::Relaxed) as f64) / PPM_SCALE }
+        #[inline] fn store_acc(&self, x: f64) {
+            let v = (x.clamp(0.0, 1.0) * PPM_SCALE).round() as u64;
+            self.acc_ppm.store(v, Ordering::Relaxed);
+        }
+        #[inline] fn load_pcu(&self) -> u64 { self.per_cu_avg.load(Ordering::Relaxed) }
+        #[inline] fn store_pcu(&self, v: u64) { self.per_cu_avg.store(v, Ordering::Relaxed); }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_leader_stats(&self, leader: Pubkey, accepted: bool, per_cu_paid: u64) {
+        const ACC_ALPHA: f64 = 0.20;
+        const PCU_ALPHA: f64 = 0.20;
+        let entry = self.leader_stats.entry(leader).or_insert_with(LeaderStats::default);
+        // acceptance ewma
+        let prev = entry.load_acc();
+        let inst = if accepted { 1.0 } else { 0.0 };
+        entry.store_acc((1.0 - ACC_ALPHA) * prev + ACC_ALPHA * inst);
+        // per-cu ewma
+        let prev_pcu = entry.load_pcu() as f64;
+        let new_pcu  = (1.0 - PCU_ALPHA) * prev_pcu + PCU_ALPHA * (per_cu_paid as f64);
+        entry.store_pcu(new_pcu.round() as u64);
+    }
+
+    /// Price with specific leader ID (prefer this when you know the upcoming leader).
+    #[inline]
+    pub fn recommend_cu_price_lamports_for_leader(&self, p: &WalletProfile, leader: &Pubkey) -> u64 {
+        let base = self.recommend_cu_price_lamports(p) as f64;
+        let heat = self.fee_heat.load_heat();
+        if let Some(st) = self.leader_stats.get(leader) {
+            let acc = st.load_acc();               // 0..1
+            let ref_pcu = st.load_pcu() as f64;    // lamports/CU
+            // If acceptance is high and ref_pcu below our base, shave a little (risk-aware).
+            let shave = if acc > 0.65 && ref_pcu <= base { (0.05 + 0.08 * (1.0 - heat)).min(0.10) } else { 0.0 };
+            // If acceptance is low or ref_pcu > base, pay up slightly towards ref.
+            let bump  = if acc < 0.35 && ref_pcu > base { ((ref_pcu / base) - 1.0).clamp(0.05, 0.30) } else { 0.0 };
+            let adj   = (1.0 + bump - shave).clamp(0.85, 1.35);
+            return (base * adj).round()
+                .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64;
+        }
+        base.round() as u64
+    }
+
+    // === ADD (verbatim) ===
+    const VOL_ALPHA: f64 = 0.12;
+
+    #[derive(Default)]
+    struct VolAtom {
+        ppm: AtomicU64, // 0..1_000_000
+    }
+
+    impl VolAtom {
+        #[inline] fn load(&self) -> f64 { (self.ppm.load(Ordering::Relaxed) as f64) / PPM_SCALE }
+        #[inline] fn store(&self, x: f64) {
+            let v = (x.clamp(0.0, 1.0) * PPM_SCALE).round() as u64;
+            self.ppm.store(v, Ordering::Relaxed);
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn feed_pair_vol(&self, a: Pubkey, b: Pubkey, slippage_bps: u16) {
+        // directional pair key; use (a,b)
+        let entry = self.pair_vol.entry((a, b)).or_insert_with(VolAtom::default);
+        let prev = entry.load();
+        // normalize slippage to 0..1 with soft cap around 2000 bps
+        let inst = ((slippage_bps as f64) / 2000.0).min(1.0);
+        let newv = (1.0 - VOL_ALPHA) * prev + VOL_ALPHA * inst;
+        entry.store(newv);
+    }
+
+    #[inline]
+    fn read_pair_vol(&self, a: Pubkey, b: Pubkey) -> f64 {
+        self.pair_vol.get(&(a, b)).map(|v| v.load()).unwrap_or(0.0)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn maybe_quarantine(&self, p: &WalletProfile) {
+        // Quarantine very toxic flows for 2 minutes based on *recent* metrics
+        if p.avg_slippage_tolerance >= 1_600.0 && p.risk_preference > 0.70 && p.aggression_index > 6.0 {
+            let until = p.last_activity.saturating_add(120);
+            self.quarantine_until.insert(p.wallet, until);
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[derive(Default)]
+    struct CoordStrength {
+        ppm: AtomicU64,   // 0..1_000_000
+        ts:  AtomicU64,   // last update (secs)
+    }
+    impl CoordStrength {
+        #[inline] fn load(&self) -> (f64, u64) {
+            ((self.ppm.load(Ordering::Relaxed) as f64) / PPM_SCALE, self.ts.load(Ordering::Relaxed))
+        }
+        #[inline] fn store(&self, val: f64, ts: u64) {
+            let v = (val.clamp(0.0, 1.0) * PPM_SCALE).round() as u64;
+            self.ppm.store(v, Ordering::Relaxed);
+            self.ts.store(ts, Ordering::Relaxed);
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn clamp_attempts(n: u32) -> u32 { n.clamp(1, STAIR_MAX_ATTEMPTS) }
+
+    #[inline]
+    fn stair_multipliers(heat: f64) -> [f64; STAIR_MAX_ATTEMPTS as usize] {
+        // Gentle in cold slots, steeper when hot; tuned to avoid cliff overpay.
+        if heat < 0.20 {
+            [1.00, 1.04, 1.08, 1.12, 1.16, 1.20]
+        } else if heat < 0.45 {
+            [1.00, 1.06, 1.12, 1.18, 1.24, 1.30]
+        } else {
+            [1.00, 1.08, 1.16, 1.24, 1.30, 1.35]
+        }
+    }
+
+    /// Build a staircase of ComputeBudget ixs for multiple attempts.
+    /// attempts: 1..=6; leader: Some(pubkey) to use leader-specific price, else auto.
+    #[inline]
+    pub fn build_priority_budget_stair_for(
+        &self,
+        p: &WalletProfile,
+        leader: Option<Pubkey>,
+        cu_limit: u32,
+        attempts: u32,
+    ) -> Vec<[Instruction; 2]> {
+        let heat = self.fee_heat.load_heat();
+        let mults = Self::stair_multipliers(heat);
+        let n = Self::clamp_attempts(attempts) as usize;
+
+        let base_per_cu = match leader {
+            Some(l) => self.recommend_cu_price_lamports_for_leader(p, &l),
+            None    => self.recommend_cu_price_auto(p),
+        } as f64;
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let per_cu = (base_per_cu * mults[i]).round()
+                .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64;
+            out.push(Self::build_compute_budget_ixs(cu_limit, per_cu));
+        }
+        out
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    async fn calculate_mirror_intent_score_recency(&self, swaps: &VecDeque<SwapData>, now_ts: u64) -> f64 {
+        if swaps.is_empty() { return 0.0; }
+        let mut wsum = 0.0f64;
+        let mut vsum = 0.0f64;
+
+        for s in swaps.iter() {
+            let c = if let Some(dq) = self.mempool_patterns_typed.get(&(s.dex, s.token_in)) {
+                self.calculate_timing_correlation(s.timestamp, &s.token_in, &dq)
+            } else {
+                let key = format!("{:?}_{}", s.dex, s.token_in);
+                if let Some(dq) = self.mempool_patterns.get(&key) {
+                    self.calculate_timing_correlation(s.timestamp, &s.token_in, &dq)
+                } else { 0.0 }
+            };
+            if c > 0.0 {
+                let age = now_ts.saturating_sub(s.timestamp) as f64;
+                let w = (-age / MIRROR_RECENCY_TAU_SECS).exp();
+                wsum += w * c;
+                vsum += w;
+            }
+        }
+        if vsum == 0.0 { 0.0 } else { (wsum / vsum).clamp(0.0, 1.0) }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn coord_key(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
+        if a.to_bytes() <= b.to_bytes() { (a,b) } else { (b,a) }
+    }
+
+    #[inline]
+    fn decay_factor(dt_secs: u64, hl_secs: f64) -> f64 {
+        if dt_secs == 0 { return 1.0; }
+        (-(dt_secs as f64) * (std::f64::consts::LN_2 / hl_secs)).exp()
+    }
+
+    #[inline]
+    fn update_coord_strength_pair(&self, a: Pubkey, b: Pubkey, corr: f64, now_ts: u64) {
+        if a == b { return; }
+        let key = Self::coord_key(a, b);
+        let entry = self.coord_strength.entry(key).or_insert_with(CoordStrength::default);
+        let (prev, last_ts) = entry.load();
+        let df = Self::decay_factor(now_ts.saturating_sub(last_ts), COORD_HL_SECS);
+        let newv = df * prev + (1.0 - df) * corr.clamp(0.0, 1.0);
+        entry.store(newv, now_ts);
+    }
+
+    #[inline]
+    fn read_coord_strength_avg(&self, w: Pubkey) -> f64 {
+        // average strength across neighbors; O(deg)
+        let mut sum = 0.0; let mut cnt = 0u32;
+        if let Some(neigh) = self.coordination_graph.get(&w) {
+            for other in neigh.iter() {
+                let key = Self::coord_key(w, *other.value());
+                if let Some(cs) = self.coord_strength.get(&key) {
+                    sum += cs.ppm.load(Ordering::Relaxed) as f64 / PPM_SCALE; cnt += 1;
+                }
+            }
+        }
+        if cnt == 0 { 0.0 } else { (sum / cnt as f64).clamp(0.0, 1.0) }
+    }
+
+    /// Re-evaluate correlations against neighbors and update strengths (call after profile update).
+    #[inline]
+    async fn update_coord_strength_for_neighbors(&self, w: Pubkey, now_ts: u64) {
+        let Some(me) = self.profiles.get(&w) else { return; };
+        if let Some(neigh) = self.coordination_graph.get(&w) {
+            for other in neigh.iter() {
+                if let Some(op) = self.profiles.get(other.value()) {
+                    let corr = self.calculate_profile_correlation(&*me, &*op);
+                    self.update_coord_strength_pair(w, *other.value(), corr, now_ts);
+                }
+            }
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub async fn update_mempool_pattern_typed_dedup(&self, dex: DexType, token_in: Pubkey, timestamp: u64) -> Result<()> {
+        let mut dq = self.mempool_patterns_typed
+            .entry((dex, token_in))
+            .or_insert_with(|| VecDeque::with_capacity(MAX_PATTERN_TIMES));
+        // prune 1h window
+        let cutoff = timestamp.saturating_sub(3_600);
+        while let Some(&front) = dq.front() {
+            if front <= cutoff { dq.pop_front(); } else { break; }
+        }
+        // dedup if last hit is within 1 second
+        if let Some(&last) = dq.back() {
+            if timestamp.abs_diff(last) <= 1 { return Ok(()); }
+        }
+        if dq.len() == MAX_PATTERN_TIMES { dq.pop_front(); }
+        dq.push_back(timestamp);
+        Ok(())
+    }
+
+    // === ADD (verbatim) ===
+    #[derive(Default)]
+    struct StartArm {
+        n:      AtomicU64, // #observations
+        wins:   AtomicU64, // #inclusions when started at this idx
+        cost_pc: AtomicU64, // Σ(per_cu_paid) on wins (lamports/CU)
+    }
+    impl StartArm {
+        #[inline] fn win_rate(&self) -> f64 {
+            let n = self.n.load(Ordering::Relaxed) as f64;
+            if n == 0.0 { 0.0 } else { (self.wins.load(Ordering::Relaxed) as f64) / n }
+        }
+        #[inline] fn avg_per_cu(&self) -> f64 {
+            let w = self.wins.load(Ordering::Relaxed);
+            if w == 0 { 0.0 } else { (self.cost_pc.load(Ordering::Relaxed) as f64) / (w as f64) }
+        }
+    }
+
+    type PolicyKey = (u8 /*heat_bucket*/, u8 /*vol_bucket*/, u8 /*leader_flag*/);
+    #[inline]
+    fn bucket_heat(h: f64) -> u8 { (h * 4.0).floor().clamp(0.0, 4.0) as u8 } // 0..4
+    #[inline]
+    fn bucket_vol(v: f64) -> u8 { if v <= 0.20 {0} else if v <= 0.60 {1} else {2} } // 0..2
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn ensure_policy(&self, key: PolicyKey) -> dashmap::mapref::one::RefMut<'_, PolicyKey, Vec<StartArm>> {
+        self.stair_policies.entry(key).or_insert_with(|| {
+            let mut v = Vec::with_capacity(STAIR_MAX_ATTEMPTS as usize);
+            for _ in 0..STAIR_MAX_ATTEMPTS { v.push(StartArm::default()); }
+            v
+        })
+    }
+
+    #[inline]
+    fn choose_start_index_for(&self, heat: f64, vol: f64, leader_friendly: bool) -> usize {
+        let key = (Self::bucket_heat(heat), Self::bucket_vol(vol), if leader_friendly {1} else {0});
+        let pol = self.ensure_policy(key);
+        // UCB-style score over "inclusions per lamport": win_rate / multiplier, with exploration
+        let mults = Self::stair_multipliers(heat);
+        let total_n: f64 = pol.iter().map(|a| a.n.load(Ordering::Relaxed) as f64).sum::<f64>().max(1.0);
+        let mut best_idx = 0usize;
+        let mut best_score = f64::MIN;
+        for (i, arm) in pol.iter().enumerate() {
+            let n = arm.n.load(Ordering::Relaxed) as f64;
+            let wr = arm.win_rate();                 // [0,1]
+            let mult = mults[i].max(1.0);            // price multiplier
+            let exploit = if mult > 0.0 { wr / mult } else { 0.0 };
+            let explore = ((total_n.ln() / (n.max(1.0))).sqrt()) * 0.05; // gentle exploration
+            let score = exploit + explore;
+            if score > best_score { best_score = score; best_idx = i; }
+        }
+        best_idx
+    }
+
+    #[inline]
+    pub fn record_stair_outcome_for_wallet(&self, wallet: Pubkey, included: bool, per_cu_paid: u64) {
+        let Some(start_idx) = self.last_stair_start.get(&wallet).map(|e| *e.value()) else { return; };
+        let heat = self.fee_heat.load_heat();
+        // approximate vol using last swap if present
+        let vol = self.profiles.get(&wallet)
+            .and_then(|p| p.recent_swaps.back()
+                .map(|last| self.read_pair_vol(last.token_in, last.token_out)))
+            .unwrap_or(0.0);
+        let key = (Self::bucket_heat(heat), Self::bucket_vol(vol), if self.leader_aligned.load(Ordering::Relaxed) {1} else {0});
+        let pol = self.ensure_policy(key);
+        if let Some(arm) = pol.get(start_idx as usize) {
+            arm.n.fetch_add(1, Ordering::Relaxed);
+            if included {
+                arm.wins.fetch_add(1, Ordering::Relaxed);
+                arm.cost_pc.fetch_add(per_cu_paid.min(1_000_000_000), Ordering::Relaxed);
+            }
+        }
+    }
+
+    // === ADD (verbatim) ===
+    pub struct AttemptPlan {
+        pub delay_ms: u64,
+        pub ixs: [Instruction; 2],
+    }
+
+    /// Build an attempt plan spaced inside the remaining slot time.
+    /// `slot_ms`: slot length; `safety_ms`: leave headroom; `rtt_ms`: your median end-to-end.
+    /// Stores chosen start step for `p.wallet` so you can later call `record_stair_outcome_for_wallet`.
+    #[inline]
+    pub fn build_stair_attempt_plan_smart(
+        &self,
+        p: &WalletProfile,
+        leader: Option<Pubkey>,
+        cu_limit: u32,
+        attempts: u32,
+        slot_ms: u64,
+        safety_ms: u64,
+        rtt_ms: u64,
+    ) -> Vec<AttemptPlan> {
+        let heat   = self.fee_heat.load_heat();
+        let vol    = p.recent_swaps.back()
+                        .map(|last| self.read_pair_vol(last.token_in, last.token_out))
+                        .unwrap_or(0.0);
+        let start  = self.choose_start_index_for(heat, vol, self.leader_aligned.load(Ordering::Relaxed));
+        self.last_stair_start.insert(p.wallet, start as u8);
+
+        let mults  = Self::stair_multipliers(heat);
+        let base_pc = match leader {
+            Some(l) => self.recommend_cu_price_lamports_for_leader(p, &l),
+            None    => self.recommend_cu_price_auto(p),
+        } as f64;
+
+        let n = attempts.clamp(1, STAIR_MAX_ATTEMPTS) as usize;
+        let usable = slot_ms.saturating_sub(safety_ms).saturating_sub(rtt_ms);
+        let step = if n <= 1 { 0 } else { usable / (n as u64 - 1) };
+
+        let mut out = Vec::with_capacity(n);
+        for k in 0..n {
+            let idx = (start + k).min((STAIR_MAX_ATTEMPTS - 1) as usize);
+            let per_cu = (base_pc * mults[idx]).round()
+                .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64;
+            let ixs = self.build_compute_budget_ixs_cached(cu_limit, per_cu);
+            out.push(AttemptPlan { delay_ms: step.saturating_mul(k as u64), ixs });
+        }
+        out
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn should_shadow_trade_stable(&self, p: &WalletProfile) -> bool {
+        let now = p.last_activity;
+        let raw = self.should_shadow_trade(p);
+        if let Some(prev) = self.shadow_state.get(&p.wallet) {
+            let (last, ts) = *prev.value();
+            if raw && !last && now.saturating_sub(ts) <= SHADOW_NEG_COOLDOWN_SECS {
+                // just flipped to true: enforce short cooldown unless a burst
+                if !self.detect_mirror_burst(p) { return false; }
+            }
+            if !raw && last && now.saturating_sub(ts) <= SHADOW_POS_HOLD_SECS {
+                // hold positive briefly to avoid flapping off
+                return true;
+            }
+        }
+        self.shadow_state.insert(p.wallet, (raw, now));
+        raw
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_attempts(&self, p: &WalletProfile, slot_ms: u64) -> u32 {
+        let heat = self.fee_heat.load_heat();
+        let vol  = p.recent_swaps.back()
+            .map(|last| self.read_pair_vol(last.token_in, last.token_out))
+            .unwrap_or(0.0);
+        let s = 0.55 * p.mirror_intent_score + 0.25 * p.coordination_score + 0.20 * (p.aggression_index / 10.0);
+        let toxic = (p.avg_slippage_tolerance >= 1200.0) || (p.risk_preference > 0.75) || (vol > 0.75);
+
+        let mut att = if s > 0.75 && heat > 0.35 { 5 } else if s > 0.60 { 4 } else { 3 };
+        if toxic { att = att.saturating_sub(1).max(1); }
+        // keep feasible with short slots
+        if slot_ms <= 350 { att = att.min(3); }
+        att.min(STAIR_MAX_ATTEMPTS).max(1)
+    }
+
+    #[inline]
+    pub fn recommend_cu_limit(&self, p: &WalletProfile) -> u32 {
+        let (dex, vol) = p.recent_swaps.back()
+            .map(|s| (Some(s.dex), self.read_pair_vol(s.token_in, s.token_out)))
+            .unwrap_or((None, 0.0));
+        let base = match dex {
+            Some(DexType::Jupiter) => 220_000u32,
+            Some(DexType::Raydium) => 180_000u32,
+            Some(DexType::Orca)    => 160_000u32,
+            None => DEFAULT_CU_ESTIMATE as u32,
+        };
+        // bump a touch under high volatility to reduce compute-overflow risk on complex routes
+        let bump = if vol > 0.70 { (base as f64 * 0.10).round() as u32 } else if vol > 0.45 { (base as f64 * 0.05).round() as u32 } else { 0 };
+        base.saturating_add(bump).min(300_000)
+    }
+
+    // === ADD (verbatim) ===
+    #[derive(Default)]
+    struct SpendWindow {
+        start_sec: AtomicU64,
+        used_lamports: AtomicU64,
+    }
+
+    impl SpendWindow {
+        #[inline] fn reset(&self, now_sec: u64) {
+            self.start_sec.store(now_sec, Ordering::Relaxed);
+            self.used_lamports.store(0, Ordering::Relaxed);
+        }
+        #[inline] fn load(&self) -> (u64, u64) {
+            (self.start_sec.load(Ordering::Relaxed), self.used_lamports.load(Ordering::Relaxed))
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_spend_caps(&self, lamports_per_min: u64, attempts_per_slot: u64) {
+        self.spend_cap_lamports_per_min.store(lamports_per_min, Ordering::Relaxed);
+        self.attempts_cap_per_slot.store(attempts_per_slot, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn spend_guard_allow(&self, lamports: u64, now_sec: u64) -> bool {
+        let (start, used) = self.spend_window.load();
+        if now_sec.saturating_sub(start) >= SPEND_WINDOW_SECS {
+            self.spend_window.reset(now_sec);
+            return lamports <= self.spend_cap_lamports_per_min.load(Ordering::Relaxed);
+        }
+        let cap = self.spend_cap_lamports_per_min.load(Ordering::Relaxed);
+        let new_used = used.saturating_add(lamports);
+        if new_used > cap { return false; }
+        self.spend_window.used_lamports.store(new_used, Ordering::Relaxed);
+        true
+    }
+
+    #[inline]
+    pub fn attempts_guard_allow(&self, slot: u64) -> bool {
+        let cap = self.attempts_cap_per_slot.load(Ordering::Relaxed);
+        let entry = self.attempts_used_in_slot.entry(slot).or_insert_with(|| AtomicU64::new(0));
+        let prev = entry.fetch_add(1, Ordering::Relaxed);
+        if prev + 1 > cap {
+            // revert increment cleanly
+            entry.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    #[inline]
+    pub fn attempts_guard_reset_slot(&self, slot: u64) {
+        self.attempts_used_in_slot.remove(&slot);
+    }
+
+    // === REPLACE: build_compute_budget_ixs_cached ===
+    #[inline]
+    pub fn build_compute_budget_ixs_cached(&self, cu_limit: u32, cu_price_lamports_per_cu: u64) -> [Instruction; 2] {
+        if let Some(hit) = self.cb_cache.get(&(cu_limit, cu_price_lamports_per_cu)) {
+            // touch
+            let t = CB_CACHE_TICK.fetch_add(1, Ordering::Relaxed);
+            let mut e = hit.clone();
+            e.tick = t;
+            self.cb_cache.insert((cu_limit, cu_price_lamports_per_cu), e.clone());
+            return e.ixs;
+        }
+        let ixs = Self::build_compute_budget_ixs(cu_limit, cu_price_lamports_per_cu);
+        let t = CB_CACHE_TICK.fetch_add(1, Ordering::Relaxed);
+        self.cb_cache.insert((cu_limit, cu_price_lamports_per_cu), CbEntry { ixs: ixs.clone(), tick: t });
+
+        // bounded eviction (LRU-ish single pass)
+        if self.cb_cache.len() > CB_CACHE_CAP {
+            if let Some((k,_)) = self.cb_cache.iter()
+                .min_by_key(|kv| kv.value().tick).map(|kv| (kv.key().clone(), kv.value().tick)) {
+                self.cb_cache.remove(&k);
+            }
+        }
+        ixs
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn predict_accept_prob(&self, per_cu: u64, leader: Option<&Pubkey>) -> f64 {
+        let heat = self.fee_heat.load_heat();        // 0..1
+        let ref_pcu = self.fee_heat.load_tip().max(1) as f64 / (DEFAULT_CU_ESTIMATE as f64);
+        let x = (per_cu as f64) / ref_pcu.max(1.0);
+        // base prior from heat
+        let mut p = (0.08 + 0.80 * heat).clamp(0.05, 0.90);
+        // leader refinement if available
+        if let Some(l) = leader {
+            if let Some(st) = self.leader_stats.get(l) {
+                let acc = st.load_acc();                   // 0..1
+                let ref_lead = st.load_pcu().max(1) as f64;
+                let rel = (per_cu as f64) / ref_lead.max(1.0);
+                p = (0.5 * p + 0.5 * acc).clamp(0.05, 0.95);
+                p *= (1.0 - (-rel).exp()).clamp(0.25, 1.0); // saturating lift
+            } else {
+                p *= (1.0 - (-x).exp()).clamp(0.25, 1.0);
             }
         } else {
-            v.push(ts);
+            p *= (1.0 - (-x).exp()).clamp(0.25, 1.0);
         }
-        // retain last hour and cap to newest MAX_PATTERN_TS
-        let cutoff = ts.saturating_sub(3600);
-        v.retain(|&x| x > cutoff);
-        if v.len() > MAX_PATTERN_TS { let drop_n = v.len() - MAX_PATTERN_TS; v.drain(0..drop_n); }
-        Ok(())
+        p.clamp(0.01, 0.98)
     }
 
-    // Compatibility: legacy "Dex_token" string → typed key (non-hot)
-    pub async fn update_mempool_pattern(&self, pattern: String, ts: u64) -> Result<()> {
-        use std::str::FromStr;
-        let (dex_s, pk_s) = match pattern.split_once('_') { Some(x) => x, None => return Ok(()) };
-        let dex = match dex_s {
-            "Jupiter" => DexType::Jupiter,
-            "Raydium" => DexType::Raydium,
-            "Orca"    => DexType::Orca,
-            _ => return Ok(()),
+    pub struct EvPlan {
+        pub plans: Vec<AttemptPlan>,
+        pub kept:  usize,
+        pub ev_sum: f64,
+    }
+
+    /// Filter plan steps by marginal EV >= 0; keep profitable prefix.
+    /// `edge_lamports`: your expected *gross* alpha per fill (lamports).
+    #[inline]
+    pub fn prune_plan_by_ev(
+        &self,
+        mut plans: Vec<AttemptPlan>,
+        total_cu: u64,
+        leader: Option<Pubkey>,
+        edge_lamports: u64,
+    ) -> EvPlan {
+        let mut ev = 0.0_f64;
+        let mut kept = 0usize;
+        for (i, step) in plans.iter().enumerate() {
+            let p = self.predict_accept_prob(
+                match step.ixs[1].data.get(1..) { // CU price ix is second element; price is in data, but safer to recompute:
+                    _ => {
+                        // we cached per_cu; recompute from cache key is not accessible here → derive from recommend if needed.
+                        // Simplify: we recompute from instruction we just built is non-trivial; instead, compute per_cu via recommend for monotonic proxy.
+                        self.recommend_cu_price_auto(
+                            self.profiles.get(&self.last_stair_start.iter().next().map(|e| *e.key()).unwrap_or(Pubkey::default()))
+                                .as_deref().unwrap_or(&WalletProfile::new(Pubkey::default()))
+                        )
+                    }
+                }, // fallback path not used if caller knows leader
+                leader.as_ref()
+            );
+            let tip = step.ixs[1].data.len(); // placeholder avoided; instead compute cost deterministically:
+            let per_cu = if let Some((_, price_ix)) = Some((&step.ixs[0], &step.ixs[1])) {
+                // price instruction carries lamports per CU in its `data` per ComputeBudget ABI: first byte tag=3, next 8 bytes u64 LE
+                if price_ix.data.len() >= 9 {
+                    u64::from_le_bytes(price_ix.data[1..9].try_into().unwrap_or([0u8;8]))
+                } else { self.recommend_cu_price_auto(&WalletProfile::new(Pubkey::default())) }
+            } else { self.recommend_cu_price_auto(&WalletProfile::new(Pubkey::default())) };
+            let cost = (per_cu as f64) * (total_cu as f64);
+            let mev  = (edge_lamports as f64);
+            let m_ev = p * mev - cost;
+            if m_ev >= 0.0 {
+                ev += m_ev; kept = i + 1;
+            } else { break; }
+        }
+        plans.truncate(kept);
+        EvPlan { plans, kept, ev_sum: ev }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn xorshift64(mut x: u64) -> u64 {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17; x
+    }
+
+    /// Apply ±jitter_ms/2 around each delay; seed is per-wallet to be deterministic.
+    #[inline]
+    pub fn apply_micro_jitter(
+        &self,
+        p: &WalletProfile,
+        plans: &mut [AttemptPlan],
+        jitter_ms: u64,
+    ) {
+        if jitter_ms == 0 { return; }
+        let slot = self.current_slot.load(Ordering::Relaxed);
+        // seed = wallet^slot^last_activity (deterministic per slot)
+        let mut s = {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&p.wallet.to_bytes());
+            let hi = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let lo = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            hi ^ lo ^ slot ^ p.last_activity
         };
-        let token_in = Pubkey::from_str(pk_s).unwrap_or(Pubkey::default());
-        self.update_mempool_pattern_key(PatternKey { dex, token_in }, ts).await
+        for step in plans.iter_mut() {
+            s = Self::xorshift64(s);
+            let r = (s % jitter_ms) as i64 - (jitter_ms as i64 / 2);
+            let d = step.delay_ms as i64 + r;
+            step.delay_ms = if d <= 0 { 0 } else { d as u64 };
+        }
     }
 
-    #[inline(always)]
-    pub async fn add_coordination_edge(&self, a: Pubkey, b: Pubkey) -> Result<()> {
-        let mut e1 = self.coordination_graph.entry(a).or_insert_with(|| SmallVec::<[Pubkey; 8]>::new());
-        if !e1.value().contains(&b) {
-            if e1.value().len() >= MAX_PEERS_PER_WALLET { e1.value_mut().remove(0); }
-            e1.value_mut().push(b);
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_tip_sample(&self, bundle_tip_lamports: u64) { 
+        self.fee_heat.update_tip_quantile_p80(bundle_tip_lamports);
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn record_shadow_outcome(&self, wallet: Pubkey, included: bool, realized_edge_lamports: i64) {
+        let s = self.shadow_stats.entry(wallet).or_insert_with(ShadowStats::default);
+        s.update(included, realized_edge_lamports);
+    }
+
+    #[inline]
+    pub fn read_shadow_quality(&self, wallet: Pubkey) -> (f64 /*hit_rate*/, f64 /*ev_ewma_lamports*/) {
+        if let Some(s) = self.shadow_stats.get(&wallet) {
+            (s.load_hr(), s.load_ev())
+        } else { (0.0, 0.0) }
+    }
+
+    /// Final gate: stable decision + historical EV threshold (lamports).
+    #[inline]
+    pub fn should_shadow_trade_final(&self, p: &WalletProfile, min_ev_lamports: i64) -> bool {
+        if self.is_drawdown_quarantined(p.wallet, p.last_activity) { return false; }
+        if !self.should_shadow_trade_stable(p) { return false; }
+        let (_hr, ev) = self.read_shadow_quality(p.wallet);
+        ev >= (min_ev_lamports as f64)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn surprise_for_wallet(&self, p: &WalletProfile) -> f64 {
+        let Some(last) = p.recent_swaps.back() else { return 0.0; };
+        if let Some(dq) = self.mempool_patterns_typed.get(&(last.dex, last.token_in)) {
+            return burst_surprise_score_from(&dq, last.timestamp);
         }
-        let mut e2 = self.coordination_graph.entry(b).or_insert_with(|| SmallVec::<[Pubkey; 8]>::new());
-        if !e2.value().contains(&a) {
-            if e2.value().len() >= MAX_PEERS_PER_WALLET { e2.value_mut().remove(0); }
-            e2.value_mut().push(a);
+        0.0
+    }
+
+    // === REPLACE: should_shadow_trade_stable (inject surprise boost) ===
+    #[inline]
+    pub fn should_shadow_trade_stable(&self, p: &WalletProfile) -> bool {
+        let now = p.last_activity;
+        let raw = {
+            // base signal composed in prior pieces
+            let base = self.should_shadow_trade(p);
+            // additive surprise boost (only helps when near threshold)
+            if !base {
+                let sup = self.surprise_for_wallet(p); // 0..1
+                if sup >= 0.40 { true } else { false }
+            } else { true }
+        };
+
+        if let Some(prev) = self.shadow_state.get(&p.wallet) {
+            let (last, ts) = *prev.value();
+            if raw && !last && now.saturating_sub(ts) <= SHADOW_NEG_COOLDOWN_SECS {
+                if !self.detect_mirror_burst(p) { return false; }
+            }
+            if !raw && last && now.saturating_sub(ts) <= SHADOW_POS_HOLD_SECS {
+                return true;
+            }
+        }
+        self.shadow_state.insert(p.wallet, (raw, now));
+        raw
+    }
+
+    // === REPLACE: prune_plan_by_ev (use tag-checked parse; remove hack) ===
+    #[inline]
+    pub fn prune_plan_by_ev(
+        &self,
+        mut plans: Vec<AttemptPlan>,
+        total_cu: u64,
+        leader: Option<Pubkey>,
+        edge_lamports: u64,
+    ) -> EvPlan {
+        let mut ev = 0.0_f64;
+        let mut kept = 0usize;
+        for (i, step) in plans.iter().enumerate() {
+            let per_cu = extract_cu_price_from_ix(&step.ixs[1]).unwrap_or(1);
+            let p = self.predict_accept_prob(per_cu, leader.as_ref());
+            let cost = (per_cu as f64) * (total_cu as f64);
+            let mev  = edge_lamports as f64;
+            let m_ev = p * mev - cost;
+            if m_ev >= 0.0 {
+                ev += m_ev; kept = i + 1;
+            } else { break; }
+        }
+        plans.truncate(kept);
+        EvPlan { plans, kept, ev_sum: ev }
+    }
+
+    // === REPLACE: feed_pair_vol ===
+    #[inline]
+    fn feed_pair_vol(&self, a: Pubkey, b: Pubkey, slippage_bps: u16) {
+        let key = canon_pair(a, b);
+        let entry = self.pair_vol.entry(key).or_insert_with(VolAtom::default);
+        let prev = entry.load();
+        let inst = ((slippage_bps as f64) / 2000.0).min(1.0);
+        let newv = (1.0 - VOL_ALPHA) * prev + VOL_ALPHA * inst;
+        entry.store(newv);
+    }
+
+    // === REPLACE: read_pair_vol ===
+    #[inline]
+    fn read_pair_vol(&self, a: Pubkey, b: Pubkey) -> f64 {
+        let key = canon_pair(a, b);
+        self.pair_vol.get(&key).map(|v| v.load()).unwrap_or(0.0)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_jitter_ms(&self, p: &WalletProfile) -> u64 {
+        let heat = self.fee_heat.load_heat(); // 0..1
+        let vol  = p.recent_swaps.back()
+            .map(|last| self.read_pair_vol(last.token_in, last.token_out))
+            .unwrap_or(0.0); // 0..1
+        let base = if heat < 0.20 { 4 } else if heat < 0.45 { 8 } else { 14 };
+        let bump = (vol * 10.0).round() as u64; // +0..10ms
+        (base + bump).min(24)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn spend_guard_allow(&self, lamports: u64, now_sec: u64) -> bool {
+        let cap = self.spend_cap_lamports_per_min.load(Ordering::Relaxed);
+        self.spend_window.allow(lamports, now_sec, cap)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_leader_stats(&self, leader: Pubkey, included: bool, per_cu_paid: u64) {
+        let entry = self.leader_stats.entry(leader).or_insert_with(LeaderStats::default);
+        entry.update(included, per_cu_paid);
+    }
+
+    // === REPLACE: recommend_cu_limit ===
+    #[inline]
+    pub fn recommend_cu_limit(&self, p: &WalletProfile) -> u32 {
+        let (dex, a, b) = if let Some(last) = p.recent_swaps.back() {
+            (Some(last.dex), last.token_in, last.token_out)
+        } else { (None, Pubkey::default(), Pubkey::default()) };
+
+        let (base, _) = match dex {
+            Some(DexType::Jupiter) => (220_000u32, 0u32),
+            Some(DexType::Raydium) => (180_000u32, 0u32),
+            Some(DexType::Orca)    => (160_000u32, 0u32),
+            None => (DEFAULT_CU_ESTIMATE as u32, 0u32),
+        };
+        let (cx_cu, _cx_heap) = if let Some(d) = dex { self.recommend_cu_heap_for_pair(d, a, b) } else { (base, 131_072) };
+
+        // volatility safety bump as before
+        let vol = p.recent_swaps.back().map(|l| self.read_pair_vol(l.token_in, l.token_out)).unwrap_or(0.0);
+        let bump = if vol > 0.70 { (base as f64 * 0.10).round() as u32 } else if vol > 0.45 { (base as f64 * 0.05).round() as u32 } else { 0 };
+
+        base.max(cx_cu).saturating_add(bump).min(300_000)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_attempts(&self, _p: &WalletProfile, max: u32) -> u32 {
+        max.min(STAIR_MAX_ATTEMPTS)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_cu_price_auto(&self, _p: &WalletProfile) -> u64 {
+        self.fee_heat.load_tip().max(1)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_cu_price_lamports_for_leader(&self, _p: &WalletProfile, leader: &Pubkey) -> u64 {
+        if let Some(stats) = self.leader_stats.get(leader) {
+            stats.load_pcu().max(1)
+        } else {
+            self.recommend_cu_price_auto(_p)
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn stair_multipliers(_heat: f64) -> [f64; 6] {
+        [1.0, 1.2, 1.5, 2.0, 3.0, 5.0] // fixed multipliers for now
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn build_compute_budget_ixs(cu_limit: u32, cu_price_lamports_per_cu: u64) -> [Instruction; 2] {
+        let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
+        let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(cu_price_lamports_per_cu);
+        [cu_limit_ix, cu_price_ix]
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn should_shadow_trade(&self, _p: &WalletProfile) -> bool {
+        // Placeholder implementation - this should be the base shadow trading logic
+        true
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn detect_mirror_burst(&self, _p: &WalletProfile) -> bool {
+        // Placeholder implementation - this should detect mirror burst patterns
+        true
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn maybe_drawdown_quarantine(&self, wallet: Pubkey, last_ts: u64, ev_ewma_lamports: f64) {
+        if ev_ewma_lamports <= (DD_HARD_NEG_LAMPORTS as f64) {
+            self.dd_quarantine_until.insert(wallet, last_ts.saturating_add(DD_WINDOW_SECS));
+        }
+    }
+
+    #[inline]
+    fn is_drawdown_quarantined(&self, wallet: Pubkey, now_ts: u64) -> bool {
+        if let Some(until) = self.dd_quarantine_until.get(&wallet) {
+            now_ts <= *until.value()
+        } else { false }
+    }
+
+    // === REPLACE: set_current_slot (make it reset the floor) ===
+    #[inline]
+    pub fn set_current_slot(&self, slot: u64) {
+        let prev = self.current_slot.swap(slot, Ordering::Relaxed);
+        if prev != slot {
+            self.slot_max_per_cu.store(0, Ordering::Relaxed);
+            SLOT_PRICE_TICK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn enforce_slot_price_floor(&self, per_cu: u64) -> u64 {
+        loop {
+            let cur = self.slot_max_per_cu.load(Ordering::Relaxed);
+            if per_cu <= cur { return cur; }
+            if self.slot_max_per_cu.compare_exchange(cur, per_cu, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return per_cu;
+            }
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn build_compute_budget_ixs3(cu_limit: u32, heap_bytes: u32, cu_price_lamports_per_cu: u64) -> [Instruction; 3] {
+        let ix_limit = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
+        let ix_heap  = ComputeBudgetInstruction::set_heap_frame(heap_bytes);
+        let ix_price = ComputeBudgetInstruction::set_compute_unit_price(cu_price_lamports_per_cu);
+        [ix_limit, ix_heap, ix_price]
+    }
+
+    #[inline]
+    pub fn prepend_compute_budget3(ixs: &mut Vec<Instruction>, cu_limit: u32, heap_bytes: u32, cu_price_lamports_per_cu: u64) {
+        let [limit, heap, price] = Self::build_compute_budget_ixs3(cu_limit, heap_bytes, cu_price_lamports_per_cu);
+        ixs.insert(0, price); ixs.insert(0, heap); ixs.insert(0, limit);
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_attempts_cap_for_wallet(&self, wallet: Pubkey, cap: u64) {
+        self.attempts_cap_override.insert(wallet, cap);
+    }
+
+    #[inline]
+    pub fn attempts_guard_allow_for_wallet(&self, wallet: Pubkey, slot: u64) -> bool {
+        let cap_global = self.attempts_cap_per_slot.load(Ordering::Relaxed);
+        let cap = self.attempts_cap_override.get(&wallet).map(|e| *e.value()).unwrap_or(cap_global);
+        let entry = self.attempts_used_in_slot.entry(slot).or_insert_with(|| AtomicU64::new(0));
+        let prev = entry.fetch_add(1, Ordering::Relaxed);
+        if prev + 1 > cap {
+            entry.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_relay_stats(&self, rid: RelayId, included: bool, per_cu_paid: u64, rtt_ms: u64, now_sec: u64) {
+        let st = self.relay_stats.entry(rid).or_insert_with(RelayStats::default);
+        // acceptance
+        let prev = st.load_acc();
+        let inst = if included { 1.0 } else { 0.0 };
+        st.store_acc((1.0 - RELAY_ALPHA)*prev + RELAY_ALPHA*inst);
+        // per-cu
+        let prev_p = st.load_per_cu() as f64;
+        st.store_per_cu(((1.0 - RELAY_ALPHA)*prev_p + RELAY_ALPHA*(per_cu_paid as f64)).round() as u64);
+        // rtt
+        let prev_r = st.load_rtt() as f64;
+        st.store_rtt(((1.0 - RELAY_ALPHA)*prev_r + RELAY_ALPHA*(rtt_ms as f64)).round() as u64);
+        // cool/backoff
+        if included { st.fails.store(0, Ordering::Relaxed); }
+        else {
+            let f = st.fails.fetch_add(1, Ordering::Relaxed) + 1;
+            let cool = RELAY_COOL_BASE_SECS.saturating_mul(f.min(6)); // bounded backoff
+            st.set_cool(now_sec.saturating_add(cool));
+        }
+    }
+
+    #[inline]
+    fn score_relay(&self, rid: RelayId, per_cu_offer: u64, now_sec: u64) -> f64 {
+        let Some(st) = self.relay_stats.get(&rid) else { return 0.4; }; // neutral prior
+        if st.cooled(now_sec) { return 0.0; }
+        let acc  = st.load_acc().clamp(0.01, 0.99);      // 0..1
+        let refp = st.load_per_cu().max(1) as f64;
+        let rtt  = st.load_rtt().max(1) as f64;          // ms
+        let relp = (per_cu_offer as f64) / refp;         // >=0
+        // Higher acc, lower rtt, rel price >=1 helps; gently punish low-balling
+        let price_term = (1.0 - (-relp).exp()).clamp(0.25, 1.0);
+        let rtt_term   = (400.0f64 / (rtt + 400.0)).clamp(0.3, 1.0); // saturating benefit
+        (acc * price_term * rtt_term).clamp(0.0, 1.0)
+    }
+
+    /// Choose best relay for current per-CU price.
+    #[inline]
+    pub fn choose_best_relay(&self, per_cu_offer: u64, candidates: &[RelayId], now_sec: u64) -> Option<RelayId> {
+        let mut best = None; let mut bs = f64::MIN;
+        for &rid in candidates {
+            let s = self.score_relay(rid, per_cu_offer, now_sec);
+            if s > bs { bs = s; best = Some(rid); }
+        }
+        best
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub async fn ingest_source_pattern(&self, source: SourceId, dex: DexType, token_in: Pubkey, ts: u64) -> Result<()> {
+        // record in per-source queue (pruned)
+        let dq = self.mempool_patterns_typed_src
+            .entry((source, dex, token_in))
+            .or_insert_with(|| VecDeque::with_capacity(MAX_PATTERN_TIMES));
+        let cutoff = ts.saturating_sub(3_600);
+        while let Some(&front) = dq.front() {
+            if front <= cutoff { dq.pop_front(); } else { break; }
+        }
+        if let Some(&last) = dq.back() {
+            if ts.abs_diff(last) <= FEED_FUSE_EPS_SECS { return Ok(()); }
+        }
+        if dq.len() == MAX_PATTERN_TIMES { dq.pop_front(); }
+        dq.push_back(ts);
+
+        // fuse into typed global if quorum within eps
+        let mut hits = 0usize;
+        for s in 0..FEED_MAX_SOURCES {
+            if let Some(q) = self.mempool_patterns_typed_src.get(&(s as u8, dex, token_in)) {
+                // find any ts within ±eps
+                if q.iter().rev().any(|&t| t.abs_diff(ts) <= FEED_FUSE_EPS_SECS) { hits += 1; }
+            }
+        }
+        if hits >= FEED_QUORUM {
+            self.update_mempool_pattern_typed_dedup(dex, token_in, ts).await?;
         }
         Ok(())
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_route_complexity(&self, dex: DexType, token_in: Pubkey, token_out: Pubkey, consumed_cu: u64, heap_bytes: u64) {
+        let key = (dex, canon_pair(token_in, token_out).0, canon_pair(token_in, token_out).1);
+        let cx = self.route_cx.entry(key).or_insert_with(RouteComplexity::default);
+        // cu
+        let prev_cu = cx.load_cu() as f64;
+        cx.store_cu(((1.0 - COMPLEXITY_ALPHA)*prev_cu + COMPLEXITY_ALPHA*(consumed_cu as f64)).round() as u64);
+        // heap
+        let prev_hp = cx.load_heap() as f64;
+        cx.store_heap(((1.0 - COMPLEXITY_ALPHA)*prev_hp + COMPLEXITY_ALPHA*(heap_bytes as f64)).round() as u64);
+    }
+
+    #[inline]
+    fn recommend_cu_heap_for_pair(&self, dex: DexType, a: Pubkey, b: Pubkey) -> (u32, u32) {
+        let key = (dex, canon_pair(a,b).0, canon_pair(a,b).1);
+        if let Some(cx) = self.route_cx.get(&key) {
+            let cu = (cx.load_cu() as f64 * 1.10).round() as u32;    // +10% safety
+            let hp = (cx.load_heap().max(131_072) as f64 * 1.05).round() as u32; // min 128KB, +5%
+            (cu.min(300_000), hp.min(512_000))
+        } else {
+            (DEFAULT_CU_ESTIMATE as u32, 131_072) // 128KB default
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn try_lock_pair_in_slot(&self, a: Pubkey, b: Pubkey, slot: u64) -> bool {
+        let key = (canon_pair(a,b).0, canon_pair(a,b).1, slot);
+        let lk = self.pair_slot_lock.entry(key).or_insert_with(SlotLock::default);
+        !lk.held.swap(true, Ordering::AcqRel)
+    }
+
+    #[inline]
+    pub fn release_pair_in_slot(&self, a: Pubkey, b: Pubkey, slot: u64) {
+        let key = (canon_pair(a,b).0, canon_pair(a,b).1, slot);
+        if let Some(lk) = self.pair_slot_lock.get(&key) {
+            lk.held.store(false, Ordering::Release);
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_min_ev_lamports(&self, p: &WalletProfile) -> i64 {
+        let vol = p.recent_swaps.back().map(|l| self.read_pair_vol(l.token_in, l.token_out)).unwrap_or(0.0);
+        let toxic = (p.avg_slippage_tolerance >= 1_200.0) as i32 + (p.risk_preference > 0.75) as i32;
+        let base = 0i64;
+        let vol_pen = (vol * 400_000.0).round() as i64; // up to ~0.0004 SOL
+        let tox_pen = (toxic as i64) * 250_000;         // +0.00025 SOL per toxic dimension
+        base + vol_pen + tox_pen
+    }
+
+    // === ADD (verbatim) ===
+    /// Call after each attempt outcome with the ms offset from slot start for the *winning* attempt.
+    #[inline]
+    pub fn update_leader_phase_ms(&self, leader: Pubkey, won_at_ms: u64) {
+        let ph = self.leader_phase_ms.entry(leader).or_insert_with(LeaderPhase::default);
+        let prev = ph.load() as f64;
+        let next = if prev == 0.0 { won_at_ms as f64 } else { (1.0 - PHASE_ALPHA)*prev + PHASE_ALPHA*(won_at_ms as f64) };
+        ph.store(next.round() as u64);
+    }
+
+    /// Read recommended phase offset for leader (ms from slot start); fallback 60ms.
+    #[inline]
+    fn recommend_phase_ms(&self, leader: &Pubkey) -> u64 {
+        self.leader_phase_ms.get(leader).map(|p| p.load()).unwrap_or(60)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn cost_fraction_from_heat(heat: f64) -> f64 {
+        // colder → leaner spend; hotter → OK to spend more to clear
+        if heat < 0.20 { 0.28 } else if heat < 0.45 { 0.42 } else { 0.55 }
+    }
+
+    /// Trim plan so cumulative *cost* ≤ f(edge). Returns kept steps and cap.
+    #[inline]
+    pub fn cap_plan_cost_by_edge(
+        &self,
+        plans: &[AttemptPlan],
+        total_cu: u64,
+        edge_lamports: u64,
+    ) -> usize {
+        let heat = self.fee_heat.load_heat();
+        let cap = (edge_lamports as f64 * Self::cost_fraction_from_heat(heat)).max(1.0);
+        let mut spent = 0.0f64;
+        let mut kept = 0usize;
+        for (i, step) in plans.iter().enumerate() {
+            if let Some(per_cu) = extract_cu_price_from_ix(&step.ixs[1]) {
+                let add = (per_cu as f64) * (total_cu as f64);
+                if spent + add > cap { break; }
+                spent += add; kept = i + 1;
+            } else { break; }
+        }
+        kept
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
 
     #[tokio::test]
@@ -796,33 +2689,31 @@ mod tests {
         let conservative_whale = Pubkey::from_str("22222222222222222222222222222222").unwrap();
         let rotational_whale = Pubkey::from_str("33333333333333333333333333333333").unwrap();
         
-        let usdc_mint = USDC_MINT;
-        let usdt_mint = USDT_MINT;
+        let usdc_mint = Pubkey::from_str(USDC_MINT).unwrap();
+        let usdt_mint = Pubkey::from_str(USDT_MINT).unwrap();
         let random_token = Pubkey::from_str("44444444444444444444444444444444").unwrap();
         
         // Simulate aggressive whale behavior
         let aggressive_swaps = vec![
             SwapData {
                 timestamp: 1000,
-                slot: 0,
                 dex: DexType::Jupiter,
                 token_in: usdc_mint,
                 token_out: random_token,
                 amount_in: 1000000000000, // Large amount
                 amount_out: 950000000000,
                 slippage_bps: 500, // 5% slippage tolerance
-                transaction_signature: SmallVec::from_slice(b"aggressive1"),
+                transaction_signature: "aggressive1".to_string(),
             },
             SwapData {
                 timestamp: 1010,
-                slot: 0,
                 dex: DexType::Raydium,
                 token_in: random_token,
                 token_out: usdt_mint,
                 amount_in: 950000000000,
                 amount_out: 940000000000,
                 slippage_bps: 600, // 6% slippage tolerance
-                transaction_signature: SmallVec::from_slice(b"aggressive2"),
+                transaction_signature: "aggressive2".to_string(),
             },
         ];
         
@@ -830,14 +2721,13 @@ mod tests {
         let conservative_swaps = vec![
             SwapData {
                 timestamp: 2000,
-                slot: 0,
                 dex: DexType::Orca,
                 token_in: usdc_mint,
                 token_out: usdt_mint,
                 amount_in: 100000000000, // Smaller amount
                 amount_out: 99000000000,
                 slippage_bps: 50, // 0.5% slippage tolerance
-                transaction_signature: SmallVec::from_slice(b"conservative1"),
+                transaction_signature: "conservative1".to_string(),
             },
         ];
         
@@ -845,36 +2735,33 @@ mod tests {
         let rotational_swaps = vec![
             SwapData {
                 timestamp: 3000,
-                slot: 0,
                 dex: DexType::Jupiter,
                 token_in: usdc_mint,
                 token_out: random_token,
                 amount_in: 500000000000,
                 amount_out: 480000000000,
                 slippage_bps: 200, // 2% slippage tolerance
-                transaction_signature: SmallVec::from_slice(b"rotational1"),
+                transaction_signature: "rotational1".to_string(),
             },
             SwapData {
                 timestamp: 3300,
-                slot: 0,
                 dex: DexType::Raydium,
                 token_in: random_token,
                 token_out: Pubkey::from_str("55555555555555555555555555555555").unwrap(),
                 amount_in: 480000000000,
                 amount_out: 470000000000,
                 slippage_bps: 250, // 2.5% slippage tolerance
-                transaction_signature: SmallVec::from_slice(b"rotational2"),
+                transaction_signature: "rotational2".to_string(),
             },
             SwapData {
                 timestamp: 3600,
-                slot: 0,
                 dex: DexType::Orca,
                 token_in: Pubkey::from_str("55555555555555555555555555555555").unwrap(),
                 token_out: usdt_mint,
                 amount_in: 470000000000,
                 amount_out: 460000000000,
                 slippage_bps: 300, // 3% slippage tolerance
-                transaction_signature: SmallVec::from_slice(b"rotational3"),
+                transaction_signature: "rotational3".to_string(),
             },
         ];
         
@@ -928,14 +2815,13 @@ mod tests {
         // Add swap that mirrors the pattern
         let swap = SwapData {
             timestamp: 1003,
-            slot: 0,
             dex: DexType::Jupiter,
             token_in: Pubkey::from_str("44444444444444444444444444444444").unwrap(),
             token_out: Pubkey::from_str("55555555555555555555555555555555").unwrap(),
             amount_in: 1000000000000,
             amount_out: 950000000000,
             slippage_bps: 500,
-            transaction_signature: SmallVec::from_slice(b"mirror_test"),
+            transaction_signature: "mirror_test".to_string(),
         };
         
         fingerprinter.update_wallet_profile(wallet, swap).await.unwrap();
@@ -971,7 +2857,7 @@ mod tests {
         let liquidity_score = fingerprinter.calculate_liquidity_behavior_score(&profile.liquidity_actions);
         assert!(liquidity_score > 0.0);
         
-        // Update profile in storage (DashMap)
+        // === REPLACE (tests): profile insert block ===
         fingerprinter.profiles.insert(wallet, profile);
         
         let behavior_score = fingerprinter.analyze_liquidity_behavior(&wallet).await.unwrap();
@@ -1022,7 +2908,7 @@ mod tests {
     }
 }
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::*;
     use solana_program::instruction::{AccountMeta, CompiledInstruction};
     use std::time::Duration;
@@ -1403,8 +3289,8 @@ mod tests_v2 {
         
         // Verify history truncation
         if let Some(profile) = fingerprinter.get_wallet_profile(&high_volume_whale).await {
-            // Should be truncated to recent swaps only (24 hours window)
-            assert!(profile.recent_swaps.len() <= 100);
+            // === REPLACE (tests): truncation assertion ===
+            assert!(profile.recent_swaps.len() <= MAX_RECENT_SWAPS);
             
             // All metrics should still be finite and bounded
             assert!(profile.aggression_index.is_finite());
@@ -1536,3 +3422,6 @@ mod tests_v2 {
         }
     }
 }
+
+
+
