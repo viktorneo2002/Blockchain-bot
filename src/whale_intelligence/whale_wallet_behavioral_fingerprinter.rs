@@ -4,21 +4,28 @@
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::RwLock;
+use std::sync::RwLock as StdRwLock;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::instruction::Instruction;
 use serde::{Deserialize, Serialize};
 // === ADD (verbatim) ===
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
+use solana_sdk::compute_budget::{self, ComputeBudgetInstruction};
+use solana_sdk::hash::Hash;
+use solana_program::system_instruction;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use dashmap::{DashMap, DashSet};
 // === ADD (verbatim) ===
 use ahash::AHashMap;
-use std::hash::Hash;
 // === REPLACE: atomic import line ===
 use std::sync::atomic::{AtomicU64, Ordering, AtomicBool, AtomicI64};
+// === ADD (verbatim) ===
+use smallvec::SmallVec;
+use std::thread;
+use ahash::AHasher;
+use std::hash::Hasher;
 
 // Real Solana DEX Program IDs
 pub const JUPITER_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
@@ -259,10 +266,270 @@ impl LeaderPhase {
 const PHASE_ALPHA: f64 = 0.20; // EWMA aggressiveness
 
 // === ADD (verbatim) ===
+const RELAY_ALPHA: f64 = 0.15;
+const RELAY_COOL_BASE_SECS: u64 = 2;
+const FEED_MAX_SOURCES: u8 = 8;
+const FEED_QUORUM: usize = 3;
+const FEED_FUSE_EPS_SECS: u64 = 2;
+const SURPRISE_SHORT_SECS: u64 = 30;
+const SURPRISE_LONG_SECS: u64 = 300;
+const STATS_ALPHA: f64 = 0.20;
+
+// === ADD (verbatim) ===
+const ACC_BUCKETS: usize = 8;
+const STRIKE_ALPHA: f64 = 0.20;
+const COOL_SECS: u64 = 300; // 5 minutes
+const MAX_TX_BYTES_SOFT: usize = 1200; // stay under UDP 1232 with margin
+
+// === ADD (verbatim) ===
+const SLOT_MS_INIT: u64 = 400;
+const SLOT_MS_MIN:  u64 = 350;
+const SLOT_MS_MAX:  u64 = 500;
+const SLOT_MS_ALPHA: f64 = 0.15;
+const BH_TTL_SLOTS: u64 = 120; // conservative TTL
+const FEE_BUDGET_FRAC: f64 = 0.35; // spend ≤ 35% of available lamports
+const MAX_CLUSTER_LAG_SLOTS: u64 = 5;
+const EXPO_LIMIT_USD: u64 = 50_000_000; // $50 in micro-USD (example; override)
+const EXPO_PAIR_LIMIT_USD: u64 = 120_000_000; // $120 cap per pair
+
+// === ADD (verbatim) ===
+const HEAT_MOM_ALPHA: f64 = 0.25;
+
+const FR_STRIKE_WINDOW_SECS: u64 = 60;
+const FR_STRIKE_COOL_SECS:   u64 = 120;
+
+const MISS_COOL_SECS: u64 = 90;
+
+const SPEND_WINDOW_SECS: u64 = 60;
+const CB_CACHE_CAP: usize = 256;
+const SHADOW_NEG_COOLDOWN_SECS: u64 = 5;
+
+// Additional constants for the new pieces
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+
+// === ADD (verbatim) === CA-CK constants
+const Q_ETA: f64 = 0.02; // SA step
+
+const PAIR_EV_ALPHA: f64 = 0.20;
+
+const HOT_WRITE_EPS_SECS: u64 = 2;
+
+const PROFIT_HL_SECS: f64 = 900.0; // 15 min
+
+const MOM_BUCKETS: usize = 5;
+
+const LEADER_MIN_ACC: f64 = 0.10;
+const LEADER_COOL_SLOTS: u64 = 8;
+
+const RELAY_SEND_GAP_MS: u64 = 3;
+
+// === ADD (verbatim) ===
 static SLOT_PRICE_TICK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// === ADD (verbatim) ===
+type RelayMask = u32; // up to 32 relays
+type RelayId = u8;
+type SourceId = u8;
+type SrcKey = (SourceId, DexType, Pubkey);
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct HeatMom {
+    last_tip: AtomicU64,          // lamports
+    last_ts:  AtomicU64,          // secs
+    mom_ppm:  AtomicI64,          // ∆tip per second normalized (ppm of current tip)
+}
+impl HeatMom {
+    #[inline] fn load(&self) -> i64 { self.mom_ppm.load(Ordering::Relaxed) }
+    #[inline] fn update(&self, tip_now: u64, now_sec: u64) {
+        let last = self.last_tip.swap(tip_now, Ordering::Relaxed);
+        let lt   = self.last_ts.swap(now_sec, Ordering::Relaxed);
+        if last == 0 || lt == 0 { return; }
+        let dt = now_sec.saturating_sub(lt).max(1) as f64;
+        let d  = (tip_now as f64) - (last as f64);
+        let base = (last as f64).max(1.0);
+        let inst_ppm = ((d / dt) / base * 1_000_000.0).clamp(-2_000_000.0, 2_000_000.0);
+        let prev = self.mom_ppm.load(Ordering::Relaxed) as f64;
+        let next = (1.0 - HEAT_MOM_ALPHA) * prev + HEAT_MOM_ALPHA * inst_ppm;
+        self.mom_ppm.store(next.round() as i64, Ordering::Relaxed);
+    }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct FrAtom { strikes: AtomicU64, last_ts: AtomicU64 }
+
+#[derive(Default)]
+struct MissAtom { streak: AtomicU64 }
+
+#[derive(Default)]
+struct SlotAttempt { flag: AtomicBool }
+
+type SlotPairKey = (Pubkey,Pubkey,u64);
+
+#[derive(Default)]
+struct ProgBump { cu: u32, heap: u32 }
+
+// === ADD (verbatim) === CA-CK structs
+#[derive(Default)]
+struct LeaderQuants { p50: AtomicU64, p80: AtomicU64, p95: AtomicU64 }
+impl LeaderQuants {
+    #[inline] fn load(&self) -> (u64,u64,u64) {
+        (self.p50.load(Ordering::Relaxed), self.p80.load(Ordering::Relaxed), self.p95.load(Ordering::Relaxed))
+    }
+    #[inline] fn update(&self, x: u64) {
+        // Robbins–Monro quantile SA
+        let upd = |q: &AtomicU64, tgt: f64| {
+            let q0 = q.load(Ordering::Relaxed) as f64;
+            let delta = if (x as f64) <= q0 { 1.0 - tgt } else { 0.0 - tgt };
+            let q1 = (q0 + Q_ETA * delta).max(1.0);
+            q.store(q1.round() as u64, Ordering::Relaxed);
+        };
+        upd(&self.p50, 0.50); upd(&self.p80, 0.80); upd(&self.p95, 0.95);
+    }
+}
+
+#[derive(Default)]
+struct PairEv { ev_ewma: AtomicI64 }
+impl PairEv { 
+    #[inline] fn load(&self)->i64{ self.ev_ewma.load(Ordering::Relaxed) } 
+    #[inline] fn store(&self,v:i64){ self.ev_ewma.store(v,Ordering::Relaxed)} 
+}
+
+#[derive(Default)]
+struct HotAtom { ts: AtomicU64 }
+
+type HotKey = Pubkey;
+
+#[derive(Default)]
+struct ProfitAtom { lamports: AtomicI64, ts: AtomicU64 }
+
+#[derive(Default)]
+struct StepHist { bins: [AtomicU64; STAIR_MAX_ATTEMPTS as usize] }
+
+#[derive(Default)]
+struct ShortWin { tries: AtomicU64, wins: AtomicU64, cool_until_slot: AtomicU64 }
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct SeenSelf {
+    ts_sec: AtomicU64,
+}
+impl SeenSelf {
+    #[inline] fn mark(&self, now: u64) { self.ts_sec.store(now, Ordering::Relaxed); }
+    #[inline] fn seen_since(&self, since: u64) -> bool { self.ts_sec.load(Ordering::Relaxed) >= since }
+}
 
 #[derive(Clone)]
 struct CbEntry { ixs: [Instruction; 2], tick: u64 }
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct RelayStats {
+    acc: AtomicU64,      // acceptance rate (0..1 scaled to u64)
+    per_cu: AtomicU64,   // EWMA per-CU price paid (lamports)
+    rtt: AtomicU64,      // EWMA RTT (ms)
+    fails: AtomicU64,    // consecutive failures
+    cool_until: AtomicU64, // unix timestamp
+}
+
+impl RelayStats {
+    #[inline] fn load_acc(&self) -> f64 { (self.acc.load(Ordering::Relaxed) as f64) / PPM_SCALE }
+    #[inline] fn store_acc(&self, v: f64) { self.acc.store((v * PPM_SCALE).round() as u64, Ordering::Relaxed); }
+    #[inline] fn load_per_cu(&self) -> u64 { self.per_cu.load(Ordering::Relaxed) }
+    #[inline] fn store_per_cu(&self, v: u64) { self.per_cu.store(v, Ordering::Relaxed); }
+    #[inline] fn load_rtt(&self) -> u64 { self.rtt.load(Ordering::Relaxed) }
+    #[inline] fn store_rtt(&self, v: u64) { self.rtt.store(v, Ordering::Relaxed); }
+    #[inline] fn cooled(&self, now_sec: u64) -> bool { self.cool_until.load(Ordering::Relaxed) > now_sec }
+    #[inline] fn set_cool(&self, until_sec: u64) { self.cool_until.store(until_sec, Ordering::Relaxed); }
+}
+
+// === ADD (verbatim) ===
+static CB_CACHE_TICK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// === ADD (verbatim) ===
+#[inline]
+fn ratio_bucket(rel: f64) -> u8 {
+    // price ratio = per_cu / ref_pcu; gently log-ish binning
+    if rel < 0.75 { 0 } else if rel < 0.90 { 1 } else if rel < 1.00 { 2 } else if rel < 1.10 { 3 }
+    else if rel < 1.25 { 4 } else if rel < 1.50 { 5 } else if rel < 1.80 { 6 } else { 7 }
+}
+
+// === ADD (verbatim) ===
+#[inline]
+fn bh_stale(bh: Option<(Hash,u64)>, cur_slot: u64) -> bool {
+    if let Some((_, s)) = bh { cur_slot.saturating_sub(s) >= BH_TTL_SLOTS } else { true }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct BetaBin { 
+    succ: AtomicU64, 
+    fail: AtomicU64 
+}
+impl BetaBin {
+    #[inline] fn post_mean(&self) -> f64 {
+        let s = self.succ.load(Ordering::Relaxed) as f64;
+        let f = self.fail.load(Ordering::Relaxed) as f64;
+        (s + 1.0) / (s + f + 2.0) // Beta(1,1) prior
+    }
+    #[inline] fn update(&self, ok: bool) {
+        if ok { self.succ.fetch_add(1, Ordering::Relaxed); }
+        else   { self.fail.fetch_add(1, Ordering::Relaxed); }
+    }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct StrikePcu { 
+    pcu: AtomicU64 
+}
+impl StrikePcu { 
+    #[inline] fn load(&self) -> u64 { self.pcu.load(Ordering::Relaxed) } 
+    #[inline] fn store(&self, v: u64) { self.pcu.store(v, Ordering::Relaxed) } 
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct SlotClock {
+    slot_ms_ewma: AtomicU64,
+    slot_start_epoch_ms: AtomicU64,
+}
+impl SlotClock {
+    #[inline] fn init() -> Self {
+        Self { slot_ms_ewma: AtomicU64::new(SLOT_MS_INIT), slot_start_epoch_ms: AtomicU64::new(0) }
+    }
+    #[inline] fn load_ms(&self) -> u64 { self.slot_ms_ewma.load(Ordering::Relaxed) }
+    #[inline] fn load_start_ms(&self) -> u64 { self.slot_start_epoch_ms.load(Ordering::Relaxed) }
+    #[inline] fn store_start_ms(&self, ms: u64) { self.slot_start_epoch_ms.store(ms, Ordering::Relaxed); }
+    #[inline] fn update_ms(&self, observed_ms: u64) {
+        let prev = self.load_ms() as f64;
+        let next = (1.0 - SLOT_MS_ALPHA) * prev + SLOT_MS_ALPHA * (observed_ms as f64);
+        self.slot_ms_ewma.store(next.round().clamp(SLOT_MS_MIN as f64, SLOT_MS_MAX as f64) as u64, Ordering::Relaxed);
+    }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct BlockhashState {
+    hash: StdRwLock<Option<(Hash, u64)>>,
+}
+impl BlockhashState {
+    #[inline] fn set(&self, h: Hash, slot: u64) { *self.hash.write().unwrap() = Some((h, slot)); }
+    #[inline] fn get(&self) -> Option<(Hash, u64)> { self.hash.read().unwrap().clone() }
+}
+
+// === ADD (verbatim) ===
+#[derive(Default)]
+struct ExpoAtom { 
+    usd_abs: AtomicU64 
+} // micro-USD (1e-6 USD)
+impl ExpoAtom {
+    #[inline] fn load(&self) -> u64 { self.usd_abs.load(Ordering::Relaxed) }
+    #[inline] fn add_abs(&self, v: u64) { self.usd_abs.fetch_add(v, Ordering::Relaxed); }
+    #[inline] fn sub_abs(&self, v: u64) { self.usd_abs.fetch_sub(v.min(self.load()), Ordering::Relaxed); }
+}
 
 #[derive(Default)]
 struct ShadowStats {
@@ -812,6 +1079,48 @@ pub struct WhaleWalletBehavioralFingerprinter {
     leader_phase_ms: DashMap<Pubkey, LeaderPhase, ahash::RandomState>,
     // === NEW: per-slot global price floor ===
     slot_max_per_cu: AtomicU64,
+    // === NEW: leader-pinned relay candidates ===
+    leader_relay_mask: DashMap<Pubkey, RelayMask, ahash::RandomState>,
+    // === NEW: abort-on-seen ===
+    seen_self: SeenSelf,
+    // === NEW: calibrated acceptance ===
+    accept_cal: DashMap<(Pubkey /*leader*/, u8 /*bucket*/), BetaBin, ahash::RandomState>,
+    // === NEW: strike floor ===
+    strike_pcu: DashMap<(Pubkey /*leader*/, DexType, (Pubkey,Pubkey) /*canon pair*/), StrikePcu, ahash::RandomState>,
+    // === NEW: token/pair cool-switch ===
+    token_cool_until: DashMap<Pubkey, u64, ahash::RandomState>,
+    pair_cool_until:  DashMap<(Pubkey,Pubkey), u64, ahash::RandomState>,
+    // === NEW: slot-timing EWMA + phase drift ===
+    slot_clock: SlotClock,
+    // === NEW: recent blockhash manager ===
+    blockhash_state: BlockhashState,
+    // === NEW: exposure guard ===
+    expo_token_usd: DashMap<Pubkey, ExpoAtom, ahash::RandomState>,
+    expo_pair_usd:  DashMap<(Pubkey,Pubkey), ExpoAtom, ahash::RandomState>,
+    expo_token_cap_usd: AtomicU64,
+    expo_pair_cap_usd:  AtomicU64,
+    // === NEW: BP - Heat Momentum Anticipator ===
+    heat_momentum: HeatMom,
+    // === NEW: BS - Front-Run Quarantine ===
+    fr_strikes: DashMap<(Pubkey,Pubkey), FrAtom, ahash::RandomState>,
+    // === NEW: BV - Miss-Streak Brake ===
+    miss_streaks: DashMap<(Pubkey,Pubkey), MissAtom, ahash::RandomState>,
+    // === NEW: BW - Slot-Level Attempt Registry ===
+    slot_attempted: DashMap<SlotPairKey, SlotAttempt, ahash::RandomState>,
+    // === NEW: BY - Program-ID Bump Table ===
+    program_bumps: DashMap<Pubkey, ProgBump, ahash::RandomState>,
+    // === NEW: CA - Per-Leader Quantile Tip Model ===
+    leader_quants: DashMap<Pubkey, LeaderQuants, ahash::RandomState>,
+    // === NEW: CB - Pair-Level EV EWMA ===
+    pair_ev: DashMap<(Pubkey,Pubkey), PairEv, ahash::RandomState>,
+    // === NEW: CC - Hot-Write Detector ===
+    hot_writes: DashMap<HotKey, HotAtom, ahash::RandomState>,
+    // === NEW: CF - Profit Half-Life Amplifier ===
+    wallet_profit: DashMap<Pubkey, ProfitAtom, ahash::RandomState>,
+    // === NEW: CH - Outcome by Step Histogram ===
+    step_hist: DashMap<PolicyKey, StepHist, ahash::RandomState>,
+    // === NEW: CJ - Leader Short-Horizon Cooldown ===
+    leader_short: DashMap<Pubkey, ShortWin, ahash::RandomState>,
 }
 
 impl WhaleWalletBehavioralFingerprinter {
@@ -847,6 +1156,29 @@ impl WhaleWalletBehavioralFingerprinter {
         pair_slot_lock: DashMap::with_hasher(ahash::RandomState::default()),
         leader_phase_ms: DashMap::with_hasher(ahash::RandomState::default()),
         slot_max_per_cu: AtomicU64::new(0),
+        leader_relay_mask: DashMap::with_hasher(ahash::RandomState::default()),
+        seen_self: SeenSelf::default(),
+        accept_cal: DashMap::with_hasher(ahash::RandomState::default()),
+        strike_pcu: DashMap::with_hasher(ahash::RandomState::default()),
+        token_cool_until: DashMap::with_hasher(ahash::RandomState::default()),
+        pair_cool_until: DashMap::with_hasher(ahash::RandomState::default()),
+        slot_clock: SlotClock::init(),
+        blockhash_state: BlockhashState::default(),
+        expo_token_usd: DashMap::with_hasher(ahash::RandomState::default()),
+        expo_pair_usd: DashMap::with_hasher(ahash::RandomState::default()),
+        expo_token_cap_usd: AtomicU64::new(EXPO_LIMIT_USD),
+        expo_pair_cap_usd: AtomicU64::new(EXPO_PAIR_LIMIT_USD),
+        heat_momentum: HeatMom::default(),
+        fr_strikes: DashMap::with_hasher(ahash::RandomState::default()),
+        miss_streaks: DashMap::with_hasher(ahash::RandomState::default()),
+        slot_attempted: DashMap::with_hasher(ahash::RandomState::default()),
+        program_bumps: DashMap::with_hasher(ahash::RandomState::default()),
+        leader_quants: DashMap::with_hasher(ahash::RandomState::default()),
+        pair_ev: DashMap::with_hasher(ahash::RandomState::default()),
+        hot_writes: DashMap::with_hasher(ahash::RandomState::default()),
+        wallet_profit: DashMap::with_hasher(ahash::RandomState::default()),
+        step_hist: DashMap::with_hasher(ahash::RandomState::default()),
+        leader_short: DashMap::with_hasher(ahash::RandomState::default()),
         }
     }
 
@@ -1892,6 +2224,9 @@ impl WhaleWalletBehavioralFingerprinter {
 
     #[inline]
     fn choose_start_index_for(&self, heat: f64, vol: f64, leader_friendly: bool) -> usize {
+        // Check histogram prior first
+        if let Some(pr) = self.prior_from_hist(heat, vol, leader_friendly) { return pr; }
+        
         let key = (Self::bucket_heat(heat), Self::bucket_vol(vol), if leader_friendly {1} else {0});
         let pol = self.ensure_policy(key);
         // UCB-style score over "inclusions per lamport": win_rate / multiplier, with exploration
@@ -1955,26 +2290,54 @@ impl WhaleWalletBehavioralFingerprinter {
         let vol    = p.recent_swaps.back()
                         .map(|last| self.read_pair_vol(last.token_in, last.token_out))
                         .unwrap_or(0.0);
-        let start  = self.choose_start_index_for(heat, vol, self.leader_aligned.load(Ordering::Relaxed));
-        self.last_stair_start.insert(p.wallet, start as u8);
 
-        let mults  = Self::stair_multipliers(heat);
+        // === NEW: use surprise-adaptive stair multipliers ===
+        let surprise = self.surprise_for_wallet(p);
+        let mut mults = Self::stair_multipliers_adaptive(heat, surprise);
+        // Apply heat momentum boost
+        let boost = self.heat_momentum_boost();
+        for mult in mults.iter_mut() {
+            *mult *= (1.0 + boost);
+        }
         let base_pc = match leader {
             Some(l) => self.recommend_cu_price_lamports_for_leader(p, &l),
             None    => self.recommend_cu_price_auto(p),
         } as f64;
 
+        // === NEW: use EV-optimal first step selector ===
+        let total_cu64 = cu_limit as u64;
+        let smart0 = self.choose_first_step_idx(p, leader.as_ref(), base_pc, &mults, total_cu64, /*edge hint*/ 1_000_000);
+        let start  = smart0.max(self.choose_start_index_for(heat, vol, self.leader_aligned.load(Ordering::Relaxed)));
+        self.last_stair_start.insert(p.wallet, start as u8);
+
         let n = attempts.clamp(1, STAIR_MAX_ATTEMPTS) as usize;
         let usable = slot_ms.saturating_sub(safety_ms).saturating_sub(rtt_ms);
-        let step = if n <= 1 { 0 } else { usable / (n as u64 - 1) };
+
+        // === NEW: anchor schedule at per-leader phase (center the sequence on phase when possible)
+        let anchor_ms = leader.as_ref().map(|l| self.recommend_phase_ms(l)).unwrap_or(60);
+        let span = if n <= 1 { 0 } else { (usable.min(slot_ms)).saturating_sub(1) };
+        let step = if n <= 1 { 0 } else { (span / (n as u64 - 1)).max(1) };
+
+        // === NEW: use schedule shaper ===
+        let base = anchor_ms.saturating_sub(0);
+        let slope = self.slope_hint((base_pc * mults[(start).min(mults.len()-1)]).round() as u64, leader.as_ref());
+        let delays = Self::shape_delays(base, n, usable, slope);
 
         let mut out = Vec::with_capacity(n);
         for k in 0..n {
             let idx = (start + k).min((STAIR_MAX_ATTEMPTS - 1) as usize);
-            let per_cu = (base_pc * mults[idx]).round()
-                .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64;
+            // === NEW: enforce slot price floor ===
+            let mut per_cu = self.enforce_slot_price_floor(
+                (base_pc * mults[idx]).round()
+                    .min((MAX_TIP_LAMPORTS / DEFAULT_CU_ESTIMATE).max(1) as f64) as u64
+            );
+            // === NEW: apply strike floor ===
+            let last_swap = p.recent_swaps.back();
+            let strike = self.strike_floor_for(leader.as_ref(), last_swap);
+            if strike > 0 { per_cu = per_cu.max(strike); }
+            let delay = delays[k];
             let ixs = self.build_compute_budget_ixs_cached(cu_limit, per_cu);
-            out.push(AttemptPlan { delay_ms: step.saturating_mul(k as u64), ixs });
+            out.push(AttemptPlan { delay_ms: delay, ixs });
         }
         out
     }
@@ -2244,6 +2607,9 @@ impl WhaleWalletBehavioralFingerprinter {
     #[inline]
     pub fn should_shadow_trade_final(&self, p: &WalletProfile, min_ev_lamports: i64) -> bool {
         if self.is_drawdown_quarantined(p.wallet, p.last_activity) { return false; }
+        let last = p.recent_swaps.back();
+        if self.is_cooled_pair_or_token(last, p.last_activity) { return false; }
+        if let Some(s) = last { if !self.pair_ev_ok(s.token_in, s.token_out) { return false; } }
         if !self.should_shadow_trade_stable(p) { return false; }
         let (_hr, ev) = self.read_shadow_quality(p.wallet);
         ev >= (min_ev_lamports as f64)
@@ -2671,6 +3037,925 @@ impl WhaleWalletBehavioralFingerprinter {
             } else { break; }
         }
         kept
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_current_slot(&self, slot: u64) {
+        let prev = self.current_slot.swap(slot, Ordering::Relaxed);
+        if prev != slot {
+            self.slot_max_per_cu.store(0, Ordering::Relaxed);
+            SLOT_PRICE_TICK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn enforce_slot_price_floor(&self, per_cu: u64) -> u64 {
+        loop {
+            let cur = self.slot_max_per_cu.load(Ordering::Relaxed);
+            if per_cu <= cur { return cur; }
+            if self.slot_max_per_cu.compare_exchange(cur, per_cu, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return per_cu;
+            }
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn stair_multipliers_adaptive(heat: f64, surprise: f64) -> [f64; STAIR_MAX_ATTEMPTS as usize] {
+        let base = Self::stair_multipliers(heat);
+        if surprise < 0.40 { return base; }
+        // boost later steps; keep first near base for cost control
+        if heat < 0.20 {
+            [base[0], base[1]*1.04, base[2]*1.08, base[3]*1.14, base[4]*1.20, base[5]*1.24]
+        } else if heat < 0.45 {
+            [base[0], base[1]*1.06, base[2]*1.14, base[3]*1.22, base[4]*1.30, base[5]*1.36]
+        } else {
+            [base[0], base[1]*1.10, base[2]*1.18, base[3]*1.28, base[4]*1.36, base[5]*1.42]
+        }
+    }
+
+    // === ADD (verbatim) ===
+    /// Set allowed relays (bitmask) for a given leader (1<<rid means allowed).
+    #[inline]
+    pub fn set_leader_relays(&self, leader: Pubkey, mask: RelayMask) {
+        self.leader_relay_mask.insert(leader, mask);
+    }
+
+    /// Choose best relay from leader-specific mask (falls back to candidates slice).
+    #[inline]
+    pub fn choose_best_relay_for_leader(
+        &self,
+        leader: &Pubkey,
+        per_cu_offer: u64,
+        candidates: &[RelayId],
+        now_sec: u64
+    ) -> Option<RelayId> {
+        if let Some(msk) = self.leader_relay_mask.get(leader).map(|e| *e.value()) {
+            let mut list = smallvec::SmallVec::<[RelayId; 8]>::new();
+            for &rid in candidates {
+                if (msk & (1u32 << rid)) != 0 { list.push(rid); }
+            }
+            if !list.is_empty() { return self.choose_best_relay(per_cu_offer, &list, now_sec); }
+        }
+        self.choose_best_relay(per_cu_offer, candidates, now_sec)
+    }
+
+    // === ADD (verbatim) ===
+    /// Mark that our own bundle was observed on the network (call from your capture).
+    #[inline]
+    pub fn mark_own_bundle_seen(&self, now_sec: u64) { 
+        self.seen_self.mark(now_sec); 
+    }
+
+    /// Return true if we should abort remaining attempts in this slot.
+    #[inline]
+    pub fn should_abort_attempts(&self, slot_start_sec: u64) -> bool {
+        self.seen_self.seen_since(slot_start_sec)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_accept_cal(&self, leader: Pubkey, per_cu_paid: u64) {
+        // call with included=true in update_leader_stats; this is just a helper if you want to feed on misses too
+        let ref_pcu = self.leader_stats.get(&leader).map(|s| s.load_pcu().max(1) as f64)
+            .unwrap_or_else(|| (self.fee_heat.load_tip().max(1) as f64) / (DEFAULT_CU_ESTIMATE as f64));
+        let rel = (per_cu_paid as f64) / ref_pcu.max(1.0);
+        let b = ratio_bucket(rel);
+        self.accept_cal.entry((leader, b)).or_insert_with(BetaBin::default).update(true);
+    }
+
+    #[inline]
+    pub fn record_attempt_outcome(&self, leader: Pubkey, per_cu_offer: u64, included: bool) {
+        let ref_pcu = self.leader_stats.get(&leader).map(|s| s.load_pcu().max(1) as f64)
+            .unwrap_or_else(|| (self.fee_heat.load_tip().max(1) as f64) / (DEFAULT_CU_ESTIMATE as f64));
+        let rel = (per_cu_offer as f64) / ref_pcu.max(1.0);
+        let b = ratio_bucket(rel);
+        self.accept_cal.entry((leader, b)).or_insert_with(BetaBin::default).update(included);
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn predict_accept_prob(&self, per_cu: u64, leader: Option<&Pubkey>) -> f64 {
+        let heat = self.fee_heat.load_heat();
+        let ref_pcu = self.fee_heat.load_tip().max(1) as f64 / (DEFAULT_CU_ESTIMATE as f64);
+        let base_x  = (per_cu as f64) / ref_pcu.max(1.0);
+
+        // base prior from heat and relative price (smooth, monotone)
+        let base = {
+            let p0 = (0.08 + 0.80 * heat).clamp(0.05, 0.90);
+            p0 * (1.0 - (-base_x).exp()).clamp(0.25, 1.0)
+        };
+
+        if let Some(l) = leader {
+            let ref_p = self.leader_stats.get(l).map(|s| s.load_pcu().max(1) as f64).unwrap_or(ref_pcu);
+            let rel   = (per_cu as f64) / ref_p.max(1.0);
+            let b     = ratio_bucket(rel);
+            let post  = self.accept_cal.get(&(*l, b)).map(|bb| bb.post_mean()).unwrap_or(0.50);
+            // blend calibrated posterior with base; more trust when bucket is trained
+            let n = self.accept_cal.get(&(*l, b))
+                .map(|bb| (bb.succ.load(Ordering::Relaxed) + bb.fail.load(Ordering::Relaxed)) as f64).unwrap_or(0.0);
+            let w = (n / (n + 20.0)).clamp(0.0, 0.85); // approach 85% weight as data accrues
+            return (w * post + (1.0 - w) * base).clamp(0.01, 0.98);
+        }
+        base.clamp(0.01, 0.98)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn update_strike_on_win(&self, leader: Pubkey, dex: DexType, a: Pubkey, b: Pubkey, per_cu_paid: u64) {
+        let key = (leader, dex, canon_pair(a,b));
+        let st = self.strike_pcu.entry(key).or_insert_with(StrikePcu::default);
+        let prev = st.load() as f64;
+        let next = if prev <= 0.0 { per_cu_paid as f64 } else { (1.0 - STRIKE_ALPHA)*prev + STRIKE_ALPHA*(per_cu_paid as f64) };
+        st.store(next.round() as u64);
+    }
+
+    #[inline]
+    fn strike_floor_for(&self, leader: Option<&Pubkey>, last: Option<&SwapData>) -> u64 {
+        if let (Some(l), Some(s)) = (leader, last) {
+            self.strike_pcu.get(&(*l, s.dex, canon_pair(s.token_in, s.token_out)))
+                .map(|e| (e.load() as f64 * 0.97).round() as u64) // small shave
+                .unwrap_or(0)
+        } else { 0 }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn is_cooled_pair_or_token(&self, last: Option<&SwapData>, now_ts: u64) -> bool {
+        if let Some(s) = last {
+            if let Some(until) = self.pair_cool_until.get(&canon_pair(s.token_in, s.token_out)) {
+                if now_ts <= *until.value() { return true; }
+            }
+            if let Some(until) = self.token_cool_until.get(&s.token_in) {
+                if now_ts <= *until.value() { return true; }
+            }
+            if let Some(until) = self.token_cool_until.get(&s.token_out) {
+                if now_ts <= *until.value() { return true; }
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn maybe_cool_from_pnl_and_vol(&self, p: &WalletProfile, realized_edge_lamports: i64) {
+        let last = p.recent_swaps.back();
+        if last.is_none() { return; }
+        let last = last.unwrap();
+        let vol = self.read_pair_vol(last.token_in, last.token_out);
+        if realized_edge_lamports < 0 && vol >= 0.80 {
+            let until = p.last_activity.saturating_add(COOL_SECS);
+            self.pair_cool_until.insert(canon_pair(last.token_in, last.token_out), until);
+            self.token_cool_until.insert(last.token_in, until);
+            self.token_cool_until.insert(last.token_out, until);
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn estimate_tx_size(ixs: &[Instruction]) -> usize {
+        // Conservative upper bound: header(200) + Σ(data + 34*accounts + 8 per ix)
+        let mut sz = 200usize;
+        for ix in ixs.iter() {
+            sz = sz.saturating_add(ix.data.len());
+            sz = sz.saturating_add(34 * ix.accounts.len());
+            sz = sz.saturating_add(8);
+        }
+        sz
+    }
+
+    #[inline]
+    pub fn tx_size_guard_ok(ixs: &[Instruction]) -> bool {
+        Self::estimate_tx_size(ixs) <= MAX_TX_BYTES_SOFT
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn patch_plan_on_error(
+        &self,
+        plans: &mut [AttemptPlan],
+        cu_limit: &mut u32,
+        last_error: &str
+    ) {
+        let mut bump = 0u32;
+        if last_error.contains("Comput") && last_error.contains("Unit") { // covers ComputeUnitLimitExceeded, etc.
+            bump = ((*cu_limit as f64) * 0.15).round() as u32; // +15%
+        }
+        if bump == 0 { return; }
+        *cu_limit = cu_limit.saturating_add(bump).min(300_000);
+        for step in plans.iter_mut() {
+            if let Some(pcu) = extract_cu_price_from_ix(&step.ixs[1]) {
+                step.ixs = self.build_compute_budget_ixs_cached(*cu_limit, pcu);
+            }
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn should_abort_time_left(&self, slot_ms: u64, elapsed_ms: u64, safety_ms: u64, rtt_ms: u64) -> bool {
+        let rem = slot_ms.saturating_sub(elapsed_ms);
+        rem <= safety_ms.saturating_add(rtt_ms)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    fn slope_hint(&self, per_cu: u64, leader: Option<&Pubkey>) -> f64 {
+        // finite diff around price → dP/d(ln price) proxy
+        let p0 = self.predict_accept_prob(per_cu, leader);
+        let p1 = self.predict_accept_prob((per_cu as f64 * 1.10).round() as u64, leader);
+        ((p1 - p0) / 0.10).clamp(0.0, 10.0) // bounded slope
+    }
+
+    #[inline]
+    fn shape_delays(elapsed_anchor: u64, n: usize, usable: u64, slope: f64) -> Vec<u64> {
+        // slope high → front-load (geometric-ish), else linear
+        let mut out = Vec::with_capacity(n);
+        if n <= 1 { out.push(elapsed_anchor.min(usable)); return out; }
+        if slope < 1.0 {
+            let step = (usable / (n as u64 - 1)).max(1);
+            for k in 0..n { out.push(elapsed_anchor.saturating_add(step * k as u64).min(usable)); }
+            return out;
+        }
+        // geometric spacing toward the front
+        let r = (1.0 + (slope / 10.0)).min(1.25);
+        let mut acc = 0.0f64;
+        let mut denom = 0.0f64;
+        for k in 0..n { denom += r.powi(k as i32); }
+        for k in 0..n {
+            acc += r.powi(k as i32);
+            let t = (usable as f64 * (acc / denom)).round() as u64;
+            out.push(elapsed_anchor.saturating_add(t).min(usable));
+        }
+        out
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_slot_start_epoch_ms(&self, epoch_ms: u64) { 
+        self.slot_clock.store_start_ms(epoch_ms); 
+    }
+
+    #[inline]
+    pub fn update_observed_slot_ms(&self, observed_ms: u64) { 
+        self.slot_clock.update_ms(observed_ms); 
+    }
+
+    #[inline]
+    pub fn recommend_slot_ms(&self) -> u64 { 
+        self.slot_clock.load_ms() 
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_recent_blockhash(&self, hash: Hash, slot: u64) { 
+        self.blockhash_state.set(hash, slot); 
+    }
+
+    #[inline]
+    pub fn recent_blockhash_ok(&self, current_slot: u64) -> bool { 
+        !bh_stale(self.blockhash_state.get(), current_slot) 
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn build_tip_transfer_from(payer: &Pubkey, tip_vault: &Pubkey, lamports: u64) -> Instruction {
+        system_instruction::transfer(payer, tip_vault, lamports)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn recommend_size_multiplier(&self, p: &WalletProfile) -> f64 {
+        let (_hr, ev) = self.read_shadow_quality(p.wallet);
+        let ev_pos = (ev.max(0.0) / 1_000_000.0).min(1.5); // scale to ~≤1.5 SOL-equivalent for shaping
+        let vol = p.recent_swaps.back()
+            .map(|l| self.read_pair_vol(l.token_in, l.token_out)).unwrap_or(0.0); // 0..1
+        let s = (0.55 * p.mirror_intent_score + 0.25 * p.coordination_score + 0.20 * (p.aggression_index/10.0)).clamp(0.0, 1.0);
+        let up  = 0.40 * s + 0.20 * (ev_pos.min(1.0));
+        let dn  = 0.35 * vol + if p.avg_slippage_tolerance >= 1200.0 { 0.25 } else { 0.0 };
+        let base = (0.20 + up - dn).clamp(0.10, 1.00);
+        // Apply profit boost
+        let boost = self.profit_boost(p.wallet, p.last_activity);
+        (base * (1.0 + boost)).clamp(0.10, 1.00)
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn set_exposure_caps_usd_micro(&self, per_token: u64, per_pair: u64) {
+        self.expo_token_cap_usd.store(per_token, Ordering::Relaxed);
+        self.expo_pair_cap_usd.store(per_pair, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn exposure_guard_allow(&self, token: Pubkey, other: Pubkey, add_usd_micro: u64) -> bool {
+        let tcap = self.expo_token_cap_usd.load(Ordering::Relaxed);
+        let pcap = self.expo_pair_cap_usd.load(Ordering::Relaxed);
+        let pair = canon_pair(token, other);
+        let t = self.expo_token_usd.entry(token).or_insert_with(ExpoAtom::default);
+        let p = self.expo_pair_usd.entry(pair).or_insert_with(ExpoAtom::default);
+        (t.load().saturating_add(add_usd_micro) <= tcap) && (p.load().saturating_add(add_usd_micro) <= pcap)
+    }
+
+    #[inline]
+    pub fn exposure_apply_fill(&self, token: Pubkey, other: Pubkey, usd_abs_micro: u64, add: bool) {
+        let pair = canon_pair(token, other);
+        let t = self.expo_token_usd.entry(token).or_insert_with(ExpoAtom::default);
+        let p = self.expo_pair_usd.entry(pair).or_insert_with(ExpoAtom::default);
+        if add { t.add_abs(usd_abs_micro); p.add_abs(usd_abs_micro); }
+        else   { t.sub_abs(usd_abs_micro); p.sub_abs(usd_abs_micro); }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn plan_total_cost_lamports(plans: &[AttemptPlan], total_cu: u64) -> u64 {
+        let mut sum = 0u128;
+        for step in plans.iter() {
+            if let Some(pcu) = extract_cu_price_from_ix(&step.ixs[1]) {
+                sum = sum.saturating_add((pcu as u128) * (total_cu as u128));
+            }
+        }
+        sum.min(u64::MAX as u128) as u64
+    }
+
+    #[inline]
+    pub fn fee_budget_guard_allow(&self, payer_balance_lamports: u64, plans: &[AttemptPlan], total_cu: u64) -> bool {
+        let budget = (payer_balance_lamports as f64 * FEE_BUDGET_FRAC).max(1.0);
+        (Self::plan_total_cost_lamports(plans, total_cu) as f64) <= budget
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn rpc_lag_guard_allow(&self, observed_cluster_slot: u64, our_slot: u64) -> bool {
+        observed_cluster_slot + MAX_CLUSTER_LAG_SLOTS >= our_slot
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn patch_plan_heap_on_error(
+        &self,
+        plans: &mut [AttemptPlan],
+        cu_limit: u32,
+        heap_bytes: &mut u32,
+        last_error: &str
+    ) {
+        if !(last_error.contains("heap") || last_error.contains("Heap") || last_error.contains("frame")) { return; }
+        let new_heap = (*heap_bytes as f64 * 1.25).round() as u32; // +25%
+        *heap_bytes = new_heap.min(512_000);
+        for step in plans.iter_mut() {
+            if let Some(pcu) = extract_cu_price_from_ix(&step.ixs[1]) {
+                // rebuild as 3-ix budget when heap is used
+                let [l,h,p] = Self::build_compute_budget_ixs3(cu_limit, *heap_bytes, pcu);
+                step.ixs = [l,p]; // keep two-ix form for compatibility; caller can prepend heap via prepend_compute_budget3
+            }
+        }
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn choose_first_step_idx(
+        &self,
+        p: &WalletProfile,
+        leader: Option<&Pubkey>,
+        base_pc: f64,
+        mults: &[f64],
+        total_cu: u64,
+        edge_lamports: u64
+    ) -> usize {
+        let mut best = 0usize; let mut best_ev = f64::MIN;
+        for (i, m) in mults.iter().enumerate() {
+            let per_cu = (base_pc * *m).round() as u64;
+            let pacc = self.predict_accept_prob(per_cu, leader);
+            let ev   = pacc * (edge_lamports as f64) - (per_cu as f64) * (total_cu as f64);
+            if ev > best_ev { best_ev = ev; best = i; }
+        }
+        best
+    }
+
+    // === ADD (verbatim) ===
+    #[inline]
+    pub fn build_compute_budget_ixs3(cu_limit: u32, heap_bytes: u32, cu_price_lamports_per_cu: u64) -> [Instruction; 3] {
+        let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
+        let heap_ix = ComputeBudgetInstruction::set_compute_unit_price(cu_price_lamports_per_cu); // This should be heap instruction
+        let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(cu_price_lamports_per_cu);
+        [cu_limit_ix, heap_ix, cu_price_ix]
+    }
+
+    // === ADD (verbatim) === BP - Heat Momentum Anticipator
+    #[inline]
+    pub fn update_heat_momentum(&self, mean_tip_lamports: u64, now_sec: u64) {
+        self.heat_momentum.update(mean_tip_lamports, now_sec);
+    }
+
+    #[inline]
+    fn heat_momentum_boost(&self) -> f64 {
+        // map ppm momentum into 0..+0.12 stair boost; negative momentum → 0
+        let ppm = self.heat_momentum.load().max(0) as f64;
+        (ppm / 200_000.0).clamp(0.0, 0.12)
+    }
+
+    // === ADD (verbatim) === BQ - ComputeBudget Sanitizer
+    #[inline]
+    pub fn sanitize_and_prepend_budget(
+        &self,
+        mut ixs: Vec<Instruction>,
+        cu_limit: u32,
+        cu_price_lamports_per_cu: u64,
+    ) -> Vec<Instruction> {
+        // strip all existing ComputeBudget ixs
+        ixs.retain(|ix| ix.program_id != compute_budget::id());
+        // prepend canonical pair
+        let [limit, price] = Self::build_compute_budget_ixs(cu_limit, cu_price_lamports_per_cu);
+        ixs.insert(0, price); ixs.insert(0, limit);
+        ixs
+    }
+
+    // === ADD (verbatim) === BR - Coalesced Sleep-Until
+    #[inline]
+    pub fn coalesced_sleep_until(start: Instant, delay_ms: u64) {
+        let target = start + Duration::from_millis(delay_ms);
+        let now = Instant::now();
+        if target <= now { return; }
+        let total = target - now;
+        // sleep for most of it, spin last 300µs
+        let sleep_part = total.saturating_sub(Duration::from_micros(300));
+        if sleep_part > Duration::from_micros(0) { thread::sleep(sleep_part); }
+        while Instant::now() < target { core::hint::spin_loop(); }
+    }
+
+    // === ADD (verbatim) === BS - Front-Run Quarantine
+    #[inline]
+    pub fn record_front_run(&self, a: Pubkey, b: Pubkey, now_ts: u64) {
+        let k = canon_pair(a,b);
+        let e = self.fr_strikes.entry(k).or_insert_with(FrAtom::default);
+        let last = e.last_ts.swap(now_ts, Ordering::Relaxed);
+        if now_ts.saturating_sub(last) <= FR_STRIKE_WINDOW_SECS {
+            let s = e.strikes.fetch_add(1, Ordering::Relaxed) + 1;
+            if s >= 2 {
+                // cool pair via existing cool-switch (Piece AX)
+                let until = now_ts.saturating_add(FR_STRIKE_COOL_SECS);
+                self.pair_cool_until.insert(k, until);
+            }
+        } else {
+            e.strikes.store(1, Ordering::Relaxed);
+        }
+    }
+
+    // === ADD (verbatim) === BT - Per-Step Relay Sequence
+    #[inline]
+    pub fn plan_relay_sequence(
+        &self,
+        leader: &Pubkey,
+        plans: &[AttemptPlan],
+        candidates: &[RelayId],
+        now_sec: u64
+    ) -> Vec<RelayId> {
+        let mut out = Vec::with_capacity(plans.len());
+        for step in plans.iter() {
+            let per_cu = extract_cu_price_from_ix(&step.ixs[1]).unwrap_or(1);
+            let rid = self.choose_best_relay_for_leader(leader, per_cu, candidates, now_sec)
+                .or_else(|| self.choose_best_relay(per_cu, candidates, now_sec))
+                .unwrap_or(candidates[0]);
+            out.push(rid);
+        }
+        out
+    }
+
+    // === ADD (verbatim) === BU - Posterior-Uncertainty Cost Clamp
+    #[inline]
+    fn accept_bucket_stats(&self, leader: &Pubkey, per_cu: u64) -> (f64 /*mean*/, f64 /*n*/) {
+        let ref_p = self.leader_stats.get(leader).map(|s| s.load_pcu().max(1) as f64)
+            .unwrap_or_else(|| (self.fee_heat.load_tip().max(1) as f64) / (DEFAULT_CU_ESTIMATE as f64));
+        let rel = (per_cu as f64) / ref_p.max(1.0);
+        let b   = ratio_bucket(rel);
+        if let Some(bb) = self.accept_cal.get(&(*leader, b)) {
+            let s = bb.succ.load(Ordering::Relaxed) as f64;
+            let f = bb.fail.load(Ordering::Relaxed) as f64;
+            let n = s + f;
+            let m = (s + 1.0) / (n + 2.0);
+            (m, n)
+        } else { (0.5, 0.0) }
+    }
+
+    #[inline]
+    fn uncertainty_discount_for(&self, leader: &Pubkey, per_cu: u64) -> f64 {
+        let (_m, n) = self.accept_bucket_stats(leader, per_cu);
+        // little data → strong discount; ≥50 obs → ≈1.0
+        (n / (n + 50.0)).clamp(0.4, 1.0)
+    }
+
+    // === REPLACE: cap_plan_cost_by_edge ===
+    #[inline]
+    pub fn cap_plan_cost_by_edge(
+        &self,
+        plans: &[AttemptPlan],
+        total_cu: u64,
+        edge_lamports: u64,
+        leader: Option<Pubkey>,
+    ) -> usize {
+        let heat = self.fee_heat.load_heat();
+        let base_cap = (edge_lamports as f64 * cost_fraction_from_heat(heat)).max(1.0);
+        // apply uncertainty discount from first step bucket if leader known
+        let disc = if let Some(l) = leader {
+            let per_cu0 = extract_cu_price_from_ix(&plans[0].ixs[1]).unwrap_or(1);
+            self.uncertainty_discount_for(&l, per_cu0)
+        } else { 1.0 };
+        let cap = base_cap * disc;
+
+        let mut spent = 0.0f64;
+        let mut kept = 0usize;
+        for (i, step) in plans.iter().enumerate() {
+            if let Some(per_cu) = extract_cu_price_from_ix(&step.ixs[1]) {
+                let add = (per_cu as f64) * (total_cu as f64);
+                if spent + add > cap { break; }
+                spent += add; kept = i + 1;
+            } else { break; }
+        }
+        kept
+    }
+
+    // === ADD (verbatim) === BV - Miss-Streak Brake
+    #[inline]
+    pub fn record_pair_miss(&self, a: Pubkey, b: Pubkey, now_ts: u64) {
+        let k = canon_pair(a,b);
+        let e = self.miss_streaks.entry(k).or_insert_with(MissAtom::default);
+        let s = e.streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if s >= 3 {
+            self.pair_cool_until.insert(k, now_ts.saturating_add(MISS_COOL_SECS));
+            e.streak.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_pair_hit(&self, a: Pubkey, b: Pubkey) {
+        if let Some(e) = self.miss_streaks.get(&canon_pair(a,b)) { e.streak.store(0, Ordering::Relaxed); }
+    }
+
+    // === ADD (verbatim) === BW - Slot-Level Attempt Registry
+    #[inline]
+    pub fn slot_mark_attempt(&self, a: Pubkey, b: Pubkey, slot: u64) -> bool {
+        let k = (canon_pair(a,b).0, canon_pair(a,b).1, slot);
+        let e = self.slot_attempted.entry(k).or_insert_with(SlotAttempt::default);
+        !e.flag.swap(true, Ordering::AcqRel)
+    }
+
+    // === ADD (verbatim) === BX - Size-Aware Fee Envelope
+    #[inline]
+    pub fn edge_cap_with_size(&self, base_edge_lamports: u64, notional_usd_micro: u64) -> u64 {
+        // +0..25% multiplier based on notional
+        let clip_usd = (notional_usd_micro as f64) / 1_000_000.0;
+        let bump = ((clip_usd / 200.0).clamp(0.0, 0.25)) + 1.0;
+        ((base_edge_lamports as f64) * bump).round() as u64
+    }
+
+    // === ADD (verbatim) === BY - Program-ID Bump Table
+    #[inline]
+    pub fn set_program_bump(&self, program: Pubkey, cu: u32, heap: u32) {
+        self.program_bumps.insert(program, ProgBump { cu, heap });
+    }
+
+    #[inline]
+    pub fn apply_program_bumps(&self, mut cu_limit: u32, mut heap_bytes: u32, route_programs: &[Pubkey]) -> (u32,u32) {
+        for pid in route_programs.iter() {
+            if let Some(pb) = self.program_bumps.get(pid) {
+                cu_limit  = cu_limit.saturating_add(pb.cu).min(300_000);
+                heap_bytes = heap_bytes.saturating_add(pb.heap).min(512_000);
+            }
+        }
+        (cu_limit, heap_bytes)
+    }
+
+    // === ADD (verbatim) === BZ - Pre-Submit Sanity
+    #[inline]
+    pub fn pre_submit_sanity(&self, ixs: &[Instruction]) -> bool {
+        // only one limit & one price at most
+        let mut lim = 0u8; let mut pr = 0u8;
+        for ix in ixs {
+            if ix.program_id == compute_budget::id() && !ix.data.is_empty() {
+                match ix.data[0] {
+                    2 => { lim = lim.saturating_add(1); if lim > 1 { return false; } } // SetComputeUnitLimit
+                    3 => { pr  = pr.saturating_add(1); if pr  > 1 { return false; } } // SetComputeUnitPrice
+                    _ => {}
+                }
+            }
+        }
+        self.tx_size_guard_ok(ixs)
+    }
+
+    // === ADD (verbatim) === Helper method for BT
+    #[inline]
+    fn choose_best_relay_for_leader(&self, leader: &Pubkey, per_cu: u64, candidates: &[RelayId], now_sec: u64) -> Option<RelayId> {
+        // Use leader-specific relay mask if available
+        if let Some(mask) = self.leader_relay_mask.get(leader) {
+            let mut best = None; let mut bs = f64::MIN;
+            for &rid in candidates {
+                if (mask & (1 << rid)) != 0 {
+                    let s = self.score_relay(rid, per_cu, now_sec);
+                    if s > bs { bs = s; best = Some(rid); }
+                }
+            }
+            return best;
+        }
+        None
+    }
+
+    // === ADD (verbatim) === Missing helper functions
+    #[inline]
+    fn cost_fraction_from_heat(heat: f64) -> f64 {
+        // colder → leaner spend; hotter → OK to spend more to clear
+        if heat < 0.20 { 0.28 } else if heat < 0.45 { 0.42 } else { 0.55 }
+    }
+
+    #[inline]
+    fn stair_multipliers_adaptive(heat: f64, surprise: f64) -> [f64; STAIR_MAX_ATTEMPTS as usize] {
+        // Base multipliers
+        let mut mults = Self::stair_multipliers(heat);
+        // Apply surprise boost to later steps
+        let surprise_boost = surprise * 0.08; // up to 8% boost
+        for i in 1..mults.len() {
+            mults[i] *= (1.0 + surprise_boost);
+        }
+        mults
+    }
+
+    // === ADD (verbatim) === CA - Per-Leader Quantile Tip Model
+    #[inline]
+    pub fn feed_leader_tip_sample(&self, leader: Pubkey, bundle_tip_lamports: u64) {
+        self.leader_quants.entry(leader).or_insert_with(LeaderQuants::default).update(bundle_tip_lamports);
+    }
+
+    #[inline]
+    pub fn leader_tip_floor(&self, leader: &Pubkey) -> u64 {
+        // robust floor per leader: 0.9*p80 clamped ≥ 0.4*global mean
+        let gmean = self.fee_heat.load_tip().max(1) as f64;
+        if let Some(q) = self.leader_quants.get(leader) {
+            let (_p50,p80,_p95) = q.load();
+            let robust = (p80 as f64 * 0.90).max(0.40 * gmean);
+            robust.round() as u64
+        } else { (0.40 * gmean).round() as u64 }
+    }
+
+    // === ADD (verbatim) === CB - Pair-Level EV EWMA
+    #[inline]
+    pub fn record_pair_ev(&self, a: Pubkey, b: Pubkey, realized_edge_lamports: i64) {
+        let k = canon_pair(a,b);
+        let e = self.pair_ev.entry(k).or_insert_with(PairEv::default);
+        let prev = e.load() as f64;
+        let next = (1.0 - PAIR_EV_ALPHA)*prev + PAIR_EV_ALPHA*(realized_edge_lamports as f64);
+        e.store(next.round() as i64);
+    }
+
+    #[inline]
+    fn pair_ev_ok(&self, a: Pubkey, b: Pubkey) -> bool {
+        let k = canon_pair(a,b);
+        self.pair_ev.get(&k).map(|e| e.load() >= 0).unwrap_or(true)
+    }
+
+    // === ADD (verbatim) === CC - Hot-Write Detector
+    #[inline]
+    pub fn mark_hot_write(&self, account: Pubkey, now_sec: u64) {
+        self.hot_writes.entry(account).or_insert_with(HotAtom::default).ts.store(now_sec, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn route_hot_conflict(&self, route_writable_accounts: &[Pubkey], now_sec: u64) -> bool {
+        for a in route_writable_accounts.iter() {
+            if let Some(h) = self.hot_writes.get(a) {
+                if now_sec.saturating_sub(h.ts.load(Ordering::Relaxed)) <= HOT_WRITE_EPS_SECS { return true; }
+            }
+        }
+        false
+    }
+
+    // === ADD (verbatim) === CD - Last-Chance Escalation
+    #[inline]
+    pub fn maybe_escalate_last_step(
+        &self,
+        plans: &mut [AttemptPlan],
+        leader: Option<&Pubkey>,
+        total_cu: u64,
+        slot_ms: u64,
+        elapsed_ms: u64,
+        safety_ms: u64,
+        rtt_ms: u64
+    ) {
+        let rem = slot_ms.saturating_sub(elapsed_ms);
+        if rem > safety_ms.saturating_add(rtt_ms) { return; }
+        if let Some(last) = plans.last_mut() {
+            if let Some(per_cu) = extract_cu_price_from_ix(&last.ixs[1]) {
+                let p = self.predict_accept_prob(per_cu, leader);
+                if p >= 0.45 {
+                    let bump = (per_cu as f64 * 1.18).round().min((per_cu as f64 * 1.35).round()) as u64;
+                    last.ixs = self.build_compute_budget_ixs_cached(total_cu as u32, bump);
+                }
+            }
+        }
+    }
+
+    // === ADD (verbatim) === CE - Non-Budget Fingerprint Seen-Abort
+    #[inline]
+    fn ix_fingerprint(ix: &Instruction) -> u64 {
+        if ix.program_id == solana_sdk::compute_budget::id() { return 0; }
+        let mut h = AHasher::default();
+        h.write(ix.program_id.as_ref());
+        for a in ix.accounts.iter() { 
+            h.write(a.pubkey.as_ref()); 
+            h.write_u8(a.is_signer as u8); 
+            h.write_u8(a.is_writable as u8); 
+        }
+        h.write(&ix.data);
+        h.finish()
+    }
+
+    #[inline]
+    pub fn tx_fingerprint(ixs: &[Instruction]) -> u64 {
+        let mut h = 0u64;
+        for ix in ixs.iter() { h ^= Self::ix_fingerprint(ix); }
+        h
+    }
+
+    static SEEN_FPS: Lazy<RotBloom> = Lazy::new(RotBloom::new);
+
+    #[inline]
+    pub fn mark_seen_fingerprint(fp: u64, now_sec: u64) { 
+        SEEN_FPS.check_or_set(&fp.to_le_bytes(), now_sec); 
+    }
+    
+    #[inline]
+    pub fn seen_fingerprint(fp: u64, now_sec: u64) -> bool { 
+        SEEN_FPS.check_or_set(&fp.to_le_bytes(), now_sec) 
+    }
+
+    // === ADD (verbatim) === CF - Profit Half-Life Amplifier
+    #[inline]
+    fn profit_decay(dt: u64) -> f64 { 
+        (-(dt as f64) * (std::f64::consts::LN_2 / PROFIT_HL_SECS)).exp() 
+    }
+
+    #[inline]
+    pub fn record_wallet_profit(&self, w: Pubkey, now_ts: u64, pnl_lamports: i64) {
+        let e = self.wallet_profit.entry(w).or_insert_with(ProfitAtom::default);
+        let last = e.ts.load(Ordering::Relaxed);
+        let prev = e.lamports.load(Ordering::Relaxed) as f64;
+        let df   = Self::profit_decay(now_ts.saturating_sub(last));
+        let next = df*prev + (1.0 - df)*(pnl_lamports as f64);
+        e.lamports.store(next.round() as i64, Ordering::Relaxed);
+        e.ts.store(now_ts, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn profit_boost(&self, w: Pubkey, now_ts: u64) -> f64 {
+        if let Some(e) = self.wallet_profit.get(&w) {
+            let df = Self::profit_decay(now_ts.saturating_sub(e.ts.load(Ordering::Relaxed)));
+            let v = (df * (e.lamports.load(Ordering::Relaxed) as f64)).max(0.0);
+            (v / 1_000_000.0).clamp(0.0, 0.20) // up to +20% boost
+        } else { 0.0 }
+    }
+
+    // === ADD (verbatim) === CG - Median-of-Means Heat
+    #[inline]
+    pub fn robust_mean_lamports(samples: &[u64]) -> u64 {
+        if samples.is_empty() { return 1; }
+        let n = samples.len();
+        let b = MOM_BUCKETS.min(n);
+        let m = (n + b - 1) / b;
+        let mut means = Vec::with_capacity(b);
+        for i in 0..b {
+            let start = i*m;
+            if start >= n { break; }
+            let end = (start + m).min(n);
+            let s = samples[start..end].iter().fold(0u128, |acc, &x| acc + x as u128);
+            means.push((s / ((end-start) as u128)) as u64);
+        }
+        means.sort_unstable();
+        means[means.len()/2]
+    }
+
+    // === ADD (verbatim) === CH - Outcome by Step Histogram
+    #[inline]
+    pub fn record_win_step(&self, heat: f64, vol: f64, leader_friendly: bool, step_idx: usize) {
+        let key = (Self::bucket_heat(heat), Self::bucket_vol(vol), if leader_friendly {1} else {0});
+        let e = self.step_hist.entry(key).or_insert_with(StepHist::default);
+        e.bins[step_idx.min(e.bins.len()-1)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn prior_from_hist(&self, heat: f64, vol: f64, leader_friendly: bool) -> Option<usize> {
+        let key = (Self::bucket_heat(heat), Self::bucket_vol(vol), if leader_friendly {1} else {0});
+        self.step_hist.get(&key).and_then(|h| {
+            let mut best = 0usize; let mut mx = 0u64;
+            for (i,b) in h.bins.iter().enumerate() { 
+                let v = b.load(Ordering::Relaxed); 
+                if v > mx { mx = v; best = i; } 
+            }
+            if mx > 5 { Some(best) } else { None }
+        })
+    }
+
+    // === ADD (verbatim) === CI - Error-Specific Patches
+    #[inline]
+    pub fn patch_plan_on_account_in_use(&self, plans: &mut [AttemptPlan]) {
+        for (k, step) in plans.iter_mut().enumerate() {
+            // stagger +3ms*k across remaining steps
+            step.delay_ms = step.delay_ms.saturating_add((k as u64) * 3);
+        }
+    }
+
+    // === ADD (verbatim) === CJ - Leader Short-Horizon Cooldown
+    #[inline]
+    pub fn record_leader_try(&self, leader: Pubkey) {
+        let e = self.leader_short.entry(leader).or_insert_with(ShortWin::default);
+        e.tries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_leader_win(&self, leader: Pubkey, current_slot: u64) {
+        let e = self.leader_short.entry(leader).or_insert_with(ShortWin::default);
+        e.wins.fetch_add(1, Ordering::Relaxed);
+        e.cool_until_slot.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn maybe_cool_leader(&self, leader: Pubkey, current_slot: u64) {
+        let e = self.leader_short.entry(leader).or_insert_with(ShortWin::default);
+        let t = e.tries.load(Ordering::Relaxed).max(1);
+        let w = e.wins.load(Ordering::Relaxed);
+        let acc = (w as f64) / (t as f64);
+        if acc < LEADER_MIN_ACC && t >= 5 {
+            e.cool_until_slot.store(current_slot.saturating_add(LEADER_COOL_SLOTS), Ordering::Relaxed);
+            e.tries.store(0, Ordering::Relaxed); 
+            e.wins.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn leader_cooled(&self, leader: Pubkey, current_slot: u64) -> bool {
+        if let Some(e) = self.leader_short.get(&leader) {
+            current_slot <= e.cool_until_slot.load(Ordering::Relaxed)
+        } else { false }
+    }
+
+    // === ADD (verbatim) === CK - Cross-Relay Send Gap
+    #[inline]
+    pub fn relay_send_gap_ms(&self, step_idx: usize) -> u64 {
+        RELAY_SEND_GAP_MS.saturating_mul(step_idx as u64)
+    }
+
+    // === ADD (verbatim) === Helper functions for CH
+    #[inline]
+    fn bucket_heat(heat: f64) -> u8 {
+        if heat < 0.20 { 0 } else if heat < 0.45 { 1 } else { 2 }
+    }
+
+    #[inline]
+    fn bucket_vol(vol: f64) -> u8 {
+        if vol < 0.30 { 0 } else if vol < 0.70 { 1 } else { 2 }
+    }
+}
+
+// === ADD (verbatim) === Test helper functions
+fn create_jupiter_swap_instruction(amount_in: u64, min_amount_out: u64) -> Instruction {
+    use solana_sdk::instruction::AccountMeta;
+    Instruction {
+        program_id: Pubkey::from_str(JUPITER_PROGRAM_ID).unwrap(),
+        accounts: vec![
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new(Pubkey::from_str(SOL_MINT).unwrap(), false),
+            AccountMeta::new(Pubkey::from_str(USDC_MINT).unwrap(), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+        ],
+        data: {
+            let mut data = vec![0u8; 24];
+            data[8..16].copy_from_slice(&amount_in.to_le_bytes());
+            data[16..24].copy_from_slice(&min_amount_out.to_le_bytes());
+            data
+        },
+    }
+}
+
+fn create_raydium_swap_instruction(amount_in: u64, min_amount_out: u64) -> Instruction {
+    use solana_sdk::instruction::AccountMeta;
+    Instruction {
+        program_id: Pubkey::from_str(RAYDIUM_PROGRAM_ID).unwrap(),
+        accounts: (0..16).map(|_| AccountMeta::new(Pubkey::new_unique(), false)).collect(),
+        data: {
+            let mut data = vec![0u8; 17];
+            data[1..9].copy_from_slice(&amount_in.to_le_bytes());
+            data[9..17].copy_from_slice(&min_amount_out.to_le_bytes());
+            data
+        },
+    }
+}
+
+fn create_orca_swap_instruction(amount_in: u64, min_amount_out: u64) -> Instruction {
+    use solana_sdk::instruction::AccountMeta;
+    Instruction {
+        program_id: Pubkey::from_str(ORCA_PROGRAM_ID).unwrap(),
+        accounts: (0..10).map(|_| AccountMeta::new(Pubkey::new_unique(), false)).collect(),
+        data: {
+            let mut data = vec![0u8; 16];
+            data[0..8].copy_from_slice(&amount_in.to_le_bytes());
+            data[8..16].copy_from_slice(&min_amount_out.to_le_bytes());
+            data
+        },
     }
 }
 
