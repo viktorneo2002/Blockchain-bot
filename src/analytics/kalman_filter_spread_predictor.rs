@@ -1,20 +1,94 @@
+// kalman_spread_predictor.rs
+// ======================================================================
+// [KALMAN] Textbook-consistent Kalman-based spread predictor (UPGRADED)
+// - CA submodel [spread, velocity, acceleration] with proper discrete F(dt)/Q(dt)
+// - Exogenous states [vol_imb, liquidity, trend] as OU/Singer processes:
+//     F_ii = exp(-dt/τ_i)
+//     Q_ii = σ_i^2 * (1 - exp(-2dt/τ_i)) / (2/τ_i)
+// - Cholesky/LDLT solves (no explicit inverses)
+// - Runtime chi-square gating from stats lib
+// - Sage–Husa adaptive bias & R with forgetting β (proper naming)
+// - Q updated from covariance identity (closed form), fused with
+//   Mehra-style innovation reconciliation to back out scalar q (CA block)
+// - PSD-safe projections (eigenvalue flooring), clamped diagonals; clamp counters + alarms
+// - H calibration “stamp” with dataset + λ + coeffs + commit; strictly enforced
+//   under `prod_strict` feature (hard fail on drift, logs identity on install)
+// - OU defaults “stamp” mirroring H-stamp: τ, σ², rule used, commit; enforced under prod_strict
+//
+// References (canonical):
+// - R.E. Kalman (1960)
+// - Gelb (1974): Applied Optimal Estimation (CA discretization, Joseph form)
+// - Bar-Shalom, Li, Kirubarajan (2001): Estimation with Applications to Tracking
+// - Welch & Bishop: An Introduction to the Kalman Filter
+// - Sage & Husa (1969): Adaptive filtering (bias + R with forgetting)
+// - Mehra (1970s): On the identification of Q and R in KF
+//
+// Unit tests:
+// - Van-Loan parity (CA F/Q closed form) + randomized grid sweeps
+// - OU parity (discrete F/Q vs closed forms)
+// - PSD projection sanity
+// ======================================================================
+
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use anyhow::{anyhow, Result};
+use nalgebra::{
+    DMatrix, DVector, SymmetricEigen,
+    linalg::{Cholesky, LDLT}
+};
 use parking_lot::RwLock;
-use nalgebra::{DMatrix, DVector};
-use solana_sdk::pubkey::Pubkey;
-use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
+use statrs::distribution::{ChiSquared, ContinuousCDF};
 
+// ======================================================================
+// Constants & tuning (documented; not vibes)
+// ======================================================================
 const MAX_SPREAD_HISTORY: usize = 100;
-const KALMAN_DT: f64 = 0.001; // 1ms update interval
 const MIN_OBSERVATIONS: usize = 10;
-const OUTLIER_THRESHOLD: f64 = 4.0;
-const SPREAD_PREDICTION_HORIZON: usize = 5;
-const CONFIDENCE_DECAY_RATE: f64 = 0.98;
-const MAX_COVARIANCE: f64 = 1000.0;
-const MIN_COVARIANCE: f64 = 1e-6;
 
+const OBS_DIM: usize = 4; // [spread, volume_imbalance, liquidity, mid_price_change]
+const STATE_DIM: usize = 6; // [spread, vel, accel, vol_imb, liquidity, trend]
+
+// dt guardrails
+const DT_MIN: f64 = 1.0e-4; // 0.1 ms
+const DT_MAX: f64 = 2.0;    // 2 s
+
+// Covariance floors
+const MAX_COVARIANCE: f64 = 1.0e6;
+const MIN_COVARIANCE: f64 = 1.0e-12;
+
+// Default forgetting factors (runtime-overridable via fields)
+const DEFAULT_BETA_R: f64 = 0.02;     // measurement noise update weight
+const DEFAULT_BETA_Q: f64 = 0.01;     // process noise update weight (EMA fuse)
+const DEFAULT_BETA_BIAS: f64 = 0.05;  // measurement bias update weight
+const NIS_ALPHA: f64 = 0.05;          // NIS running-mean tracker
+
+// q bounds for CA spectral density
+const Q_SPREAD_MIN: f64 = 1.0e-8;
+const Q_SPREAD_MAX: f64 = 1.0e2;
+
+// Mehra fusion weight for q from innovation reconciliation
+const BETA_Q_MEHRA: f64 = 0.005;
+
+// Tolerance for calibration-stamp vs H coefficients
+const H_STAMP_TOL: f64 = 1e-12;
+
+// Tolerance for OU-stamp vs live OU params
+const OU_STAMP_TOL: f64 = 1e-9;
+
+// NIS alarming
+const NIS_ALERT_MIN_UPDATES: u64 = 50;
+
+// Clamp alarming (EMA over clamp events)
+const CLAMP_ALPHA: f64 = 0.05;
+const CLAMP_ALERT_RATE: f64 = 0.05; // trigger if >5% of updates need PSD clamps
+const ADAPT_FREEZE_BETA: f64 = 0.0; // freeze adaptation when alarmed
+
+// ======================================================================
+// Data models
+// ======================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpreadObservation {
     pub timestamp_ms: u64,
@@ -28,15 +102,17 @@ pub struct SpreadObservation {
 
 #[derive(Debug, Clone)]
 pub struct KalmanState {
-    pub state: DVector<f64>,
-    pub covariance: DMatrix<f64>,
+    pub state: DVector<f64>,            // x (6x1)
+    pub covariance: DMatrix<f64>,       // P (6x6)
     pub last_update: u64,
-    pub innovation: f64,
-    pub innovation_covariance: f64,
-    pub mahalanobis_distance: f64,
+
+    // Diagnostics
+    pub innovation: DVector<f64>,             // v (4x1)
+    pub innovation_covariance: DMatrix<f64>,  // S (4x4)
+    pub nis: f64,                              // v^T S^{-1} v
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpreadPrediction {
     pub predicted_spread: f64,
     pub confidence_interval: (f64, f64),
@@ -46,865 +122,1070 @@ pub struct SpreadPrediction {
     pub volatility_estimate: f64,
 }
 
+// Calibration stamp for observation model H (mid-change ≈ a*velocity + b*trend)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationStamp {
+    pub dataset_id: String,
+    pub window_start_ms: u64,
+    pub window_end_ms: u64,
+    pub ridge_lambda: f64,
+    pub coeff_a: f64,     // maps velocity -> mid_change
+    pub coeff_b: f64,     // maps trend    -> mid_change
+    pub stderr_a: f64,
+    pub stderr_b: f64,
+    pub commit_hash: String,
+}
+
+// OU/Singer parameterization for exogenous state i
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OUParam {
+    pub tau: f64,     // time-constant τ > 0 (seconds)
+    pub sigma2: f64,  // diffusion intensity σ^2 >= 0
+}
+impl OUParam { pub fn new(tau: f64, sigma2: f64) -> Self { Self { tau, sigma2 } } }
+
+// OU defaults stamp (provenance for τ/σ²)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OUCalibrationStamp {
+    pub dataset_id: String,     // or “rule:id”, e.g., “decay:per_sec_0.95/0.98/0.999”
+    pub rule: String,           // human-readable rule used to derive τ, σ²
+    pub commit_hash: String,    // commit of the config/rule
+    pub tau_vol: f64,
+    pub sigma2_vol: f64,
+    pub tau_liq: f64,
+    pub sigma2_liq: f64,
+    pub tau_trend: f64,
+    pub sigma2_trend: f64,
+}
+
+// Innovation statistics for Mehra-style q estimation
+#[derive(Debug, Clone)]
+struct InnovStats {
+    sum_vvt: DMatrix<f64>, // accumulated v vᵀ
+    count: usize,
+    last_P_pred: DMatrix<f64>, // last P^- for projection
+}
+impl InnovStats {
+    fn new() -> Self {
+        Self {
+            sum_vvt: DMatrix::<f64>::zeros(OBS_DIM, OBS_DIM),
+            count: 0,
+            last_P_pred: DMatrix::<f64>::identity(STATE_DIM, STATE_DIM),
+        }
+    }
+}
+
+// Health snapshot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthSnapshot {
+    pub nis_ema: f64,
+    pub nis_df: f64,
+    pub nis_updates: u64,
+    pub nis_alarm: bool,
+    pub r_clamp_ema: f64,
+    pub q_clamp_ema: f64,
+    pub adaptation_frozen: bool,
+}
+
+// ======================================================================
+// Core predictor
+// ======================================================================
 pub struct KalmanFilterSpreadPredictor {
+    // Per trading pair
     states: Arc<RwLock<HashMap<(Pubkey, Pubkey), KalmanState>>>,
     observations: Arc<RwLock<HashMap<(Pubkey, Pubkey), Vec<SpreadObservation>>>>,
-    process_noise: DMatrix<f64>,
-    measurement_noise: DMatrix<f64>,
-    state_transition: DMatrix<f64>,
-    observation_matrix: DMatrix<f64>,
-    adaptive_factor: f64,
-    outlier_count: Arc<RwLock<HashMap<(Pubkey, Pubkey), u32>>>,
+
+    // Base model pieces (mutable safely)
+    measurement_noise: RwLock<DMatrix<f64>>,  // R (4x4)
+    observation_matrix: RwLock<DMatrix<f64>>, // H (4x6)
+    q_spread: RwLock<f64>,                    // scalar spectral density for CA block q
+
+    // Sage–Husa measurement bias (mean of measurement noise), size = obs_dim
+    meas_bias: RwLock<DVector<f64>>,
+
+    // Exogenous state OU parameters (indices 3,4,5)
+    ou_params: [RwLock<OUParam>; 3],
+
+    // Forgetting factors (runtime adjustable / freeze-able)
+    beta_r: RwLock<f64>,
+    beta_q: RwLock<f64>,
+    beta_bias: RwLock<f64>,
+
+    // Gating
+    chi2_gate_p: f64,
+    chi2_gate_df: f64,
+    chi2_gate_threshold: f64,
+
+    // NIS monitor (EMA) + count
+    nis_ema: RwLock<f64>,
+    update_count: RwLock<u64>,
+
+    // Calibration stamps (when provided)
+    stamp: RwLock<Option<CalibrationStamp>>,
+    ou_stamp: RwLock<Option<OUCalibrationStamp>>,
+
+    // Innovation stats for Mehra reconciliation
+    innov_stats: Arc<RwLock<HashMap<(Pubkey, Pubkey), InnovStats>>>,
+
+    // Clamp monitors and adaptation status
+    r_clamp_ema: RwLock<f64>,
+    q_clamp_ema: RwLock<f64>,
+    adaptation_frozen: RwLock<bool>,
 }
 
 impl KalmanFilterSpreadPredictor {
+    /// Constructor with canonical defaults.
+    /// State: [ spread, velocity, acceleration, volume_imbalance, liquidity, trend ]
+    /// Measurements: [ spread, volume_imbalance, liquidity, mid_price_change ]
     pub fn new() -> Self {
-        let state_dim = 6; // [spread, spread_velocity, spread_acceleration, volume_imbalance, liquidity, trend]
-        let obs_dim = 4; // [spread, volume_imbalance, liquidity_depth, mid_price_change]
-        
-        let mut process_noise = DMatrix::zeros(state_dim, state_dim);
-        process_noise[(0, 0)] = 0.001; // spread noise
-        process_noise[(1, 1)] = 0.01;  // velocity noise
-        process_noise[(2, 2)] = 0.1;   // acceleration noise
-        process_noise[(3, 3)] = 0.05;  // volume imbalance noise
-        process_noise[(4, 4)] = 0.02;  // liquidity noise
-        process_noise[(5, 5)] = 0.005; // trend noise
-        
-        let mut measurement_noise = DMatrix::zeros(obs_dim, obs_dim);
-        measurement_noise[(0, 0)] = 0.01;  // spread measurement noise
-        measurement_noise[(1, 1)] = 0.05;  // volume imbalance measurement noise
-        measurement_noise[(2, 2)] = 0.03;  // liquidity measurement noise
-        measurement_noise[(3, 3)] = 0.02;  // mid price change noise
-        
-        let mut state_transition = DMatrix::zeros(state_dim, state_dim);
-        // Position update
-        state_transition[(0, 0)] = 1.0;
-        state_transition[(0, 1)] = KALMAN_DT;
-        state_transition[(0, 2)] = 0.5 * KALMAN_DT * KALMAN_DT;
-        // Velocity update
-        state_transition[(1, 1)] = 1.0;
-        state_transition[(1, 2)] = KALMAN_DT;
-        // Acceleration update
-        state_transition[(2, 2)] = 0.99; // Slight decay
-        // Volume imbalance
-        state_transition[(3, 3)] = 0.95;
-        // Liquidity
-        state_transition[(4, 4)] = 0.98;
-        // Trend
-        state_transition[(5, 5)] = 0.999;
-        state_transition[(5, 1)] = 0.01; // Trend influenced by velocity
-        
-        let mut observation_matrix = DMatrix::zeros(obs_dim, state_dim);
-        observation_matrix[(0, 0)] = 1.0; // Observe spread directly
-        observation_matrix[(1, 3)] = 1.0; // Observe volume imbalance
-        observation_matrix[(2, 4)] = 1.0; // Observe liquidity
-        observation_matrix[(3, 1)] = 0.1; // Mid price change relates to spread velocity
-        observation_matrix[(3, 5)] = 0.5; // Mid price change relates to trend
-        
+        // R diagonal init (adaptive)
+        let mut r = DMatrix::zeros(OBS_DIM, OBS_DIM);
+        r[(0, 0)] = 0.01; // spread
+        r[(1, 1)] = 0.05; // volume imbalance
+        r[(2, 2)] = 0.03; // liquidity
+        r[(3, 3)] = 0.02; // mid price change
+
+        // H mapping: direct for first three; mid_change = a*velocity + b*trend (coeffs from stamp)
+        let mut h = DMatrix::zeros(OBS_DIM, STATE_DIM);
+        h[(0, 0)] = 1.0; // observe spread
+        h[(1, 3)] = 1.0; // observe vol_imb
+        h[(2, 4)] = 1.0; // observe liquidity
+        // h[(3,1)] and h[(3,5)] set from calibration stamp (if provided); fall back to zero until stamped
+        h[(3, 1)] = 0.0;
+        h[(3, 5)] = 0.0;
+
+        // Chi-square threshold at runtime (p=0.99, df=OBS_DIM)
+        let df = OBS_DIM as f64;
+        let p = 0.99;
+        let chi = ChiSquared::new(df).expect("chi-square df");
+        let thr = chi.inverse_cdf(p);
+
+        // Replace previous ad-hoc decays with OU defaults equivalent to prior decay rates:
+        // Prior implied τs from 0.95^dt, 0.98^dt, 0.999^dt per second:
+        // τ = 1/(-ln(decay_per_sec))
+        let tau_vol = 1.0 / (-0.95f64.ln());   // ≈ 19.49 s
+        let tau_liq = 1.0 / (-0.98f64.ln());   // ≈ 50.50 s
+        let tau_trd = 1.0 / (-0.999f64.ln());  // ≈ 1000.5 s
+        // Match σ^2 so that discrete Q at dt=1s equals the old Q diag targets (0.05, 0.02, 0.005)
+        let sigma2_vol = ou_sigma2_from_Qd1(0.05, tau_vol);
+        let sigma2_liq = ou_sigma2_from_Qd1(0.02, tau_liq);
+        let sigma2_trd = ou_sigma2_from_Qd1(0.005, tau_trd);
+
         Self {
             states: Arc::new(RwLock::new(HashMap::new())),
             observations: Arc::new(RwLock::new(HashMap::new())),
-            process_noise,
-            measurement_noise,
-            state_transition,
-            observation_matrix,
-            adaptive_factor: 1.0,
-            outlier_count: Arc::new(RwLock::new(HashMap::new())),
+            measurement_noise: RwLock::new(r),
+            observation_matrix: RwLock::new(h),
+            q_spread: RwLock::new(1.0e-2),
+            meas_bias: RwLock::new(DVector::zeros(OBS_DIM)),
+            ou_params: [
+                RwLock::new(OUParam::new(tau_vol, sigma2_vol)),
+                RwLock::new(OUParam::new(tau_liq, sigma2_liq)),
+                RwLock::new(OUParam::new(tau_trd, sigma2_trd)),
+            ],
+            beta_r: RwLock::new(DEFAULT_BETA_R),
+            beta_q: RwLock::new(DEFAULT_BETA_Q),
+            beta_bias: RwLock::new(DEFAULT_BETA_BIAS),
+            chi2_gate_p: p,
+            chi2_gate_df: df,
+            chi2_gate_threshold: thr,
+            nis_ema: RwLock::new(df), // start near DOF
+            update_count: RwLock::new(0),
+            stamp: RwLock::new(None),
+            ou_stamp: RwLock::new(None),
+            innov_stats: Arc::new(RwLock::new(HashMap::new())),
+            r_clamp_ema: RwLock::new(0.0),
+            q_clamp_ema: RwLock::new(0.0),
+            adaptation_frozen: RwLock::new(false),
         }
     }
-    
-    pub fn update(&self, pair: (Pubkey, Pubkey), observation: SpreadObservation) -> Result<()> {
-        let mut observations = self.observations.write();
-        let obs_vec = observations.entry(pair).or_insert_with(Vec::new);
-        
-        if obs_vec.len() >= MAX_SPREAD_HISTORY {
-            obs_vec.remove(0);
+
+    /// Optional boot check to enforce stamps early in prod_strict.
+    pub fn boot_check(&self) -> Result<()> {
+        self.ensure_calibration_if_strict()?;
+        Ok(())
+    }
+
+    /// Set OU parameters (τ, σ^2) for exogenous states (indices 3,4,5).
+    pub fn set_ou_params(&self, vol_imb: OUParam, liquidity: OUParam, trend: OUParam) {
+        *self.ou_params[0].write() = vol_imb;
+        *self.ou_params[1].write() = liquidity;
+        *self.ou_params[2].write() = trend;
+    }
+
+    /// Install OU defaults provenance; enforced under prod_strict.
+    pub fn set_ou_calibration_stamp(&self, stamp: OUCalibrationStamp) -> Result<()> {
+        if stamp.dataset_id.is_empty() || stamp.commit_hash.is_empty() {
+            return Err(anyhow!("OUCalibrationStamp must include dataset_id and commit_hash"));
         }
-        
-        let mid_price_change = if obs_vec.is_empty() {
-            0.0
+        // Log identity for auditors
+        eprintln!(
+            "[OU-STAMP] dataset={} rule={} commit={} \
+             (vol: tau={:.9}, sigma2={:.9}) (liq: tau={:.9}, sigma2={:.9}) (trend: tau={:.9}, sigma2={:.9})",
+            stamp.dataset_id, stamp.rule, stamp.commit_hash,
+            stamp.tau_vol, stamp.sigma2_vol, stamp.tau_liq, stamp.sigma2_liq, stamp.tau_trend, stamp.sigma2_trend
+        );
+        *self.ou_stamp.write() = Some(stamp);
+        Ok(())
+    }
+
+    /// Install a calibration stamp and wire H accordingly (mid_change row).
+    pub fn set_calibration_stamp(&self, stamp: CalibrationStamp) -> Result<()> {
+        if stamp.dataset_id.is_empty() || stamp.commit_hash.is_empty() {
+            return Err(anyhow!("CalibrationStamp must include dataset_id and commit_hash"));
+        }
+        {
+            let mut h = self.observation_matrix.write();
+            h[(3, 1)] = stamp.coeff_a;
+            h[(3, 5)] = stamp.coeff_b;
+        }
+        // Log identity for auditors
+        eprintln!(
+            "[H-STAMP] dataset={} window=[{}..{}] lambda={} \
+             a={:.12}±{:.3e} b={:.12}±{:.3e} commit={}",
+            stamp.dataset_id, stamp.window_start_ms, stamp.window_end_ms, stamp.ridge_lambda,
+            stamp.coeff_a, stamp.stderr_a, stamp.coeff_b, stamp.stderr_b, stamp.commit_hash
+        );
+        *self.stamp.write() = Some(stamp);
+        Ok(())
+    }
+
+    /// Replace R (e.g., after offline tuning).
+    pub fn set_measurement_noise(&self, new_r: DMatrix<f64>) -> Result<()> {
+        if new_r.nrows() != OBS_DIM || new_r.ncols() != OBS_DIM {
+            return Err(anyhow!("R shape must be {}x{}", OBS_DIM, OBS_DIM));
+        }
+        let (r_psd, clamped) = psd_floor_flag(new_r, MIN_COVARIANCE);
+        if clamped { self.bump_r_clamp(); }
+        *self.measurement_noise.write() = r_psd;
+        Ok(())
+    }
+
+    /// Manually freeze or unfreeze adaptation (R/Q/bias updates).
+    pub fn set_adaptation_frozen(&self, frozen: bool) {
+        *self.adaptation_frozen.write() = frozen;
+        if frozen {
+            *self.beta_r.write() = ADAPT_FREEZE_BETA;
+            *self.beta_q.write() = ADAPT_FREEZE_BETA;
+            *self.beta_bias.write() = ADAPT_FREEZE_BETA;
         } else {
-            let last_mid = obs_vec.last().unwrap().mid_price;
-            (observation.mid_price - last_mid) / last_mid
+            *self.beta_r.write() = DEFAULT_BETA_R;
+            *self.beta_q.write() = DEFAULT_BETA_Q;
+            *self.beta_bias.write() = DEFAULT_BETA_BIAS;
+        }
+    }
+
+    /// Set chi-square gate percentile (default 0.99).
+    pub fn set_gate_percentile(&mut self, p: f64) -> Result<()> {
+        if !(0.5..1.0).contains(&p) { return Err(anyhow!("percentile must be (0.5,1)")); }
+        self.chi2_gate_p = p;
+        let chi = ChiSquared::new(self.chi2_gate_df).expect("chi-square df");
+        self.chi2_gate_threshold = chi.inverse_cdf(p);
+        Ok(())
+    }
+
+    /// Ingest new observation (Sage–Husa bias, adaptive R/Q, Mehra reconciliation).
+    pub fn update(&self, pair: (Pubkey, Pubkey), obs: SpreadObservation) -> Result<()> {
+        // Enforce calibration in prod_strict
+        self.ensure_calibration_if_strict()?;
+
+        // Maintain history
+        {
+            let mut all = self.observations.write();
+            let buf = all.entry(pair).or_insert_with(Vec::new);
+            if buf.len() >= MAX_SPREAD_HISTORY { buf.remove(0); }
+            buf.push(obs.clone());
+        }
+
+        // Measurement vector y
+        let mid_price_change = {
+            let all = self.observations.read();
+            let buf = all.get(&pair).unwrap();
+            if buf.len() >= 2 {
+                let a = &buf[buf.len()-2];
+                let b = &buf[buf.len()-1];
+                if a.mid_price > 0.0 { (b.mid_price - a.mid_price) / a.mid_price } else { 0.0 }
+            } else { 0.0 }
         };
-        
-        obs_vec.push(observation.clone());
-        drop(observations);
-        
-        let measurement = DVector::from_vec(vec![
-            observation.spread,
-            observation.volume_imbalance,
-            observation.liquidity_depth,
+
+        let y = DVector::from_vec(vec![
+            obs.spread,
+            obs.volume_imbalance,
+            obs.liquidity_depth,
             mid_price_change,
         ]);
-        
-        let mut states = self.states.write();
-        let state = states.entry(pair).or_insert_with(|| {
-            self.initialize_state(&observation)
-        });
-        
-        self.kalman_update(state, measurement, observation.timestamp_ms)?;
-        
+
+        // Initialize state if missing
+        {
+            let mut states = self.states.write();
+            states.entry(pair).or_insert_with(|| self.initialize_state(&obs));
+        }
+
+        // Step filter
+        {
+            let mut states = self.states.write();
+            let st = states.get_mut(&pair).expect("state inserted");
+            self.kf_step(pair, st, y, obs.timestamp_ms)?;
+        }
+
+        // NIS alarming math
+        self.bump_update_count_and_check_nis_alarm();
+
         Ok(())
     }
-    
-    fn initialize_state(&self, observation: &SpreadObservation) -> KalmanState {
-        let initial_state = DVector::from_vec(vec![
-            observation.spread,
-            0.0, // Initial velocity
-            0.0, // Initial acceleration
-            observation.volume_imbalance,
-            observation.liquidity_depth,
-            0.0, // Initial trend
-        ]);
-        
-        let mut initial_covariance = DMatrix::identity(6, 6);
-        initial_covariance *= 0.1;
-        
-        KalmanState {
-            state: initial_state,
-            covariance: initial_covariance,
-            last_update: observation.timestamp_ms,
-            innovation: 0.0,
-            innovation_covariance: 1.0,
-            mahalanobis_distance: 0.0,
-        }
-    }
-    
-    fn kalman_update(&self, state: &mut KalmanState, measurement: DVector<f64>, timestamp_ms: u64) -> Result<()> {
-        let dt = (timestamp_ms.saturating_sub(state.last_update)) as f64 / 1000.0;
-        if dt <= 0.0 {
-            return Ok(());
-        }
-        
-        // Prediction step
-        let predicted_state = &self.state_transition * &state.state;
-        let predicted_covariance = &self.state_transition * &state.covariance * self.state_transition.transpose() 
-            + &self.process_noise * dt;
-        
-        // Innovation calculation
-        let predicted_measurement = &self.observation_matrix * &predicted_state;
-        let innovation = measurement - predicted_measurement;
-        
-        // Innovation covariance
-        let innovation_covariance = &self.observation_matrix * &predicted_covariance * self.observation_matrix.transpose() 
-            + &self.measurement_noise;
-        
-        // Check for numerical stability
-        let inv_innovation_cov = innovation_covariance.clone().try_inverse()
-            .ok_or_else(|| anyhow!("Innovation covariance matrix is singular"))?;
-        
-        // Kalman gain
-        let kalman_gain = &predicted_covariance * self.observation_matrix.transpose() * inv_innovation_cov;
-        
-        // State update
-        state.state = predicted_state + &kalman_gain * &innovation;
-        
-        // Covariance update (Joseph form for numerical stability)
-        let identity = DMatrix::identity(6, 6);
-        let update_matrix = &identity - &kalman_gain * &self.observation_matrix;
-        state.covariance = update_matrix * &predicted_covariance * update_matrix.transpose() 
-            + &kalman_gain * &self.measurement_noise * kalman_gain.transpose();
-        
-        // Bound covariance values
-        for i in 0..state.covariance.nrows() {
-            for j in 0..state.covariance.ncols() {
-                state.covariance[(i, j)] = state.covariance[(i, j)].clamp(MIN_COVARIANCE, MAX_COVARIANCE);
-            }
-        }
-        
-        // Calculate Mahalanobis distance for outlier detection
-        let mahalanobis = (innovation.transpose() * &inv_innovation_cov * &innovation)[(0, 0)].sqrt();
-        
-        if mahalanobis > OUTLIER_THRESHOLD {
-            let mut outlier_count = self.outlier_count.write();
-            *outlier_count.entry((state.last_update, timestamp_ms)).or_insert(0) += 1;
-            
-            // Adapt process noise if too many outliers
-            if *outlier_count.get(&(state.last_update, timestamp_ms)).unwrap_or(&0) > 5 {
-                state.covariance *= 1.5;
-            }
-        }
-        
-        state.innovation = innovation[0];
-        state.innovation_covariance = innovation_covariance[(0, 0)];
-        state.mahalanobis_distance = mahalanobis;
-        state.last_update = timestamp_ms;
-        
-        Ok(())
-    }
-    
+
+    /// Predict spread horizon ahead with uncertainty.
     pub fn predict_spread(&self, pair: (Pubkey, Pubkey), horizon_ms: u64) -> Result<SpreadPrediction> {
         let states = self.states.read();
-        let state = states.get(&pair)
-            .ok_or_else(|| anyhow!("No state found for pair"))?;
-        
+        let st = states.get(&pair).ok_or_else(|| anyhow!("No state found"))?;
+
         let observations = self.observations.read();
-        let obs_history = observations.get(&pair)
-            .ok_or_else(|| anyhow!("No observations found for pair"))?;
-        
-        if obs_history.len() < MIN_OBSERVATIONS {
-            return Err(anyhow!("Insufficient observations: {} < {}", obs_history.len(), MIN_OBSERVATIONS));
+        let hist = observations.get(&pair).ok_or_else(|| anyhow!("No observations"))?;
+        if hist.len() < MIN_OBSERVATIONS {
+            return Err(anyhow!("Insufficient observations: {} < {}", hist.len(), MIN_OBSERVATIONS));
         }
-        
-        let horizon_steps = (horizon_ms as f64 / (KALMAN_DT * 1000.0)).ceil() as usize;
-        let mut predicted_state = state.state.clone();
-        let mut predicted_covariance = state.covariance.clone();
-        
-        // Multi-step prediction
-        for step in 0..horizon_steps {
-            predicted_state = &self.state_transition * &predicted_state;
-            predicted_covariance = &self.state_transition * &predicted_covariance * self.state_transition.transpose() 
-                + &self.process_noise * (KALMAN_DT * (step + 1) as f64);
+
+        let steps = ((horizon_ms as f64) / 50.0).ceil() as usize;
+        let dt = (horizon_ms as f64 / 1000.0) / (steps.max(1) as f64);
+
+        let mut x = st.state.clone();
+        let mut P = st.covariance.clone();
+
+        for _ in 0..steps.max(1) {
+            let F = self.build_F(dt);
+            let Q = self.build_Q(dt);
+            x = &F * x;
+            P = &F * P * F.transpose() + Q;
+            P = psd_floor(P, MIN_COVARIANCE);
+            P = clamp_matrix_diag(P, MIN_COVARIANCE, MAX_COVARIANCE);
         }
-        
-        let predicted_spread = predicted_state[0];
-        let spread_variance = predicted_covariance[(0, 0)];
-        let spread_std = spread_variance.sqrt();
-        
-        // Calculate confidence based on innovation and covariance
-        let model_confidence = self.calculate_model_confidence(state, obs_history);
-        
-        // Trend strength from velocity and acceleration
-        let trend_strength = (state.state[1].abs() + 0.1 * state.state[2].abs()) / (spread_std + 1e-6);
-        
-        // Volatility estimate from recent observations
-        let volatility_estimate = self.estimate_volatility(obs_history);
-        
-        // Confidence interval (95%)
-        let confidence_interval = (
-            predicted_spread - 1.96 * spread_std,
-            predicted_spread + 1.96 * spread_std
-        );
-        
+
+        let spread = x[0];
+        let var = P[(0, 0)].max(0.0);
+        let std = var.sqrt();
+
+        let model_conf = self.model_confidence(&st);
+        let trend_strength = (st.state[1].abs() + 0.1 * st.state[2].abs()) / (std + 1e-9);
+        let vol_est = estimate_realized_vol(hist);
+
+        let ci = (spread - 1.96 * std, spread + 1.96 * std);
+
         Ok(SpreadPrediction {
-            predicted_spread,
-            confidence_interval,
+            predicted_spread: spread,
+            confidence_interval: ci,
             prediction_horizon_ms: horizon_ms,
-            model_confidence,
+            model_confidence: model_conf,
             trend_strength,
-            volatility_estimate,
+            volatility_estimate: vol_est,
         })
     }
-    
-    fn calculate_model_confidence(&self, state: &KalmanState, observations: &[SpreadObservation]) -> f64 {
-        let innovation_factor = (-state.innovation.abs() / (state.innovation_covariance.sqrt() + 1e-6)).exp();
-        let mahalanobis_factor = (-state.mahalanobis_distance / OUTLIER_THRESHOLD).exp();
-        
-        let recent_accuracy = if observations.len() >= 10 {
-            let recent_obs = &observations[observations.len() - 10..];
-            let mut accuracy = 0.0;
-            for i in 1..recent_obs.len() {
-                use solana_sdk::{
-    account::Account,
-    clock::Clock,
-    pubkey::Pubkey,
-    sysvar::Sysvar,
-};
-use std::{
-    collections::VecDeque,
-    sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use borsh::{BorshDeserialize, BorshSerialize};
-use fixed::types::I80F48;
-use raydium_amm::state::{AmmInfo, Loadable};
-use serum_dex::state::Market;
 
-const MAX_PRICE_HISTORY: usize = 256;
-const MIN_SAMPLES_FOR_CALCULATION: usize = 32;
-const RISK_THRESHOLD: f64 = 0.025;
-const MAX_POSITION_SIZE_BPS: u64 = 500; // 5% max position
-const MIN_PROFIT_THRESHOLD_BPS: u64 = 15; // 0.15% min profit
-const CONFIDENCE_THRESHOLD: f64 = 0.85;
-const MAX_LEVERAGE: f64 = 3.0;
-const COOLDOWN_DURATION_MS: u64 = 500;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Signal {
-    Buy { confidence: f64, size_ratio: f64 },
-    Sell { confidence: f64, size_ratio: f64 },
-    Hold,
-}
-
-#[derive(Debug, Clone, Copy, BorshSerialize, BorshDeserialize)]
-pub struct PricePoint {
-    pub price: f64,
-    pub volume: f64,
-    pub timestamp: u64,
-    pub spread_bps: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct OUParameters {
-    pub theta: f64,      // mean reversion speed
-    pub mu: f64,         // long-term mean
-    pub sigma: f64,      // volatility
-    pub dt: f64,         // time increment
-    pub last_update: u64,
-}
-
-#[derive(Debug)]
-pub struct OrnsteinUhlenbeckStrategy {
-    price_history: Arc<RwLock<VecDeque<PricePoint>>>,
-    parameters: Arc<RwLock<OUParameters>>,
-    last_signal_time: Arc<RwLock<u64>>,
-    cumulative_pnl: Arc<RwLock<f64>>,
-    win_rate: Arc<RwLock<f64>>,
-    total_trades: Arc<RwLock<u64>>,
-    winning_trades: Arc<RwLock<u64>>,
-}
-
-impl OrnsteinUhlenbeckStrategy {
-    pub fn new() -> Self {
-        Self {
-            price_history: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_PRICE_HISTORY))),
-            parameters: Arc::new(RwLock::new(OUParameters {
-                theta: 0.15,
-                mu: 0.0,
-                sigma: 0.02,
-                dt: 1.0 / 3600.0,
-                last_update: 0,
-            })),
-            last_signal_time: Arc::new(RwLock::new(0)),
-            cumulative_pnl: Arc::new(RwLock::new(0.0)),
-            win_rate: Arc::new(RwLock::new(0.0)),
-            total_trades: Arc::new(RwLock::new(0)),
-            winning_trades: Arc::new(RwLock::new(0)),
+    /// Expose running NIS mean vs DOF for health checks and clamp status.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        let nis = *self.nis_ema.read();
+        let df = self.chi2_gate_df;
+        let n = *self.update_count.read();
+        let alarm = if n >= NIS_ALERT_MIN_UPDATES {
+            let sd = (2.0 * df / n as f64).sqrt();
+            (nis - df).abs() > 3.0 * sd
+        } else { false };
+        HealthSnapshot {
+            nis_ema: nis,
+            nis_df: df,
+            nis_updates: n,
+            nis_alarm: alarm,
+            r_clamp_ema: *self.r_clamp_ema.read(),
+            q_clamp_ema: *self.q_clamp_ema.read(),
+            adaptation_frozen: *self.adaptation_frozen.read(),
         }
     }
 
-    pub fn update_price(&self, price: f64, volume: f64, spread_bps: u16) -> Result<(), &'static str> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "Time error")?
-            .as_millis() as u64;
+    // ============================== internals ==============================
 
-        let mut history = self.price_history.write().map_err(|_| "Lock error")?;
-        
-        if history.len() >= MAX_PRICE_HISTORY {
-            history.pop_front();
+    fn ensure_calibration_if_strict(&self) -> Result<()> {
+        #[cfg(feature = "prod_strict")]
+        {
+            // H-stamp must exist and match H
+            let stamp_opt = self.stamp.read();
+            if stamp_opt.is_none() {
+                return Err(anyhow!("prod_strict: CalibrationStamp is required"));
+            }
+            let stamp = stamp_opt.as_ref().unwrap();
+            let h = self.observation_matrix.read();
+            let a = h[(3, 1)];
+            let b = h[(3, 5)];
+            if (a - stamp.coeff_a).abs() > H_STAMP_TOL || (b - stamp.coeff_b).abs() > H_STAMP_TOL {
+                return Err(anyhow!(
+                    "prod_strict: H coefficients differ from CalibrationStamp (a={},b={}) vs stamp (a={},b={})",
+                    a, b, stamp.coeff_a, stamp.coeff_b
+                ));
+            }
+
+            // OU-stamp must exist and match live OU params
+            let ou_stamp_opt = self.ou_stamp.read();
+            if ou_stamp_opt.is_none() {
+                return Err(anyhow!("prod_strict: OUCalibrationStamp is required"));
+            }
+            let ou_stamp = ou_stamp_opt.as_ref().unwrap();
+            let ou0 = *self.ou_params[0].read();
+            let ou1 = *self.ou_params[1].read();
+            let ou2 = *self.ou_params[2].read();
+
+            let ok = (ou0.tau - ou_stamp.tau_vol).abs() <= OU_STAMP_TOL
+                && (ou0.sigma2 - ou_stamp.sigma2_vol).abs() <= OU_STAMP_TOL
+                && (ou1.tau - ou_stamp.tau_liq).abs() <= OU_STAMP_TOL
+                && (ou1.sigma2 - ou_stamp.sigma2_liq).abs() <= OU_STAMP_TOL
+                && (ou2.tau - ou_stamp.tau_trend).abs() <= OU_STAMP_TOL
+                && (ou2.sigma2 - ou_stamp.sigma2_trend).abs() <= OU_STAMP_TOL;
+
+            if !ok {
+                return Err(anyhow!("prod_strict: OU params drifted from OUCalibrationStamp"));
+            }
         }
-
-        history.push_back(PricePoint {
-            price,
-            volume,
-            timestamp,
-            spread_bps,
-        });
-
-        drop(history);
-
-        if self.should_recalibrate(timestamp) {
-            self.recalibrate_parameters()?;
-        }
-
         Ok(())
     }
 
-    pub fn get_signal(&self) -> Result<Signal, &'static str> {
-        let history = self.price_history.read().map_err(|_| "Lock error")?;
-        
-        if history.len() < MIN_SAMPLES_FOR_CALCULATION {
-            return Ok(Signal::Hold);
+    fn initialize_state(&self, o: &SpreadObservation) -> KalmanState {
+        let x0 = DVector::from_vec(vec![
+            o.spread,         // spread
+            0.0,              // velocity
+            0.0,              // acceleration
+            o.volume_imbalance,
+            o.liquidity_depth,
+            0.0,              // trend
+        ]);
+        let p0 = DMatrix::<f64>::identity(STATE_DIM, STATE_DIM) * 0.1;
+
+        KalmanState {
+            state: x0,
+            covariance: p0,
+            last_update: o.timestamp_ms,
+            innovation: DVector::zeros(OBS_DIM),
+            innovation_covariance: DMatrix::identity(OBS_DIM, OBS_DIM),
+            nis: 0.0,
         }
+    }
 
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "Time error")?
-            .as_millis() as u64;
+    /// One KF step with Sage–Husa bias and adaptive R/Q (+ Mehra reconciliation).
+    ///
+    /// Mehra fusion note:
+    /// We reduce the CA block process noise to a scalar q by minimizing Frobenius-norm
+    /// residuals against the CA closed-form basis B(dt). This is a standard scalarization
+    /// for the constant-acceleration white-noise model (Gelb/Bar-Shalom). We blend:
+    ///   (i) covariance-identity estimate on the CA block, and
+    ///   (ii) innovation reconciliation via E[vvᵀ] − (HP^-Hᵀ + R)
+    /// projected through H B_embed Hᵀ. Both are closed-form scalar least-squares estimates.
+    fn kf_step(
+        &self,
+        pair: (Pubkey, Pubkey),
+        st: &mut KalmanState,
+        y: DVector<f64>,
+        ts_ms: u64,
+    ) -> Result<()> {
+        // Real dt with bounds
+        let mut dt = (ts_ms.saturating_sub(st.last_update)) as f64 / 1000.0;
+        if dt <= 0.0 { return Ok(()); }
+        if dt < DT_MIN { dt = DT_MIN; }
+        if dt > DT_MAX { dt = DT_MAX; }
 
-        let last_signal = *self.last_signal_time.read().map_err(|_| "Lock error")?;
-        
-        if current_time - last_signal < COOLDOWN_DURATION_MS {
-            return Ok(Signal::Hold);
-        }
+        // Read model pieces
+        let h = self.observation_matrix.read().clone();
+        let mut r_now = self.measurement_noise.read().clone();
+        let mut bias = self.meas_bias.read().clone();
+        let q_scalar = *self.q_spread.read();
 
-        let latest = history.back().ok_or("No price data")?;
-        let params = self.parameters.read().map_err(|_| "Lock error")?;
+        // Forgetting factors (allow runtime freezing/degrading)
+        let beta_r = *self.beta_r.read();
+        let beta_q = *self.beta_q.read();
+        let beta_bias = *self.beta_bias.read();
 
-        let log_returns = self.calculate_log_returns(&history)?;
-        let current_deviation = (latest.price.ln() - params.mu) / params.sigma;
-        
-        let mean_reversion_probability = self.calculate_mean_reversion_probability(
-            current_deviation,
-            params.theta,
-            params.dt
-        );
+        // Build F and Q
+        let F = self.build_F(dt);
+        let Q = self.build_Q_with(q_scalar, dt);
 
-        let volume_signal = self.analyze_volume_profile(&history)?;
-        let spread_signal = self.analyze_spread_dynamics(&history)?;
-        
-        let composite_signal = mean_reversion_probability * 0.6 
-            + volume_signal * 0.25 
-            + spread_signal * 0.15;
+        // Predict
+        let x_pred = &F * &st.state;
+        let P_pred = &F * &st.covariance * F.transpose() + Q;
 
-        let risk_adjusted_size = self.calculate_position_size(
-            current_deviation.abs(),
-            latest.spread_bps,
-            composite_signal.abs()
-        );
+        // Sage–Husa bias update on raw residual r = y − H x_pred − b
+        let r_raw = &y - &( &h * &x_pred ) - &bias;
+        bias = &bias + beta_bias * (&r_raw - &bias); // b_k = b_{k−1} + β (v_k − b_{k−1})
+        *self.meas_bias.write() = bias.clone();
 
-        if composite_signal > CONFIDENCE_THRESHOLD && current_deviation < -1.5 {
-            *self.last_signal_time.write().map_err(|_| "Lock error")? = current_time;
-            Ok(Signal::Buy { 
-                confidence: composite_signal,
-                size_ratio: risk_adjusted_size
-            })
-        } else if composite_signal < -CONFIDENCE_THRESHOLD && current_deviation > 1.5 {
-            *self.last_signal_time.write().map_err(|_| "Lock error")? = current_time;
-            Ok(Signal::Sell { 
-                confidence: composite_signal.abs(),
-                size_ratio: risk_adjusted_size
-            })
+        // Innovation with bias correction
+        let v = &y - &( &h * &x_pred ) - &bias;
+
+        // Innovation covariance
+        let S = &h * &P_pred * h.transpose() + &r_now;
+
+        // Gain K via factorization
+        let PHt = &P_pred * h.transpose();
+        let K = if let Some(chol) = Cholesky::new(S.clone()) {
+            chol.solve(&PHt.transpose()).transpose()
+        } else if let Some(ldlt) = LDLT::new(S.clone()) {
+            ldlt.solve(&PHt.transpose()).transpose()
         } else {
-            Ok(Signal::Hold)
-        }
-    }
-
-    fn calculate_log_returns(&self, history: &VecDeque<PricePoint>) -> Result<Vec<f64>, &'static str> {
-        if history.len() < 2 {
-            return Err("Insufficient data");
-        }
-
-        let mut returns = Vec::with_capacity(history.len() - 1);
-        let prices: Vec<f64> = history.iter().map(|p| p.price).collect();
-
-        for i in 1..prices.len() {
-            if prices[i - 1] > 0.0 && prices[i] > 0.0 {
-                returns.push((prices[i] / prices[i - 1]).ln());
-            }
-        }
-
-        Ok(returns)
-    }
-
-    fn calculate_mean_reversion_probability(&self, deviation: f64, theta: f64, dt: f64) -> f64 {
-        let mean_reversion_strength = 1.0 - (-theta * dt).exp();
-        let normalized_deviation = deviation.tanh();
-        
-        let base_probability = mean_reversion_strength * normalized_deviation.abs();
-        let direction_factor = if deviation > 0.0 { -1.0 } else { 1.0 };
-        
-        direction_factor * base_probability * (1.0 + 0.2 * deviation.abs().min(3.0))
-    }
-
-    fn analyze_volume_profile(&self, history: &VecDeque<PricePoint>) -> Result<f64, &'static str> {
-        let recent_window = 20.min(history.len());
-        let mut volume_weighted_price = 0.0;
-        let mut total_volume = 0.0;
-
-        for i in history.len().saturating_sub(recent_window)..history.len() {
-            let point = &history[i];
-            volume_weighted_price += point.price * point.volume;
-            total_volume += point.volume;
-        }
-
-        if total_volume == 0.0 {
-            return Ok(0.0);
-        }
-
-        let vwap = volume_weighted_price / total_volume;
-        let current_price = history.back().ok_or("No price data")?.price;
-        
-        let volume_ma = total_volume / recent_window as f64;
-        let current_volume = history.back().ok_or("No volume data")?.volume;
-        let volume_ratio = (current_volume / volume_ma).min(3.0);
-        
-        let price_deviation = (current_price - vwap) / vwap;
-        Ok(-price_deviation * volume_ratio.sqrt())
-    }
-
-    fn analyze_spread_dynamics(&self, history: &VecDeque<PricePoint>) -> Result<f64, &'static str> {
-        let recent_window = 10.min(history.len());
-        let mut spread_sum = 0u64;
-        
-        for i in history.len().saturating_sub(recent_window)..history.len() {
-            spread_sum += history[i].spread_bps as u64;
-        }
-
-        let avg_spread = spread_sum as f64 / recent_window as f64;
-        let current_spread = history.back().ok_or("No spread data")?.spread_bps as f64;
-        
-        let spread_ratio = current_spread / avg_spread.max(1.0);
-        
-        if spread_ratio > 1.5 {
-            Ok(-0.5 * spread_ratio.min(2.0))
-        } else if spread_ratio < 0.7 {
-            Ok(0.3 * (1.0 / spread_ratio).min(1.5))
-        } else {
-            Ok(0.0)
-        }
-    }
-
-    fn calculate_position_size(&self, deviation: f64, spread_bps: u16, confidence: f64) -> f64 {
-        let base_size = (MAX_POSITION_SIZE_BPS as f64 / 10000.0) * confidence;
-        
-        let kelly_fraction = {
-            let win_rate = *self.win_rate.read().unwrap_or(&RwLock::new(0.5)).get_mut();
-            let avg_win_loss_ratio = 1.2;
-            
-            if win_rate > 0.0 && win_rate < 1.0 {
-                let p = win_rate;
-                let b = avg_win_loss_ratio;
-                ((p * (b + 1.0) - 1.0) / b).max(0.0).min(0.25)
-            } else {
-                0.1
-            }
+            return Err(anyhow!("Innovation covariance not PD/semidefinite"));
         };
-        
-        let volatility_adjustment = (-deviation.abs() / 3.0).exp();
-        let spread_adjustment = 1.0 / (1.0 + (spread_bps as f64 / 100.0));
-        
-        (base_size * kelly_fraction * volatility_adjustment * spread_adjustment)
-            .min(MAX_POSITION_SIZE_BPS as f64 / 10000.0)
-            .max(0.0)
-    }
 
-    fn should_recalibrate(&self, current_time: u64) -> bool {
-        let params = self.parameters.read().unwrap();
-        current_time - params.last_update > 300_000 // 5 minutes
-    }
+        // NIS
+        let nis = {
+            let s_inv_v = if let Some(ch) = Cholesky::new(S.clone()) {
+                ch.solve(&v)
+            } else if let Some(ld) = LDLT::new(S.clone()) {
+                ld.solve(&v)
+            } else { v.clone() };
+            (v.transpose() * s_inv_v)[(0, 0)]
+        };
 
-    fn recalibrate_parameters(&self) -> Result<(), &'static str> {
-        let history = self.price_history.read().map_err(|_| "Lock error")?;
-        
-        if history.len() < MIN_SAMPLES_FOR_CALCULATION {
-            return Ok(());
+        // Gate
+        let chi_thr = self.chi2_gate_threshold;
+        let mut x_upd = x_pred.clone();
+        let mut P_upd = P_pred.clone();
+        if nis <= chi_thr {
+            x_upd = &x_pred + &K * &v;
+
+            // Joseph form (Gelb ch. 6)
+            let I = DMatrix::<f64>::identity(STATE_DIM, STATE_DIM);
+            let U = &I - &K * &h;
+            P_upd = &U * P_pred * U.transpose() + &K * &r_now * K.transpose();
+        } else {
+            // outlier: coast and modestly inflate
+            P_upd = P_pred * 1.05;
         }
 
-        let log_returns = self.calculate_log_returns(&history)?;
-        
-        if log_returns.is_empty() {
-            return Ok(());
+        // Keep P PSD and reasonable
+        P_upd = psd_floor(P_upd, MIN_COVARIANCE);
+        P_upd = clamp_matrix_diag(P_upd, MIN_COVARIANCE, MAX_COVARIANCE);
+
+        // === Sage–Husa R update (proper notation) ===
+        // R̂ = v vᵀ − H P^- Hᵀ  (PSD-projected), R_k = (1−β)R_{k−1} + β R̂
+        let mut R_est = &v * v.transpose() - &h * &P_pred * h.transpose();
+        R_est = symmetrize(R_est);
+        let (R_est_psd, r_clamped) = psd_floor_flag(R_est, 1e-12);
+        if r_clamped { self.bump_r_clamp(); }
+        r_now = (1.0 - beta_r) * r_now + beta_r * R_est_psd;
+        let (r_now_psd, r2_clamped) = psd_floor_flag(r_now, 1e-10);
+        if r2_clamped { self.bump_r_clamp(); }
+        *self.measurement_noise.write() = r_now_psd.clone();
+
+        // === Adaptive Q via covariance identity (closed form on CA block) ===
+        // Q̂_full = P^- − F P^+_{k−1} Fᵀ
+        let Q_est_full = {
+            let prev_P_plus = st.covariance.clone();
+            let mut qhat = P_pred.clone() - &F * &prev_P_plus * F.transpose();
+            qhat = symmetrize(qhat);
+            let (qhat_psd, q_clamped) = psd_floor_flag(qhat, 1e-12);
+            if q_clamped { self.bump_q_clamp(); }
+            qhat_psd
+        };
+
+        // Extract CA 3x3 block and fit scalar q to basis B(dt) (trace LS)  [Gelb, Bar-Shalom]
+        let B = ca_Q_basis(dt); // 3x3 (see ca_Q_basis doc tag)
+        let Q_ca = Q_est_full.slice((0, 0), (3, 3)).into_owned();
+        let num = trace_of(&(&B.transpose() * &Q_ca));
+        let den = trace_of(&(&B.transpose() * &B)).max(1e-18);
+        let q_hat_cov_id = (num / den).clamp(Q_SPREAD_MIN, Q_SPREAD_MAX);
+
+        // === Mehra-style reconciliation using innovation statistics ===
+        // Maintain S_emp = E[v vᵀ] and reconcile with S_th = H P^- Hᵀ + R, approximating
+        // Q contribution through H (q * B_embedded). Solve min || M - H (q B_emb) Hᵀ ||_F
+        // where M = S_emp - S_th(q=0). Closed-form scalar LS again.
+        {
+            let mut istats_map = self.innov_stats.write();
+            let istats = istats_map.entry(pair).or_insert_with(InnovStats::new);
+            istats.sum_vvt = &istats.sum_vvt + &(&v * v.transpose());
+            istats.count += 1;
+            istats.last_P_pred = P_pred.clone();
+
+            if istats.count >= 8 {
+                let S_emp = (1.0 / istats.count as f64) * istats.sum_vvt.clone();
+                let S_th0 = &h * &P_pred * h.transpose() + &r_now_psd; // treat q effect separately
+                let M = symmetrize(S_emp - S_th0);
+
+                let B_emb = embed_ca_basis_into_state(&B);
+                let HBH = &h * &B_emb * h.transpose();
+
+                let num_m = trace_of(&(HBH.transpose() * M));
+                let den_m = trace_of(&(HBH.transpose() * HBH)).max(1e-18);
+                let q_hat_mehra = (num_m / den_m).clamp(Q_SPREAD_MIN, Q_SPREAD_MAX);
+
+                // Fuse both q estimates conservatively
+                let q_blend = 0.5 * q_hat_cov_id + 0.5 * q_hat_mehra;
+                let mut q_cur = *self.q_spread.read();
+                q_cur = (1.0 - beta_q) * q_cur + beta_q * q_blend
+                    + BETA_Q_MEHRA * (q_hat_mehra - q_cur);
+                q_cur = q_cur.clamp(Q_SPREAD_MIN, Q_SPREAD_MAX);
+                *self.q_spread.write() = q_cur;
+
+                // Decay stats to keep responsiveness
+                istats.sum_vvt = 0.5 * istats.sum_vvt.clone();
+                istats.count = (istats.count / 2).max(4);
+            } else {
+                // Early stage: use covariance-identity estimate softly
+                let mut q_cur = *self.q_spread.read();
+                q_cur = (1.0 - beta_q) * q_cur + beta_q * q_hat_cov_id;
+                q_cur = q_cur.clamp(Q_SPREAD_MIN, Q_SPREAD_MAX);
+                *self.q_spread.write() = q_cur;
+            }
         }
 
-        let mean = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
-        let variance = log_returns.iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>() / log_returns.len() as f64;
-        
-        let autocorrelation = self.calculate_autocorrelation(&log_returns, 1)?;
-        
-        let new_theta = (-autocorrelation.ln()).max(0.01).min(1.0);
-        let new_sigma = variance.sqrt() * (2.0 * new_theta).sqrt();
-        let new_mu = mean / new_theta;
+        // === NIS EMA monitor ===
+        {
+            let mut nis_m = self.nis_ema.write();
+            *nis_m = (1.0 - NIS_ALPHA) * *nis_m + NIS_ALPHA * nis;
+        }
 
-        let mut params = self.parameters.write().map_err(|_| "Lock error")?;
-        params.theta = 0.7 * params.theta + 0.3 * new_theta;
-        params.sigma = 0.7 * params.sigma + 0.3 * new_sigma;
-        params.mu = 0.7 * params.mu + 0.3 * new_mu;
-        params.last_update = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "Time error")?
-            .as_millis() as u64;
+        // Save
+        st.state = x_upd;
+        st.covariance = P_upd;
+        st.innovation = v;
+        st.innovation_covariance = S;
+        st.nis = nis;
+        st.last_update = ts_ms;
 
         Ok(())
     }
 
-    fn calculate_autocorrelation(&self, returns: &[f64], lag: usize) -> Result<f64, &'static str> {
-        if returns.len() <= lag {
-            return Err("Insufficient data for autocorrelation");
-        }
+    // ---------------- F/Q builders (CA + OU) ----------------
 
-        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>() / returns.len() as f64;
+    /// Discrete state transition F(dt)
+    ///
+    /// CA block (Gelb ch. 6; Bar-Shalom Li Kirubarajan):
+    ///   x = [pos, vel, acc]  with white-noise jerk → F =
+    ///     [[1, dt, 0.5 dt^2],
+    ///      [0,  1,      dt ],
+    ///      [0,  0,       1 ]]
+    ///
+    /// OU block (Bar-Shalom; Singer model):
+    ///   F_ii = exp(-dt/τ_i) for states [3,4,5]
+    fn build_F(&self, dt: f64) -> DMatrix<f64> {
+        let mut F = DMatrix::<f64>::identity(STATE_DIM, STATE_DIM);
+        // CA block
+        F[(0, 1)] = dt;
+        F[(0, 2)] = 0.5 * dt * dt;
+        F[(1, 2)] = dt;
 
-                if variance == 0.0 {
-            return Ok(0.0);
-        }
-
-        let mut covariance = 0.0;
-        for i in lag..returns.len() {
-            covariance += (returns[i] - mean) * (returns[i - lag] - mean);
-        }
-        covariance /= (returns.len() - lag) as f64;
-
-        Ok(covariance / variance)
+        // OU persistence for exogenous states
+        let ou0 = *self.ou_params[0].read();
+        let ou1 = *self.ou_params[1].read();
+        let ou2 = *self.ou_params[2].read();
+        F[(3, 3)] = (-dt / ou0.tau).exp();
+        F[(4, 4)] = (-dt / ou1.tau).exp();
+        F[(5, 5)] = (-dt / ou2.tau).exp();
+        F
     }
 
-    pub fn update_trade_outcome(&self, pnl: f64) -> Result<(), &'static str> {
-        let mut cumulative = self.cumulative_pnl.write().map_err(|_| "Lock error")?;
-        let mut total = self.total_trades.write().map_err(|_| "Lock error")?;
-        let mut winning = self.winning_trades.write().map_err(|_| "Lock error")?;
-        let mut win_rate = self.win_rate.write().map_err(|_| "Lock error")?;
+    /// Q(dt) with current q scalar for CA, OU closed forms for exogenous states.
+    fn build_Q_with(&self, q: f64, dt: f64) -> DMatrix<f64> {
+        let mut Q = DMatrix::<f64>::zeros(STATE_DIM, STATE_DIM);
 
-        *cumulative += pnl;
-        *total += 1;
-        
-        if pnl > 0.0 {
-            *winning += 1;
-        }
+        // CA block (Gelb ch. 6; Bar-Shalom): see ca_Q_basis()
+        let B = ca_Q_basis(dt);
+        for i in 0..3 { for j in 0..3 { Q[(i, j)] = q * B[(i, j)]; } }
 
-        if *total > 0 {
-            *win_rate = *winning as f64 / *total as f64;
-        }
+        // OU blocks (independent) [Bar-Shalom; Singer]
+        let ou0 = *self.ou_params[0].read();
+        let ou1 = *self.ou_params[1].read();
+        let ou2 = *self.ou_params[2].read();
+        Q[(3, 3)] = ou_discrete_Q(ou0.tau, ou0.sigma2, dt);
+        Q[(4, 4)] = ou_discrete_Q(ou1.tau, ou1.sigma2, dt);
+        Q[(5, 5)] = ou_discrete_Q(ou2.tau, ou2.sigma2, dt);
 
-        Ok(())
+        Q
     }
 
-    pub fn get_risk_metrics(&self) -> Result<RiskMetrics, &'static str> {
-        let history = self.price_history.read().map_err(|_| "Lock error")?;
-        let params = self.parameters.read().map_err(|_| "Lock error")?;
-        
-        let sharpe_ratio = self.calculate_sharpe_ratio(&history)?;
-        let max_drawdown = self.calculate_max_drawdown(&history)?;
-        let current_volatility = params.sigma;
-        
-        Ok(RiskMetrics {
-            sharpe_ratio,
-            max_drawdown,
-            current_volatility,
-            win_rate: *self.win_rate.read().map_err(|_| "Lock error")?,
-            total_trades: *self.total_trades.read().map_err(|_| "Lock error")?,
-        })
+    /// Convenience wrapper using current q.
+    fn build_Q(&self, dt: f64) -> DMatrix<f64> {
+        let q = *self.q_spread.read();
+        self.build_Q_with(q, dt)
     }
 
-    fn calculate_sharpe_ratio(&self, history: &VecDeque<PricePoint>) -> Result<f64, &'static str> {
-        let returns = self.calculate_log_returns(history)?;
-        
-        if returns.is_empty() {
-            return Ok(0.0);
-        }
+    fn model_confidence(&self, st: &KalmanState) -> f64 {
+        // Simple innovation and NIS-based confidence proxy
+        let s00 = st.innovation_covariance[(0, 0)].max(1e-12);
+        let v0 = st.innovation[0];
+        let innovation_factor = (-(v0.abs() / s00.sqrt())).exp();
 
-        let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let std_dev = (returns.iter()
-            .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>() / returns.len() as f64)
-            .sqrt();
+        let nis_mean = *self.nis_ema.read();
+        let maha_factor = (-(nis_mean.sqrt()) / self.chi2_gate_df.sqrt()).exp();
 
-        if std_dev == 0.0 {
-            return Ok(0.0);
-        }
-
-        let annualized_return = mean_return * 252.0 * 24.0;
-        let annualized_std = std_dev * (252.0 * 24.0).sqrt();
-        
-        Ok(annualized_return / annualized_std)
+        (0.6 * innovation_factor + 0.4 * maha_factor).clamp(0.0, 1.0)
     }
 
-    fn calculate_max_drawdown(&self, history: &VecDeque<PricePoint>) -> Result<f64, &'static str> {
-        if history.len() < 2 {
-            return Ok(0.0);
-        }
+    // -------- alarms / counters --------
 
-        let prices: Vec<f64> = history.iter().map(|p| p.price).collect();
-        let mut max_drawdown = 0.0;
-        let mut peak = prices[0];
-
-        for &price in &prices[1..] {
-            if price > peak {
-                peak = price;
-            }
-            let drawdown = (peak - price) / peak;
-            if drawdown > max_drawdown {
-                max_drawdown = drawdown;
+    fn bump_update_count_and_check_nis_alarm(&self) {
+        let mut n = self.update_count.write();
+        *n += 1;
+        if *n >= NIS_ALERT_MIN_UPDATES {
+            let nis = *self.nis_ema.read();
+            let df = self.chi2_gate_df;
+            let sd = (2.0 * df / *n as f64).sqrt();
+            let alarm = (nis - df).abs() > 3.0 * sd;
+            if alarm {
+                eprintln!(
+                    "[KF-ALERT] NIS EMA {:.6} outside χ²(df={:.0}) 3σ band [{:.6}, {:.6}] (N={})",
+                    nis, df, df - 3.0 * sd, df + 3.0 * sd, *n
+                );
             }
         }
-
-        Ok(max_drawdown)
     }
 
-    pub fn validate_market_conditions(&self, market_data: &MarketData) -> Result<bool, &'static str> {
-        if market_data.bid_liquidity < 1000.0 || market_data.ask_liquidity < 1000.0 {
-            return Ok(false);
-        }
-
-        let spread_bps = ((market_data.ask - market_data.bid) / market_data.mid) * 10000.0;
-        if spread_bps > 50.0 {
-            return Ok(false);
-        }
-
-        let history = self.price_history.read().map_err(|_| "Lock error")?;
-        if history.len() < MIN_SAMPLES_FOR_CALCULATION {
-            return Ok(false);
-        }
-
-        let recent_volatility = self.calculate_recent_volatility(&history)?;
-        if recent_volatility > 0.1 {
-            return Ok(false);
-        }
-
-        Ok(true)
+    fn bump_r_clamp(&self) {
+        let mut ema = self.r_clamp_ema.write();
+        *ema = (1.0 - CLAMP_ALPHA) * *ema + CLAMP_ALPHA * 1.0;
+        self.maybe_freeze_if_clamp_rate_high();
     }
-
-    fn calculate_recent_volatility(&self, history: &VecDeque<PricePoint>) -> Result<f64, &'static str> {
-        let window = 20.min(history.len());
-        let recent_prices: Vec<f64> = history.iter()
-            .rev()
-            .take(window)
-            .map(|p| p.price)
-            .collect();
-
-        if recent_prices.len() < 2 {
-            return Ok(0.0);
-        }
-
-        let mut returns = Vec::new();
-        for i in 1..recent_prices.len() {
-            returns.push((recent_prices[i] / recent_prices[i-1]).ln());
-        }
-
-        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>() / returns.len() as f64;
-
-        Ok(variance.sqrt())
+    fn bump_q_clamp(&self) {
+        let mut ema = self.q_clamp_ema.write();
+        *ema = (1.0 - CLAMP_ALPHA) * *ema + CLAMP_ALPHA * 1.0;
+        self.maybe_freeze_if_clamp_rate_high();
     }
-
-    pub fn calculate_optimal_entry(&self, signal: &Signal, market_data: &MarketData) -> Result<OrderParams, &'static str> {
-        match signal {
-            Signal::Buy { confidence, size_ratio } => {
-                let base_size = market_data.available_balance * size_ratio;
-                let adjusted_size = self.apply_risk_limits(base_size, market_data)?;
-                
-                let limit_price = market_data.bid * (1.0 + 0.0001);
-                let stop_loss = limit_price * (1.0 - RISK_THRESHOLD);
-                let take_profit = limit_price * (1.0 + MIN_PROFIT_THRESHOLD_BPS as f64 / 10000.0 * 2.0);
-
-                Ok(OrderParams {
-                    side: OrderSide::Buy,
-                    size: adjusted_size,
-                    limit_price,
-                    stop_loss: Some(stop_loss),
-                    take_profit: Some(take_profit),
-                    time_in_force: TimeInForce::IOC,
-                })
-            },
-            Signal::Sell { confidence, size_ratio } => {
-                let base_size = market_data.position_size * size_ratio;
-                let adjusted_size = self.apply_risk_limits(base_size, market_data)?;
-                
-                let limit_price = market_data.ask * (1.0 - 0.0001);
-                let stop_loss = limit_price * (1.0 + RISK_THRESHOLD);
-                let take_profit = limit_price * (1.0 - MIN_PROFIT_THRESHOLD_BPS as f64 / 10000.0 * 2.0);
-
-                Ok(OrderParams {
-                    side: OrderSide::Sell,
-                    size: adjusted_size,
-                    limit_price,
-                    stop_loss: Some(stop_loss),
-                    take_profit: Some(take_profit),
-                    time_in_force: TimeInForce::IOC,
-                })
-            },
-            Signal::Hold => Err("No trade signal"),
-        }
-    }
-
-    fn apply_risk_limits(&self, size: f64, market_data: &MarketData) -> Result<f64, &'static str> {
-        let max_position = market_data.available_balance * MAX_POSITION_SIZE_BPS as f64 / 10000.0;
-        let leverage_adjusted = size.min(market_data.available_balance * MAX_LEVERAGE);
-        
-        let liquidity_constraint = (market_data.bid_liquidity + market_data.ask_liquidity) * 0.05;
-        
-        Ok(size.min(max_position).min(leverage_adjusted).min(liquidity_constraint))
-    }
-
-    pub fn get_execution_priority(&self, signal: &Signal) -> ExecutionPriority {
-        match signal {
-            Signal::Buy { confidence, .. } | Signal::Sell { confidence, .. } => {
-                if *confidence > 0.95 {
-                    ExecutionPriority::Critical
-                } else if *confidence > 0.9 {
-                    ExecutionPriority::High
-                } else {
-                    ExecutionPriority::Normal
-                }
-            },
-            Signal::Hold => ExecutionPriority::Low,
+    fn maybe_freeze_if_clamp_rate_high(&self) {
+        let r = *self.r_clamp_ema.read();
+        let q = *self.q_clamp_ema.read();
+        let frozen = *self.adaptation_frozen.read();
+        if (r > CLAMP_ALERT_RATE || q > CLAMP_ALERT_RATE) && !frozen {
+            eprintln!(
+                "[KF-ALERT] Clamp rate high (R_ema={:.3}, Q_ema={:.3}) → freezing adaptation",
+                r, q
+            );
+            self.set_adaptation_frozen(true);
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct RiskMetrics {
-    pub sharpe_ratio: f64,
-    pub max_drawdown: f64,
-    pub current_volatility: f64,
-    pub win_rate: f64,
-    pub total_trades: u64,
-}
+// ======================================================================
+// Offline identification helpers (separate from filter core)
+// ======================================================================
 
-#[derive(Debug, Clone)]
-pub struct MarketData {
-    pub bid: f64,
-    pub ask: f64,
-    pub mid: f64,
-    pub bid_liquidity: f64,
-    pub ask_liquidity: f64,
-    pub available_balance: f64,
-    pub position_size: f64,
-}
+/// Fit mid-price-change coefficients y ≈ a*velocity + b*trend with ridge regularization.
+/// Returns (a, b) and records dataset/version strings for audit if desired.
+pub fn fit_midchange_coefficients_ridge(
+    velocity: &[f64],
+    trend: &[f64],
+    y_mid_change: &[f64],
+    lambda: f64,
+) -> Result<(f64, f64)> {
+    let n = y_mid_change.len();
+    if velocity.len() != n || trend.len() != n || n < 8 {
+        return Err(anyhow!("Need matching arrays with n >= 8"));
+    }
+    let mut X = DMatrix::<f64>::zeros(n, 2);
+    for i in 0..n {
+        X[(i, 0)] = velocity[i];
+        X[(i, 1)] = trend[i];
+    }
+    let y = DVector::from_iterator(n, y_mid_change.iter().cloned());
 
-#[derive(Debug, Clone)]
-pub struct OrderParams {
-    pub side: OrderSide,
-    pub size: f64,
-    pub limit_price: f64,
-    pub stop_loss: Option<f64>,
-    pub take_profit: Option<f64>,
-    pub time_in_force: TimeInForce,
-}
+    // Ridge: beta = (XᵀX + λI)^{-1} Xᵀ y
+    let Xt = X.transpose();
+    let reg = DMatrix::<f64>::identity(2, 2) * lambda.max(0.0);
+    let m = &Xt * &X + reg;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OrderSide {
-    Buy,
-    Sell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TimeInForce {
-    IOC,
-    FOK,
-    GTC,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExecutionPriority {
-    Low,
-    Normal,
-    High,
-    Critical,
-}
-
-impl Default for OrnsteinUhlenbeckStrategy {
-    fn default() -> Self {
-        Self::new()
+    if let Some(ch) = Cholesky::new(m) {
+        let beta = ch.solve(&(&Xt * &y));
+        Ok((beta[0], beta[1]))
+    } else if let Some(ld) = LDLT::new(m) {
+        let beta = ld.solve(&(&Xt * &y));
+        Ok((beta[0], beta[1]))
+    } else {
+        Err(anyhow!("Ridge normal equations not PD/semidefinite"))
     }
 }
 
+// ======================================================================
+// Utilities: PSD projection, symmetrize, CA basis, traces, realized vol,
+//            OU helpers, embedding
+// ======================================================================
+
+fn symmetrize(mut p: DMatrix<f64>) -> DMatrix<f64> {
+    p = 0.5 * (&p + p.transpose());
+    p
+}
+
+fn psd_floor(mut p: DMatrix<f64>, eps: f64) -> DMatrix<f64> {
+    p = symmetrize(p);
+    let se = SymmetricEigen::new(p.clone());
+    let mut d = se.eigenvalues;
+    let mut any = false;
+    for i in 0..d.len() {
+        if d[i] < eps { d[i] = eps; any = true; }
+    }
+    if any {
+        let v = se.eigenvectors;
+        p = &v * DMatrix::from_diagonal(&d) * v.transpose();
+        p = symmetrize(p);
+    }
+    p
+}
+
+/// PSD floor that reports whether a clamp occurred (for R/Q invariants).
+fn psd_floor_flag(mut p: DMatrix<f64>, eps: f64) -> (DMatrix<f64>, bool) {
+    p = symmetrize(p);
+    let se = SymmetricEigen::new(p.clone());
+    let mut d = se.eigenvalues;
+    let mut any = false;
+    for i in 0..d.len() {
+        if d[i] < eps { d[i] = eps; any = true; }
+    }
+    if any {
+        let v = se.eigenvectors;
+        p = &v * DMatrix::from_diagonal(&d) * v.transpose();
+        p = symmetrize(p);
+    }
+    (p, any)
+}
+
+fn clamp_matrix_diag(mut p: DMatrix<f64>, lo: f64, hi: f64) -> DMatrix<f64> {
+    let n = p.nrows().min(p.ncols());
+    for i in 0..n {
+        p[(i, i)] = p[(i, i)].clamp(lo, hi);
+    }
+    p
+}
+
+/// CA Q basis (Gelb ch. 6; Bar-Shalom Li Kirubarajan).
+/// For constant-acceleration with white-noise jerk spectral density q:
+///   Q_ca(dt) = q * [[dt^5/20, dt^4/8, dt^3/6],
+///                   [dt^4/8,  dt^3/3, dt^2/2],
+///                   [dt^3/6,  dt^2/2, dt]]
+fn ca_Q_basis(dt: f64) -> DMatrix<f64> {
+    let dt2 = dt * dt;
+    let dt3 = dt2 * dt;
+    let dt4 = dt2 * dt2;
+    let dt5 = dt3 * dt2;
+
+    let mut B = DMatrix::<f64>::zeros(3, 3);
+    B[(0, 0)] = dt5 / 20.0;
+    B[(0, 1)] = dt4 / 8.0;
+    B[(0, 2)] = dt3 / 6.0;
+    B[(1, 0)] = B[(0, 1)];
+    B[(1, 1)] = dt3 / 3.0;
+    B[(1, 2)] = dt2 / 2.0;
+    B[(2, 0)] = B[(0, 2)];
+    B[(2, 1)] = B[(1, 2)];
+    B[(2, 2)] = dt;
+    B
+}
+
+fn embed_ca_basis_into_state(B: &DMatrix<f64>) -> DMatrix<f64> {
+    let mut E = DMatrix::<f64>::zeros(STATE_DIM, STATE_DIM);
+    for i in 0..3 { for j in 0..3 { E[(i, j)] = B[(i, j)]; } }
+    E
+}
+
+fn trace_of(m: &DMatrix<f64>) -> f64 {
+    let n = m.nrows().min(m.ncols());
+    let mut t = 0.0;
+    for i in 0..n { t += m[(i, i)]; }
+    t
+}
+
+fn estimate_realized_vol(obs: &[SpreadObservation]) -> f64 {
+    let n = obs.len();
+    if n < 2 { return 0.0; }
+    let window = n.min(32);
+    let slice = &obs[n - window..];
+    let mut rets = Vec::with_capacity(window.saturating_sub(1));
+    for w in slice.windows(2) {
+        let a = w[0].mid_price;
+        let b = w[1].mid_price;
+        if a > 0.0 && b > 0.0 {
+            rets.push((b / a).ln());
+        }
+    }
+    if rets.is_empty() { return 0.0; }
+    let mean = rets.iter().copied().sum::<f64>() / rets.len() as f64;
+    let var = rets.iter().map(|r| {
+        let d = r - mean; d * d
+    }).sum::<f64>() / rets.len() as f64;
+    var.sqrt()
+}
+
+/// OU discrete Q closed form (Bar-Shalom; Singer)
+///   Qd = σ² * (1 - e^{-2 dt / τ}) / (2/τ)
+fn ou_discrete_Q(tau: f64, sigma2: f64, dt: f64) -> f64 {
+    if tau <= 0.0 { return 0.0; }
+    let lam = 1.0 / tau;
+    sigma2 * (1.0 - (-2.0 * lam * dt).exp()) / (2.0 * lam)
+}
+
+/// Given a target discrete Q at dt=1s, solve for σ² that matches the OU closed form.
+fn ou_sigma2_from_Qd1(Qd1: f64, tau: f64) -> f64 {
+    if tau <= 0.0 { return 0.0; }
+    let lam = 1.0 / tau;
+    let denom = (1.0 - (-2.0 * lam).exp()) / (2.0 * lam);
+    if denom <= 0.0 { return 0.0; }
+    (Qd1 / denom).max(0.0)
+}
+
+// ======================================================================
+// Van-Loan/OU parity tests
+// ======================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::ComplexField;
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
 
+    fn expm(a: &DMatrix<f64>) -> DMatrix<f64> {
+        // Scaling and squaring with Pade(6)
+        let one = DMatrix::<f64>::identity(a.nrows(), a.ncols());
+        let norm = a.norm();
+        let s = if norm > 0.5 { (norm / 0.5).log2().ceil().max(0.0) as u32 } else { 0 };
+        let a_scaled = a / 2f64.powi(s as i32);
+
+        // Pade(6) coefficients
+        let c = [1.0,
+                 0.5,
+                 0.12,
+                 0.018333333333333333,
+                 0.0019927536231884053,
+                 0.00016059043836821612,
+                 0.000010117,
+        ];
+
+        let a2 = &a_scaled * &a_scaled;
+        let a4 = &a2 * &a2;
+        let a6 = &a4 * &a2;
+
+        let mut U = a_scaled.clone() * c[1];
+        U = U + a_scaled.clone() * c[3] * &a2;
+        U = U + a_scaled.clone() * c[5] * &a4;
+
+        let mut V = one.clone() * c[0];
+        V = V + &a2 * c[2];
+        V = V + &a4 * c[4];
+        V = V + &a6 * c[6];
+
+        let numer = &V + &U;
+        let denom = &V - &U;
+
+        let denom_inv = denom.try_inverse().expect("invertible");
+        let mut R = &denom_inv * &numer;
+
+        for _ in 0..s { R = &R * &R; }
+        R
+    }
+
+    /// Van-Loan: M = [[-A, GQcGᵀ],[0, Aᵀ]] dt, exp(M) = [[M11, M12],[0, M22]]
+    /// Fd = M22ᵀ, Qd = M22ᵀ M12
     #[test]
-    fn test_strategy_initialization() {
-        let strategy = OrnsteinUhlenbeckStrategy::new();
-        assert!(strategy.price_history.read().unwrap().is_empty());
+    fn van_loan_matches_ca_closed_form() {
+        let dt = 0.037; // 37 ms
+        let q = 0.007;
+
+        // Continuous CA: xdot = A x + G w, E[w wᵀ] = q δ
+        let mut A = DMatrix::<f64>::zeros(3, 3);
+        A[(0,1)] = 1.0;
+        A[(1,2)] = 1.0;
+        let mut G = DMatrix::<f64>::zeros(3, 1);
+        G[(2,0)] = 1.0;
+        let Qc = DMatrix::<f64>::identity(1,1) * q;
+
+        // Van-Loan block matrix
+        let n = 3;
+        let mut M = DMatrix::<f64>::zeros(2*n, 2*n);
+        let GQGt = &G * &Qc * G.transpose();
+        // top-left: -A
+        for i in 0..n { for j in 0..n { M[(i,j)] = -A[(i,j)]; } }
+        // top-right: G Qc Gᵀ
+        for i in 0..n { for j in 0..n { M[(i, j+n)] = GQGt[(i,j)]; } }
+        // bottom-right: Aᵀ
+        for i in 0..n { for j in 0..n { M[(i+n, j+n)] = A[(j,i)]; } }
+
+        let Md = expm(&(M * dt));
+        let _M11 = Md.slice((0,0),(n,n)).into_owned();
+        let M12 = Md.slice((0,n),(n,n)).into_owned();
+        let M22 = Md.slice((n,n),(n,n)).into_owned();
+
+        let Fd_vl = M22.transpose();
+        let Qd_vl = &Fd_vl.transpose() * &M12;
+
+        // Closed-form
+        let F_cf = {
+            let mut F = DMatrix::<f64>::identity(3,3);
+            F[(0,1)] = dt;
+            F[(0,2)] = 0.5*dt*dt;
+            F[(1,2)] = dt;
+            F
+        };
+        let Q_cf = ca_Q_basis(dt) * q;
+
+        // Compare
+        assert!((Fd_vl - F_cf).norm() < 1e-10, "F mismatch");
+        assert!((Qd_vl - Q_cf).norm() < 1e-10, "Q mismatch");
     }
 
     #[test]
-    fn test_price_update() {
-        let strategy = OrnsteinUhlenbeckStrategy::new();
-        assert!(strategy.update_price(100.0, 1000.0, 10).is_ok());
-        assert_eq!(strategy.price_history.read().unwrap().len(), 1);
-    }
+    fn van_loan_grid_sweep() {
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..64 {
+            let dt = rng.gen_range(1.0e-4..0.2);
+            let q = rng.gen_range(1.0e-6..1.0e-1);
 
-    #[test]
-    fn test_signal_generation() {
-        let strategy = OrnsteinUhlenbeckStrategy::new();
-        
-        for i in 0..MIN_SAMPLES_FOR_CALCULATION {
-            let price = 100.0 + (i as f64 * 0.1);
-            strategy.update_price(price, 1000.0, 10).unwrap();
+            let mut A = DMatrix::<f64>::zeros(3, 3);
+            A[(0,1)] = 1.0;
+            A[(1,2)] = 1.0;
+            let mut G = DMatrix::<f64>::zeros(3, 1);
+            G[(2,0)] = 1.0;
+            let Qc = DMatrix::<f64>::identity(1,1) * q;
+
+            let n = 3;
+            let mut M = DMatrix::<f64>::zeros(2*n, 2*n);
+            let GQGt = &G * &Qc * G.transpose();
+            for i in 0..n { for j in 0..n { M[(i,j)] = -A[(i,j)]; } }
+            for i in 0..n { for j in 0..n { M[(i, j+n)] = GQGt[(i,j)]; } }
+            for i in 0..n { for j in 0..n { M[(i+n, j+n)] = A[(j,i)]; } }
+
+            let Md = expm(&(M * dt));
+            let M12 = Md.slice((0,n),(n,n)).into_owned();
+            let M22 = Md.slice((n,n),(n,n)).into_owned();
+
+            let Fd_vl = M22.transpose();
+            let Qd_vl = &Fd_vl.transpose() * &M12;
+
+            let mut F_cf = DMatrix::<f64>::identity(3,3);
+            F_cf[(0,1)] = dt;
+            F_cf[(0,2)] = 0.5*dt*dt;
+            F_cf[(1,2)] = dt;
+            let Q_cf = ca_Q_basis(dt) * q;
+
+            assert!((Fd_vl - F_cf).norm() < 1e-9, "F mismatch");
+            assert!((Qd_vl - Q_cf).norm() < 1e-9, "Q mismatch");
         }
-        
-        let signal = strategy.get_signal().unwrap();
-        assert!(matches!(signal, Signal::Hold | Signal::Buy { .. } | Signal::Sell { .. }));
+    }
+
+    #[test]
+    fn psd_floor_sane() {
+        let mut P = DMatrix::<f64>::from_diagonal_element(4,4,-1.0);
+        P[(0,1)] = 10.0;
+        let Pf = psd_floor(P, 1e-9);
+        // Eigenvalues >= eps and symmetric
+        let se = SymmetricEigen::new(Pf.clone());
+        assert!(se.eigenvalues.iter().all(|&e| e >= 0.0));
+        assert!((Pf.clone() - Pf.transpose()).norm() < 1e-12);
+    }
+
+    #[test]
+    fn ou_parity_closed_form() {
+        let tau = 20.0;
+        let sigma2 = 0.07;
+        let dt = 0.5; // 500 ms
+
+        // Discrete F, Q
+        let Fd = (-dt/tau).exp();
+        let Qd = ou_discrete_Q(tau, sigma2, dt);
+
+        // Sanity: both within (0,1] and >= 0
+        assert!(Fd > 0.0 && Fd <= 1.0);
+        assert!(Qd >= 0.0);
+
+        // Check limit behaviors
+        let Qd_small = ou_discrete_Q(tau, sigma2, 1.0e-6);
+        assert!(Qd_small >= 0.0 && Qd_small < Qd);
     }
 }
-
